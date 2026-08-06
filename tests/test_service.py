@@ -289,6 +289,71 @@ class ServiceTest(TestCase):
         self.assertNotIn("No registra deuda", output)
         self.assertIn("VEPAI está en mantenimiento", service.status(1001))
 
+    def test_iibb_reports_a_conciliated_grouped_payment(self):
+        self.db.ensure_user(1001)
+        fetched_at = datetime.now(timezone.utc)
+        payload = {
+            "regime": "Régimen Simplificado",
+            "status": "ACTIVO",
+            "account": "131-123456-7",
+            "adhesion_date": "2024-01-31",
+            "category": "III",
+            "monthly_amount": "42882.00",
+            "next_obligation": {
+                "period": "2026-07",
+                "due_date": "2026-08-20",
+                "amount": "42882.00",
+                "overdue": False,
+            },
+            "payments": [],
+            "vepai": {
+                "status": "AVAILABLE",
+                "payments": [
+                    {"period": "2026-04", "paid_on": "2026-08-04", "amount": "39452.50"},
+                    {"period": "2026-05", "paid_on": "2026-08-04", "amount": "38351.50"},
+                    {"period": "2026-06", "paid_on": "2026-08-04", "amount": "37250.50"},
+                ],
+                "payment_groups": [
+                    {
+                        "paid_on": "2026-08-04",
+                        "total": "115054.50",
+                        "periods": ["2026-04", "2026-05", "2026-06"],
+                    }
+                ],
+                "reconciliation": {
+                    "status": "COMPLETE",
+                    "through": "2026-06",
+                    "missing_periods": [],
+                },
+            },
+        }
+        self.db.upsert_live_snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            fetched_at.isoformat(),
+            (fetched_at + timedelta(hours=1)).isoformat(),
+            json.dumps(payload),
+        )
+        self.db.upsert_connection(
+            1001,
+            "SANTA_FE_IIBB",
+            "CONNECTED",
+            fetched_at.isoformat(),
+        )
+        service = TaxMonitorService(
+            self.db,
+            live_synchronizers={"SANTA_FE_IIBB": lambda _chat_id: None},
+        )
+
+        output = service.dispatch("/iibb", 1001)
+
+        self.assertIn("Último pago: $115.054,50 el 04/08/2026", output)
+        self.assertIn("Deuda vencida en Régimen Simplificado: no", output)
+        self.assertIn("julio de 2026: $42.882,00", output)
+        self.assertIn("Vence: 20/08/2026", output)
+        self.assertIn("Pagos conciliados en VEPAI hasta junio de 2026", output)
+
     def test_failed_live_sync_never_falls_back_to_snapshot(self):
         def fail(_chat_id):
             raise RuntimeError("organismo no disponible")

@@ -549,25 +549,72 @@ Ahora falta autorizar el certificado {alias} en ARCA. La cuenta operadora es {op
         vepai_payments = vepai.get("payments", []) if isinstance(vepai, dict) else []
         registered_payments = snapshot.get("payments", [])
         payments = vepai_payments or registered_payments
-        if payments:
-            latest = max(
-                payments,
-                key=lambda item: (str(item.get("paid_on", "")), str(item.get("period", ""))),
-            )
-            source = "VEPAI" if vepai_payments else "Régimen Simplificado"
+        reconciliation = vepai.get("reconciliation", {}) if isinstance(vepai, dict) else {}
+        if reconciliation.get("status") == "COMPLETE":
+            lines.extend(["", "Deuda vencida en Régimen Simplificado: no."])
+        elif reconciliation.get("status") == "MISSING":
+            lines.extend(["", "Deuda vencida: hay períodos sin pago identificado."])
+
+        next_obligation = snapshot.get("next_obligation")
+        if isinstance(next_obligation, dict):
+            title = "Pago vencido" if next_obligation.get("overdue") else "Próximo pago"
+            due_label = "Venció" if next_obligation.get("overdue") else "Vence"
             lines.extend(
                 [
                     "",
-                    f"Pagos que muestra {source}: {len(payments)}",
+                    title,
                     (
-                        f"Último: {self._display_month(str(latest.get('period', '')))} — "
-                        f"{format_money(latest.get('amount'))}, pagado el "
-                        f"{format_date(latest.get('paid_on'))}"
+                        f"{self._display_month(str(next_obligation.get('period', '')))}: "
+                        f"{format_money(next_obligation.get('amount'))}"
                     ),
+                    f"{due_label}: {format_date(str(next_obligation.get('due_date', '')))}",
                 ]
             )
+        if payments:
+            source = "VEPAI" if vepai_payments else "Régimen Simplificado"
+            if vepai_payments and isinstance(vepai, dict) and vepai.get("payment_groups"):
+                groups = vepai["payment_groups"]
+                latest_date = max(str(group.get("paid_on", "")) for group in groups)
+                latest_groups = [
+                    group for group in groups if str(group.get("paid_on", "")) == latest_date
+                ]
+                latest_total = sum(
+                    (Decimal(str(group.get("total", "0"))) for group in latest_groups),
+                    Decimal("0"),
+                )
+                latest_periods = sorted(
+                    {
+                        str(period)
+                        for group in latest_groups
+                        for period in group.get("periods", [])
+                    }
+                )
+                lines.extend(
+                    [
+                        "",
+                        f"Períodos con pagos en {source}: {len({str(item.get('period')) for item in payments})}",
+                        f"Último pago: {format_money(latest_total)} el {format_date(latest_date)}",
+                        f"Períodos incluidos en ese pago: {len(latest_periods)}",
+                    ]
+                )
+            else:
+                latest = max(
+                    payments,
+                    key=lambda item: (str(item.get("paid_on", "")), str(item.get("period", ""))),
+                )
+                lines.extend(
+                    [
+                        "",
+                        f"Pagos que muestra {source}: {len(payments)}",
+                        (
+                            f"Último: {self._display_month(str(latest.get('period', '')))} — "
+                            f"{format_money(latest.get('amount'))}, pagado el "
+                            f"{format_date(latest.get('paid_on'))}"
+                        ),
+                    ]
+                )
         payments_as_of = snapshot.get("payments_as_of")
-        if payments_as_of:
+        if payments_as_of and not vepai_payments:
             lines.append(f"Registro de pagos actualizado al {format_date(str(payments_as_of))}.")
 
         if isinstance(vepai, dict) and vepai.get("status") == "MAINTENANCE":
@@ -579,13 +626,28 @@ Ahora falta autorizar el certificado {alias} en ARCA. La cuenta operadora es {op
                 ]
             )
         elif isinstance(vepai, dict) and vepai.get("status") == "AVAILABLE":
-            lines.extend(
-                [
-                    "",
-                    "Pagos verificados en VEPAI.",
-                    "La conciliación automática por período todavía está en preparación; no generes un pago sólo con este resumen.",
-                ]
-            )
+            if reconciliation.get("status") == "COMPLETE":
+                lines.extend(
+                    [
+                        "",
+                        (
+                            "Pagos conciliados en VEPAI hasta "
+                            f"{self._display_month(str(reconciliation.get('through', '')))}."
+                        ),
+                    ]
+                )
+            elif reconciliation.get("status") == "MISSING":
+                missing = list(reconciliation.get("missing_periods", []))
+                detail = ", ".join(self._display_month(period) for period in missing[:6])
+                if len(missing) > 6:
+                    detail += f" y {len(missing) - 6} más"
+                lines.extend(
+                    [
+                        "",
+                        f"VEPAI no muestra pagos para: {detail}.",
+                        "Esto requiere revisión antes de generar cualquier pago.",
+                    ]
+                )
         lines.extend(["", f"Consultado: {format_datetime_argentina(snapshot.get('fetched_at'))}"])
         return "\n".join(lines)
 

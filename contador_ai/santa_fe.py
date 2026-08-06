@@ -72,6 +72,20 @@ class _TableParser(HTMLParser):
             self._table_depth = max(0, self._table_depth - 1)
 
 
+class _InputParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.values: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag != "input":
+            return
+        attributes = dict(attrs)
+        key = attributes.get("id") or attributes.get("name")
+        if key:
+            self.values[key] = html.unescape(attributes.get("value", ""))
+
+
 def _normalized(value: str) -> str:
     return " ".join(html.unescape(value).replace("\ufeff", " ").split())
 
@@ -130,6 +144,57 @@ def _parse_payment_rows(html_text: str) -> list[dict[str, str]]:
     return payments
 
 
+def _parse_vepai_payments(
+    html_text: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    payments: list[dict[str, object]] = []
+    groups: list[dict[str, object]] = []
+    current_date = ""
+    current_total = ""
+    current_payment: dict[str, object] | None = None
+    current_group: dict[str, object] | None = None
+
+    for row in _table_rows(html_text):
+        cells = row + [""] * max(0, 5 - len(row))
+        if re.fullmatch(r"\d{2}/\d{2}/20\d{2}", cells[0]):
+            current_date = _iso_date(cells[0])
+        if cells[1] and re.search(r"\d", cells[1]):
+            current_total = _money(cells[1])
+            current_group = {
+                "paid_on": current_date,
+                "total": current_total,
+                "periods": [],
+            }
+            groups.append(current_group)
+
+        period_match = re.fullmatch(r"(20\d{2})-(0[1-9]|1[0-2])M?", cells[2])
+        if period_match:
+            current_payment = {
+                "period": f"{period_match.group(1)}-{period_match.group(2)}",
+                "paid_on": current_date,
+                "amount": "0.00",
+                "payment_total": current_total,
+                "components": [],
+            }
+            payments.append(current_payment)
+            if current_group is not None:
+                current_group["periods"].append(current_payment["period"])
+
+        if current_payment is None or not cells[3] or not cells[4]:
+            continue
+        try:
+            component_amount = Decimal(_money(cells[4]))
+        except SantaFeIibbError:
+            continue
+        current_payment["components"].append(
+            {"description": cells[3], "amount": str(component_amount)}
+        )
+        current_payment["amount"] = str(
+            Decimal(str(current_payment["amount"])) + component_amount
+        )
+    return payments, groups
+
+
 def parse_regsim(html_text: str, expected_cuit: str) -> dict[str, object]:
     text = _normalized(_visible_text(html_text))
     observed_cuit = re.sub(
@@ -185,13 +250,90 @@ def parse_vepai(html_text: str) -> dict[str, object]:
     if "error:" in lowered and not _parse_payment_rows(html_text):
         error = text[lowered.index("error:") :][:240]
         raise SantaFeIibbError(error)
-    payments = _parse_payment_rows(html_text)
+    payments, groups = _parse_vepai_payments(html_text)
     if not payments and not any(
         phrase in lowered
         for phrase in ("no se encontraron", "sin pagos", "no registra pagos")
     ):
         raise SantaFeIibbError("VEPAI no devolvió un detalle de pagos reconocible")
-    return {"status": "AVAILABLE", "payments": payments}
+    return {"status": "AVAILABLE", "payments": payments, "payment_groups": groups}
+
+
+def parse_period_quote(html_text: str, period: str) -> dict[str, object]:
+    parser = _InputParser()
+    parser.feed(html_text)
+    try:
+        due_date = _iso_date(parser.values["fe_vencimi_periodo_vep"])
+        amount = _money(parser.values["importe_periodo_vep"])
+    except KeyError as exc:
+        raise SantaFeIibbError(
+            f"Régimen Simplificado no informó el vencimiento de {period}"
+        ) from exc
+    return {
+        "period": period,
+        "due_date": due_date,
+        "amount": amount,
+    }
+
+
+def _periods_between(first: str, last: str) -> list[str]:
+    start_year, start_month = (int(part) for part in first.split("-"))
+    end_year, end_month = (int(part) for part in last.split("-"))
+    periods: list[str] = []
+    year, month = start_year, start_month
+    while (year, month) <= (end_year, end_month):
+        periods.append(f"{year:04d}-{month:02d}")
+        month += 1
+        if month == 13:
+            year += 1
+            month = 1
+    return periods
+
+
+def _two_months_before(value: date) -> str:
+    year, month = value.year, value.month - 2
+    while month < 1:
+        year -= 1
+        month += 12
+    return f"{year:04d}-{month:02d}"
+
+
+def _period_offset(value: date, offset: int) -> str:
+    year, month = value.year, value.month + offset
+    while month < 1:
+        year -= 1
+        month += 12
+    while month > 12:
+        year += 1
+        month -= 12
+    return f"{year:04d}-{month:02d}"
+
+
+def reconcile_vepai(
+    effective_period: str,
+    payments: list[dict[str, object]],
+    current: date,
+    period_quotes: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    through = _two_months_before(current)
+    for quote in period_quotes or []:
+        try:
+            is_due = date.fromisoformat(str(quote.get("due_date", ""))) <= current
+        except ValueError:
+            continue
+        period = str(quote.get("period", ""))
+        if is_due and period > through:
+            through = period
+    expected = _periods_between(effective_period, through)
+    paid = {str(payment.get("period", "")) for payment in payments}
+    missing = [period for period in expected if period not in paid]
+    return {
+        "status": "COMPLETE" if not missing else "MISSING",
+        "through": through,
+        "expected_periods": len(expected),
+        "paid_periods": len(set(expected) & paid),
+        "missing_periods": missing,
+    }
 
 
 def _cookie_jar(login: ArcaHttpLogin) -> httpx.Cookies:
@@ -234,7 +376,13 @@ class SantaFeIibbConnector:
             headers={"User-Agent": "Mozilla/5.0", "Referer": login.url},
         )
 
-    def fetch_regsim(self, chat_id: int, represented_cuit: str) -> dict[str, object]:
+    def fetch_regsim(
+        self,
+        chat_id: int,
+        represented_cuit: str,
+        *,
+        current: date,
+    ) -> dict[str, object]:
         login = self._login(chat_id, represented_cuit, "santafe_regsim")
         with self._client(login) as client:
             menu = client.post(
@@ -244,7 +392,17 @@ class SantaFeIibbConnector:
             menu.raise_for_status()
             response = client.get(f"{REGSIM_URL}?action=Registro::boletasPago")
             response.raise_for_status()
-        return parse_regsim(response.text, represented_cuit)
+            quotes = []
+            for period in (_period_offset(current, -1), _period_offset(current, 0)):
+                quote = client.post(
+                    f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarPeriodoVep",
+                    data={"periodo_osiris": period.replace("-", "")},
+                )
+                quote.raise_for_status()
+                quotes.append(parse_period_quote(quote.text, period))
+        result = parse_regsim(response.text, represented_cuit)
+        result["period_quotes"] = quotes
+        return result
 
     def fetch_vepai(
         self,
@@ -275,7 +433,7 @@ class SantaFeIibbConnector:
 
     def sync(self, chat_id: int, represented_cuit: str, *, today: date | None = None) -> dict[str, object]:
         current = today or datetime.now(ARGENTINA_TIMEZONE).date()
-        profile = self.fetch_regsim(chat_id, represented_cuit)
+        profile = self.fetch_regsim(chat_id, represented_cuit, current=current)
         try:
             vepai = self.fetch_vepai(
                 chat_id,
@@ -286,6 +444,27 @@ class SantaFeIibbConnector:
             )
         except SantaFeMaintenance:
             vepai = {"status": "MAINTENANCE", "payments": []}
+        if vepai.get("status") == "AVAILABLE":
+            vepai["reconciliation"] = reconcile_vepai(
+                str(profile["effective_period"]),
+                list(vepai.get("payments", [])),
+                current,
+                list(profile.get("period_quotes", [])),
+            )
+            paid_periods = {
+                str(payment.get("period", "")) for payment in vepai.get("payments", [])
+            }
+            obligations = [
+                quote
+                for quote in profile.get("period_quotes", [])
+                if str(quote.get("period", "")) not in paid_periods
+            ]
+            if obligations:
+                next_obligation = min(obligations, key=lambda quote: str(quote["due_date"]))
+                next_obligation["overdue"] = (
+                    date.fromisoformat(str(next_obligation["due_date"])) < current
+                )
+                profile["next_obligation"] = next_obligation
         profile["vepai"] = vepai
         return profile
 

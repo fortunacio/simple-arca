@@ -11,7 +11,9 @@ from contador_ai.santa_fe import (
     SantaFeIibbWorker,
     SantaFeMaintenance,
     parse_regsim,
+    parse_period_quote,
     parse_vepai,
+    reconcile_vepai,
 )
 
 
@@ -59,13 +61,47 @@ class SantaFeParserTest(TestCase):
         result = parse_vepai(
             """
             <table>
-              <tr><th>Período</th><th>Fecha de pago</th><th>Importe</th></tr>
-              <tr><td>2026/06</td><td>04/08/2026</td><td>$42.882,00</td></tr>
+              <tr><th>Fecha de pago</th><th>Total pago</th><th>Periodo</th><th colspan="2">Detalle</th></tr>
+              <tr><td>04/08/2026</td><td>115.054,50</td><td>2026-04M</td><td>05 - Impuesto</td><td>+ 36.700,00</td></tr>
+              <tr><td></td><td></td><td></td><td>15 - Accesorios</td><td>+ 2.752,50</td></tr>
+              <tr><td></td><td></td><td>2026-05M</td><td>05 - Impuesto</td><td>+ 36.700,00</td></tr>
+              <tr><td></td><td></td><td></td><td>15 - Accesorios</td><td>+ 1.651,50</td></tr>
+              <tr><td></td><td></td><td>2026-06M</td><td>05 - Impuesto</td><td>+ 36.700,00</td></tr>
+              <tr><td></td><td></td><td></td><td>15 - Accesorios</td><td>+ 550,50</td></tr>
             </table>
             """
         )
         self.assertEqual(result["status"], "AVAILABLE")
-        self.assertEqual(result["payments"][0]["period"], "2026-06")
+        self.assertEqual(result["payments"][-1]["period"], "2026-06")
+        self.assertEqual(result["payments"][-1]["amount"], "37250.50")
+        self.assertEqual(result["payment_groups"][0]["total"], "115054.50")
+        self.assertEqual(len(result["payment_groups"][0]["periods"]), 3)
+
+    def test_reconciles_only_periods_that_are_safely_due(self):
+        payments = [
+            {"period": f"2026-{month:02d}"}
+            for month in range(1, 7)
+        ]
+        result = reconcile_vepai("2026-01", payments, date(2026, 8, 6))
+
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertEqual(result["through"], "2026-06")
+        self.assertEqual(result["missing_periods"], [])
+
+    def test_parses_next_period_amount_and_due_date(self):
+        result = parse_period_quote(
+            """
+            <input id="fe_vencimi_periodo_vep" value="20/08/2026">
+            <input id="importe_periodo_vep" value="42882,00">
+            <input id="interes_periodo_vep" value="471,70">
+            """,
+            "2026-07",
+        )
+
+        self.assertEqual(
+            result,
+            {"period": "2026-07", "due_date": "2026-08-20", "amount": "42882.00"},
+        )
 
 
 class _Connector:

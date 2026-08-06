@@ -1,6 +1,6 @@
 from unittest import TestCase
 
-from contador_ai.telegram import TelegramClient
+from contador_ai.telegram import BOT_COMMANDS, TelegramClient
 
 
 class FakeDatabase:
@@ -49,6 +49,21 @@ class FakeTelegramClient(TelegramClient):
 
 
 class TelegramAccessTest(TestCase):
+    def test_registers_a_short_command_menu_for_private_chats(self):
+        client = FakeTelegramClient([], {123})
+
+        client.set_commands()
+
+        method, payload = client.sent[0]
+        self.assertEqual(method, "setMyCommands")
+        commands = __import__("json").loads(payload["commands"])
+        self.assertEqual(commands[0]["command"], "estado")
+        self.assertEqual(len(commands), len(BOT_COMMANDS))
+        self.assertEqual(
+            __import__("json").loads(payload["scope"]),
+            {"type": "all_private_chats"},
+        )
+
     def test_unauthorized_private_chat_is_silently_ignored(self):
         client = FakeTelegramClient(
             [

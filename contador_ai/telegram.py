@@ -15,6 +15,20 @@ from .service import TaxMonitorService
 
 LOGGER = logging.getLogger(__name__)
 
+BOT_COMMANDS = (
+    ("estado", "Resumen de ARCA e Ingresos Brutos"),
+    ("iibb", "Deuda y próximo pago de Ingresos Brutos"),
+    ("monotributo", "Deuda y próximo vencimiento del monotributo"),
+    ("categoria", "Categoría actual y proyectada"),
+    ("facturacion", "Facturación de los últimos 12 meses"),
+    ("facturas", "Ver las últimas facturas"),
+    ("nueva_factura", "Preparar una Factura C"),
+    ("nuevo_cliente", "Guardar un cliente para facturar"),
+    ("bandeja", "Mensajes sin leer de ARCA"),
+    ("configurar_arca", "Guardar o actualizar la clave fiscal"),
+    ("ayuda", "Ver todos los comandos disponibles"),
+)
+
 
 class TelegramClient:
     def __init__(
@@ -74,6 +88,25 @@ class TelegramClient:
         if keyboard:
             payload["reply_markup"] = self._reply_markup(keyboard)
         self.request("sendMessage", payload)
+
+    def set_commands(self) -> None:
+        self.request(
+            "setMyCommands",
+            {
+                "commands": json.dumps(
+                    [
+                        {"command": command, "description": description}
+                        for command, description in BOT_COMMANDS
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "scope": json.dumps(
+                    {"type": "all_private_chats"},
+                    separators=(",", ":"),
+                ),
+            },
+        )
 
     def edit_message(self, chat_id: int, message_id: int, text: str, keyboard=()) -> None:
         payload = {
@@ -222,6 +255,10 @@ class TelegramClient:
         return handled
 
     def run(self) -> None:
+        try:
+            self.set_commands()
+        except Exception:
+            LOGGER.exception("No pude actualizar el menú de comandos de Telegram")
         LOGGER.info("Bot multiusuario iniciado")
         while True:
             try:

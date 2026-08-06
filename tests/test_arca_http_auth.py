@@ -4,7 +4,7 @@ from unittest import TestCase
 import httpx
 
 from contador_ai.arca_http_auth import ArcaHttpAuthenticator
-from contador_ai.ccma import CcmaCredentialsRejected
+from contador_ai.ccma import CcmaCredentialsRejected, CcmaSessionRequired
 
 
 USERNAME_FORM = """
@@ -74,3 +74,58 @@ class ArcaHttpAuthenticatorTest(TestCase):
 
         with self.assertRaises(CcmaCredentialsRejected):
             authenticator.authenticate("20383717419", "incorrecta")
+
+    def test_follows_the_hidden_sso_form_without_javascript(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(200, text=USERNAME_FORM)
+            if len(requests) == 2:
+                return httpx.Response(200, text=PASSWORD_FORM)
+            if len(requests) == 3:
+                return httpx.Response(
+                    200,
+                    text="""
+                    <form method="post"
+                          action="https://monotributo.afip.gob.ar/app/Inicio.aspx">
+                      <input type="hidden" name="token" value="sso-token">
+                    </form>
+                    <script>document.forms[0].submit()</script>
+                    """,
+                )
+            return httpx.Response(
+                200,
+                text="<button>Ver Saldo / Pagar</button>",
+                headers={"Set-Cookie": "mono=session; Path=/; HttpOnly; Secure"},
+            )
+
+        authenticator = ArcaHttpAuthenticator(transport=httpx.MockTransport(handler))
+        cookies = authenticator.authenticate("20383717419", "clave-secreta")
+
+        relay_data = urllib.parse.parse_qs(requests[3].content.decode())
+        self.assertEqual(relay_data["token"], ["sso-token"])
+        self.assertEqual(cookies[0]["name"], "mono")
+
+    def test_preserves_safe_feedback_from_arca(self):
+        responses = iter(
+            (
+                httpx.Response(200, text=USERNAME_FORM),
+                httpx.Response(200, text=PASSWORD_FORM),
+                httpx.Response(
+                    200,
+                    text=PASSWORD_FORM
+                    + '<span id="F1:msg">Intentá nuevamente más tarde</span>',
+                ),
+            )
+        )
+        authenticator = ArcaHttpAuthenticator(
+            transport=httpx.MockTransport(lambda _request: next(responses))
+        )
+
+        with self.assertRaisesRegex(
+            CcmaSessionRequired,
+            "Intentá nuevamente más tarde",
+        ):
+            authenticator.authenticate("20383717419", "cualquiera")

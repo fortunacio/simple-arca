@@ -124,7 +124,7 @@ HTTPS del proxy de la VPS dirigida al puerto interno `8090`. Desde Telegram usar
 El bot genera un enlace aleatorio válido por diez minutos y por un único intento.
 La clave se carga en esa página, viaja por HTTPS directamente al worker y nunca se
 envía por Telegram. El worker verifica el ingreso y el CUIT antes de cifrarla. En
-desarrollo puede usarse `http://localhost:8090`; cualquier URL remota sin HTTPS hace
+desarrollo puede usarse `http://127.0.0.1:8090`; cualquier URL remota sin HTTPS hace
 que el bot se niegue a iniciar.
 
 noVNC queda sólo como recuperación excepcional si ARCA solicita CAPTCHA u otra

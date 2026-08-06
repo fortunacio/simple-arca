@@ -3,6 +3,15 @@ set -eu
 
 export DISPLAY="${DISPLAY:-:99}"
 
+display_number="${DISPLAY#:}"
+case "$display_number" in
+    ""|*[!0-9]*)
+        echo "DISPLAY debe tener el formato :NUMERO" >&2
+        exit 1
+        ;;
+esac
+rm -f "/tmp/.X${display_number}-lock" "/tmp/.X11-unix/X${display_number}"
+
 Xvfb "$DISPLAY" -screen 0 1440x900x24 -nolisten tcp &
 fluxbox >/tmp/fluxbox.log 2>&1 &
 x11vnc -display "$DISPLAY" -forever -shared -localhost -rfbport 5900 -nopw \

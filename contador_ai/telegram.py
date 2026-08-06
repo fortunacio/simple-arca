@@ -37,6 +37,13 @@ class TelegramClient:
         try:
             with urllib.request.urlopen(request, timeout=45) as response:
                 result = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            try:
+                error = json.loads(exc.read())
+                description = error.get("description", str(exc))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                description = str(exc)
+            raise RuntimeError(f"Telegram rechazó {method}: {description}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Telegram no respondió: {exc}") from exc
         if not result.get("ok"):

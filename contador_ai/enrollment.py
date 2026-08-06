@@ -210,15 +210,16 @@ Verificando tus datos con ARCA. Puede tardar hasta dos minutos; no cierres esta 
             return
         except CcmaSessionRequired as exc:
             LOGGER.warning(
-                "ARCA pidió validación adicional para chat_id=%s: %s",
+                "ARCA no completó el ingreso para chat_id=%s: %s",
                 row["chat_id"],
                 exc,
             )
             self._send(
                 409,
                 _page(
-                    "ARCA pidió otra validación",
-                    "<p>No se guardó la clave. ARCA solicitó CAPTCHA u otra intervención manual.</p>",
+                    "ARCA no completó el ingreso",
+                    f"<p>{html.escape(str(exc))}</p>"
+                    "<p>No se guardó la clave.</p>",
                 ),
             )
             return

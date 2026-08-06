@@ -241,6 +241,54 @@ class ServiceTest(TestCase):
 
         self.assertIn("rechazó la clave fiscal guardada", output)
 
+    def test_iibb_shows_profile_without_claiming_no_debt_during_maintenance(self):
+        self.db.ensure_user(1001)
+        fetched_at = datetime.now(timezone.utc)
+        self.db.upsert_live_snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            fetched_at.isoformat(),
+            (fetched_at + timedelta(hours=1)).isoformat(),
+            json.dumps(
+                {
+                    "regime": "Régimen Simplificado",
+                    "status": "ACTIVO",
+                    "account": "131-123456-7",
+                    "adhesion_date": "2024-01-31",
+                    "category": "III",
+                    "monthly_amount": "42882.00",
+                    "payments_as_of": "2026-08-03",
+                    "payments": [
+                        {
+                            "period": "2025-05",
+                            "paid_on": "2025-07-01",
+                            "amount": "28746.01",
+                        }
+                    ],
+                    "vepai": {"status": "MAINTENANCE", "payments": []},
+                }
+            ),
+        )
+        self.db.upsert_connection(
+            1001,
+            "SANTA_FE_IIBB",
+            "PARTIAL",
+            fetched_at.isoformat(),
+        )
+        service = TaxMonitorService(
+            self.db,
+            live_synchronizers={"SANTA_FE_IIBB": lambda _chat_id: None},
+        )
+
+        output = service.dispatch("/iibb", 1001)
+
+        self.assertIn("Categoría III — $42.882,00 por mes", output)
+        self.assertIn("VEPAI está en mantenimiento", output)
+        self.assertIn("no puedo confirmar", output)
+        self.assertNotIn("No registra deuda", output)
+        self.assertIn("VEPAI está en mantenimiento", service.status(1001))
+
     def test_failed_live_sync_never_falls_back_to_snapshot(self):
         def fail(_chat_id):
             raise RuntimeError("organismo no disponible")

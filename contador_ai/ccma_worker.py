@@ -21,6 +21,7 @@ from .ccma import (
     parse_ccma_account,
 )
 from .db import Database
+from .santa_fe import SantaFeIibbConnector, SantaFeIibbWorker
 
 
 LOGGER = logging.getLogger(__name__)
@@ -404,6 +405,7 @@ def main() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     database = Database(os.environ.get("TAX_MONITOR_DB", "/data/tax_monitor.sqlite3"))
     database.initialize()
     state = EncryptedBrowserState(
@@ -422,6 +424,19 @@ def main() -> None:
             seconds=int(os.environ.get("CCMA_SNAPSHOT_TTL_SECONDS", "86400"))
         ),
     )
+    santa_fe_worker = None
+    if os.environ.get("SANTA_FE_IIBB_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        santa_fe_worker = SantaFeIibbWorker(
+            database,
+            SantaFeIibbConnector(credentials),
+            snapshot_ttl=timedelta(
+                seconds=int(os.environ.get("SANTA_FE_IIBB_SNAPSHOT_TTL_SECONDS", "86400"))
+            ),
+        )
     configured = _chat_ids(
         os.environ.get("CCMA_CHAT_IDS", "")
         or os.environ.get("INVOICE_EMISSION_CHAT_IDS", "")
@@ -476,6 +491,24 @@ def main() -> None:
                 LOGGER.warning("CCMA necesita iniciar sesión para chat_id=%s", chat_id)
             except Exception:
                 LOGGER.exception("Falló la sincronización CCMA para chat_id=%s", chat_id)
+            if santa_fe_worker is not None:
+                try:
+                    santa_fe_worker.sync_chat(chat_id)
+                except CcmaCredentialsRejected:
+                    LOGGER.error(
+                        "ARCA rechazó las credenciales de Santa Fe para chat_id=%s",
+                        chat_id,
+                    )
+                except CcmaSessionRequired:
+                    LOGGER.warning(
+                        "Ingresos Brutos necesita configurar ARCA para chat_id=%s",
+                        chat_id,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Falló la sincronización de Ingresos Brutos para chat_id=%s",
+                        chat_id,
+                    )
         if args.once:
             return
         for _ in range(max(1, interval)):

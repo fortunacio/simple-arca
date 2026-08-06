@@ -35,6 +35,7 @@ PROVIDER_COMMANDS = {
     "ARCA_DFE": "/bandeja",
     "ARCA_CCMA": "/monotributo",
     "ARCA_INVOICES": "/facturacion",
+    "SANTA_FE_IIBB": "/iibb",
 }
 
 ARGENTINA_TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
@@ -143,9 +144,10 @@ class TaxMonitorService:
                 "/nuevo_cliente — guardar un cliente verificado en ARCA",
                 "/bandeja — comunicaciones sin leer de ARCA",
                 "/monotributo — deuda, créditos y próximo vencimiento en CCMA",
+                "/iibb — categoría y pagos de Ingresos Brutos de Santa Fe",
                 "/configurar_arca — guardar o actualizar la clave fiscal de forma segura",
                 "",
-                "Todavía estamos trabajando en otras deudas de ARCA, vencimientos e Ingresos Brutos de Santa Fe.",
+                "Todavía estamos trabajando en otras deudas de ARCA y vencimientos.",
                 "",
                 "/desconectar — desvincular tu cuenta",
             ]
@@ -190,6 +192,14 @@ class TaxMonitorService:
             return f"🟡 {PROVIDERS[provider]} — ARCA pidió una validación manual"
         if row["status"] == "CREDENTIALS_REQUIRED":
             return f"🔴 {PROVIDERS[provider]} — hay que actualizar la clave fiscal guardada"
+        if row["status"] == "PARTIAL":
+            observed = format_datetime_argentina(row["last_success_at"])
+            detail = (
+                "VEPAI está en mantenimiento"
+                if provider == "SANTA_FE_IIBB"
+                else "la consulta quedó incompleta"
+            )
+            return f"🟡 {PROVIDERS[provider]} — {detail}\nActualizado: {observed}"
         if row["status"] != "CONNECTED":
             return f"🔴 {PROVIDERS[provider]} — hubo un problema en la última consulta"
         observed = format_datetime_argentina(row["last_success_at"])
@@ -515,6 +525,70 @@ Ahora falta autorizar el certificado {alias} en ARCA. La cuenta operadora es {op
             lines.append("ARCA rechazó la clave guardada; hay que volver a cargarla.")
         return "\n".join(lines)
 
+    def iibb_account(self, chat_id: int) -> str:
+        if "SANTA_FE_IIBB" not in self.live_synchronizers:
+            return self.source_command(chat_id, "SANTA_FE_IIBB")
+        snapshot = self.valid_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
+        connection = self.connection_map(chat_id).get("SANTA_FE_IIBB")
+        if snapshot is None:
+            if connection and connection["status"] == "CREDENTIALS_REQUIRED":
+                return "ARCA rechazó la clave fiscal guardada. Hay que volver a cargarla."
+            if connection and connection["status"] == "LOGIN_REQUIRED":
+                return "Falta guardar la clave fiscal con /configurar_arca."
+            return self.source_command(chat_id, "SANTA_FE_IIBB")
+
+        lines = [
+            "Ingresos Brutos de Santa Fe",
+            "",
+            f"{snapshot.get('regime', 'Régimen Simplificado')}: {(snapshot.get('status') or 'sin dato').lower()}",
+            f"Categoría {snapshot.get('category', 'sin dato')} — {format_money(snapshot.get('monthly_amount'))} por mes",
+            f"Cuenta: {snapshot.get('account', 'sin dato')}",
+            f"Adhesión: {format_date(snapshot.get('adhesion_date'))}",
+        ]
+        vepai = snapshot.get("vepai", {})
+        vepai_payments = vepai.get("payments", []) if isinstance(vepai, dict) else []
+        registered_payments = snapshot.get("payments", [])
+        payments = vepai_payments or registered_payments
+        if payments:
+            latest = max(
+                payments,
+                key=lambda item: (str(item.get("paid_on", "")), str(item.get("period", ""))),
+            )
+            source = "VEPAI" if vepai_payments else "Régimen Simplificado"
+            lines.extend(
+                [
+                    "",
+                    f"Pagos que muestra {source}: {len(payments)}",
+                    (
+                        f"Último: {self._display_month(str(latest.get('period', '')))} — "
+                        f"{format_money(latest.get('amount'))}, pagado el "
+                        f"{format_date(latest.get('paid_on'))}"
+                    ),
+                ]
+            )
+        payments_as_of = snapshot.get("payments_as_of")
+        if payments_as_of:
+            lines.append(f"Registro de pagos actualizado al {format_date(str(payments_as_of))}.")
+
+        if isinstance(vepai, dict) and vepai.get("status") == "MAINTENANCE":
+            lines.extend(
+                [
+                    "",
+                    "VEPAI está en mantenimiento.",
+                    "Hasta que responda no puedo confirmar si todos los pagos quedaron imputados ni si existe saldo pendiente.",
+                ]
+            )
+        elif isinstance(vepai, dict) and vepai.get("status") == "AVAILABLE":
+            lines.extend(
+                [
+                    "",
+                    "Pagos verificados en VEPAI.",
+                    "La conciliación automática por período todavía está en preparación; no generes un pago sólo con este resumen.",
+                ]
+            )
+        lines.extend(["", f"Consultado: {format_datetime_argentina(snapshot.get('fetched_at'))}"])
+        return "\n".join(lines)
+
     def sync_provider(self, chat_id: int, provider: str) -> str | None:
         synchronizer = self.live_synchronizers.get(provider)
         if synchronizer is None:
@@ -588,7 +662,7 @@ Ahora falta autorizar el certificado {alias} en ARCA. La cuenta operadora es {op
                 ]
             )
         if command == "/iibb":
-            return self.source_command(chat_id, "SANTA_FE_IIBB")
+            return self.iibb_account(chat_id)
         if command == "/vencimientos":
             return "Vencimientos todavía no está disponible."
         if command == "/desconectar":

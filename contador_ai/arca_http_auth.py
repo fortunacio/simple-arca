@@ -4,17 +4,26 @@ import html
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 import httpx
 
 from .ccma import CcmaCredentialsRejected, CcmaSessionRequired
 
 
-ARCA_LOGIN_URL = (
-    "https://auth.afip.gov.ar/contribuyente_/"
-    "login.xhtml?action=SYSTEM&system=admin_mono"
-)
+ARCA_LOGIN_BASE_URL = "https://auth.afip.gov.ar/contribuyente_/login.xhtml"
+ARCA_SYSTEM_TARGETS = {
+    "admin_mono": "monotributo.afip.gob.ar",
+    "santafe_vepai": "www.santafe.gob.ar",
+    "santafe_regsim": "www.santafe.gob.ar",
+}
+
+
+@dataclass
+class ArcaHttpLogin:
+    cookies: list[dict[str, object]]
+    url: str
+    html: str
 
 
 @dataclass
@@ -81,6 +90,7 @@ def _official_host(url: str) -> bool:
         host.endswith(".afip.gov.ar")
         or host.endswith(".afip.gob.ar")
         or host.endswith(".arca.gob.ar")
+        or host.endswith(".santafe.gob.ar")
     )
 
 
@@ -88,11 +98,12 @@ def _follow_sso_relay(
     client: httpx.Client,
     response: httpx.Response,
     *,
+    stop_host: str,
     max_hops: int = 4,
 ) -> httpx.Response:
     current = response
     for _ in range(max_hops):
-        if current.url.host == "monotributo.afip.gob.ar":
+        if current.url.host == stop_host:
             return current
         parser = _FormParser()
         parser.feed(current.text)
@@ -172,7 +183,10 @@ class ArcaHttpAuthenticator:
         self.timeout = timeout
         self.transport = transport
 
-    def authenticate(self, cuit: str, password: str) -> list[dict[str, object]]:
+    def login(self, cuit: str, password: str, system: str) -> ArcaHttpLogin:
+        if system not in ARCA_SYSTEM_TARGETS:
+            raise ValueError("El servicio de ARCA no está habilitado por este cliente")
+        login_url = f"{ARCA_LOGIN_BASE_URL}?{urlencode({'action': 'SYSTEM', 'system': system})}"
         with httpx.Client(
             follow_redirects=True,
             timeout=self.timeout,
@@ -180,7 +194,7 @@ class ArcaHttpAuthenticator:
             headers={"User-Agent": "Mozilla/5.0"},
         ) as client:
             try:
-                first = client.get(ARCA_LOGIN_URL)
+                first = client.get(login_url)
                 first.raise_for_status()
                 username_form = _form_with(first.text, "F1:username")
                 second = _submit(
@@ -205,7 +219,11 @@ class ArcaHttpAuthenticator:
                     },
                 )
                 third.raise_for_status()
-                third = _follow_sso_relay(client, third)
+                third = _follow_sso_relay(
+                    client,
+                    third,
+                    stop_host=ARCA_SYSTEM_TARGETS[system],
+                )
             except httpx.HTTPError as exc:
                 raise CcmaSessionRequired(
                     "ARCA no respondió correctamente durante el ingreso"
@@ -220,13 +238,10 @@ class ArcaHttpAuthenticator:
                     "ARCA mantuvo abierto el formulario de clave fiscal." + detail
                 )
             if (
-                "monotributo.afip.gob.ar" not in third.url.host
-                or "Ver Saldo / Pagar" not in text
+                not _official_host(str(third.url))
             ):
-                raise CcmaSessionRequired(
-                    "ARCA no redirigió el ingreso hacia Monotributo"
-                )
-            return [
+                raise CcmaSessionRequired("ARCA no finalizó el ingreso en un dominio oficial")
+            cookies = [
                 {
                     "name": cookie.name,
                     "value": cookie.value,
@@ -239,3 +254,16 @@ class ArcaHttpAuthenticator:
                 }
                 for cookie in client.cookies.jar
             ]
+            return ArcaHttpLogin(cookies, str(third.url), third.text)
+
+    def authenticate(self, cuit: str, password: str) -> list[dict[str, object]]:
+        login = self.login(cuit, password, "admin_mono")
+        text = _visible_text(login.html)
+        if (
+            httpx.URL(login.url).host != "monotributo.afip.gob.ar"
+            or "Ver Saldo / Pagar" not in text
+        ):
+            raise CcmaSessionRequired(
+                "ARCA no redirigió el ingreso hacia Monotributo"
+            )
+        return login.cookies

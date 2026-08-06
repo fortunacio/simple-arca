@@ -137,36 +137,43 @@ def build_dfe_synchronizer(db: Database) -> ArcaDfeSynchronizer:
 def build_live_synchronizers(db: Database):
     certificate = os.environ.get("ARCA_CERTIFICATE_PATH", "").strip()
     private_key = os.environ.get("ARCA_PRIVATE_KEY_PATH", "").strip()
-    if not certificate and not private_key:
-        return {}
     if not certificate or not private_key:
-        raise SystemExit(
-            "ARCA_CERTIFICATE_PATH y ARCA_PRIVATE_KEY_PATH deben configurarse juntos."
+        if certificate or private_key:
+            raise SystemExit(
+                "ARCA_CERTIFICATE_PATH y ARCA_PRIVATE_KEY_PATH deben configurarse juntos."
+            )
+        synchronizers = {}
+    else:
+        environment = build_arca_environment()
+        tickets = build_ticket_provider(db, environment, certificate, private_key)
+        profile = ArcaProfileSynchronizer(
+            db=db,
+            wsaa=tickets,
+            padron=ConstanciaInscripcionClient(environment),
         )
-    environment = build_arca_environment()
-    tickets = build_ticket_provider(db, environment, certificate, private_key)
-    profile = ArcaProfileSynchronizer(
-        db=db,
-        wsaa=tickets,
-        padron=ConstanciaInscripcionClient(environment),
-    )
-    dfe = ArcaDfeSynchronizer(
-        db=db,
-        wsaa=tickets,
-        dfe=DfeClient(environment),
-    )
-    invoices = ArcaInvoicesSynchronizer(
-        db=db,
-        wsaa=tickets,
-        wsfe=WsfeClient(environment),
-    )
-    synchronizers = {
-        "ARCA_PROFILE": profile.sync_chat,
-        "ARCA_DFE": dfe.sync_chat,
-        "ARCA_INVOICES": invoices.sync_chat,
-    }
+        dfe = ArcaDfeSynchronizer(
+            db=db,
+            wsaa=tickets,
+            dfe=DfeClient(environment),
+        )
+        invoices = ArcaInvoicesSynchronizer(
+            db=db,
+            wsaa=tickets,
+            wsfe=WsfeClient(environment),
+        )
+        synchronizers = {
+            "ARCA_PROFILE": profile.sync_chat,
+            "ARCA_DFE": dfe.sync_chat,
+            "ARCA_INVOICES": invoices.sync_chat,
+        }
     if os.environ.get("CCMA_ENABLED", "").strip().lower() in {"1", "true", "yes"}:
         synchronizers["ARCA_CCMA"] = lambda _chat_id: None
+        if os.environ.get("SANTA_FE_IIBB_ENABLED", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            synchronizers["SANTA_FE_IIBB"] = lambda _chat_id: None
     return synchronizers
 
 

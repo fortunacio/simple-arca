@@ -57,13 +57,15 @@ Funciona:
   Services y validado mediante `FEParamGetPtosVenta`. El `00001` permanece reservado
   para Comprobantes en Línea.
 - CCMA: parser validado que separa deuda vencida, saldo a favor y obligaciones todavía
-  no vencidas. El conector usa un Chromium aislado; su sesión y, opcionalmente, las
-  credenciales verificadas se guardan cifradas fuera de la base principal.
+  no vencidas. El ingreso se renueva por HTTPS y Chromium queda limitado a leer CCMA;
+  la sesión y las credenciales verificadas se guardan cifradas fuera de la base principal.
+- Ingresos Brutos Santa Fe: consulta automática del Régimen Simplificado y VEPAI con
+  la misma clave cifrada. Si VEPAI está en mantenimiento, el bot conserva la categoría
+  y los pagos visibles, pero no afirma que la cuenta esté al día.
 
 Pendiente:
 
-- Onboarding HTTPS de un solo uso.
-- Integración de deuda y régimen simplificado de Ingresos Brutos Santa Fe.
+- Conciliación automática de períodos e importes de Ingresos Brutos Santa Fe.
 - Delegación de servicios a usuarios operadores y pool acotado de sesiones para CCMA,
   Comprobantes en Línea y Santa Fe.
 - Extracción y normalización de respuestas de cada organismo.
@@ -143,8 +145,9 @@ docker compose --profile portal up -d portal-worker
 La sesión y las credenciales se cifran con `SESSION_ENCRYPTION_KEY` y quedan en el
 volumen `portal_state`, con permisos `0600`. Cuando la sesión vence, el worker vuelve
 a ingresar automáticamente. Si ARCA rechaza la clave o exige CAPTCHA/otra validación,
-no insiste en bucle y lo informa. El worker consulta CCMA cada seis horas y actualiza
-el snapshot que usan `/monotributo` y `/deuda_arca`. No genera VEP ni realiza pagos.
+no insiste en bucle y lo informa. El worker consulta CCMA, Régimen Simplificado y
+VEPAI cada seis horas y actualiza los datos que usan `/monotributo`, `/deuda_arca`
+y `/iibb`. No genera VEP ni realiza pagos.
 
 ## Autenticación prevista
 

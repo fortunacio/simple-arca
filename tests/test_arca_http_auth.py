@@ -108,6 +108,38 @@ class ArcaHttpAuthenticatorTest(TestCase):
         self.assertEqual(relay_data["token"], ["sso-token"])
         self.assertEqual(cookies[0]["name"], "mono")
 
+    def test_can_stop_the_sso_relay_at_santa_fe(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(200, text=USERNAME_FORM)
+            if len(requests) == 2:
+                return httpx.Response(200, text=PASSWORD_FORM)
+            if len(requests) == 3:
+                return httpx.Response(
+                    200,
+                    text="""
+                    <form method="post"
+                          action="https://www.santafe.gob.ar/e-vepa/index.php">
+                      <input type="hidden" name="token" value="sso-token">
+                    </form>
+                    """,
+                )
+            return httpx.Response(200, text="<h1>VEPAI</h1><form></form>")
+
+        authenticator = ArcaHttpAuthenticator(transport=httpx.MockTransport(handler))
+        login = authenticator.login(
+            "20383717419",
+            "clave-secreta",
+            "santafe_vepai",
+        )
+
+        self.assertEqual(httpx.URL(login.url).host, "www.santafe.gob.ar")
+        self.assertIn("VEPAI", login.html)
+        self.assertEqual(len(requests), 4)
+
     def test_preserves_safe_feedback_from_arca(self):
         responses = iter(
             (

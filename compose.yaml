@@ -1,0 +1,34 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TAX_MONITOR_DB: /data/tax_monitor.sqlite3
+    volumes:
+      - tax_data:/data
+      - ./secrets:/run/secrets:ro
+
+  portal-worker:
+    profiles: ["portal"]
+    build:
+      context: .
+      dockerfile: Dockerfile.portal
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TAX_MONITOR_DB: /data/tax_monitor.sqlite3
+      CCMA_SESSION_DIR: /portal-state
+    ports:
+      - "127.0.0.1:6080:6080"
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - tax_data:/data
+      - portal_state:/portal-state
+      - ./secrets:/run/secrets:ro
+
+volumes:
+  tax_data:
+  portal_state:

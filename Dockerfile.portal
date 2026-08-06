@@ -1,0 +1,33 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DISPLAY=:99 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    TAX_MONITOR_DB=/data/tax_monitor.sqlite3
+
+WORKDIR /app
+
+COPY requirements.txt requirements.portal.txt ./
+RUN mkdir -p /ms-playwright \
+    && pip install --no-cache-dir --requirement requirements.portal.txt \
+    && python -m playwright install --with-deps chromium \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        fluxbox novnc websockify x11vnc xvfb \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 appuser \
+    && mkdir -p /data /portal-state /tmp/.X11-unix \
+    && chmod 1777 /tmp/.X11-unix \
+    && chown -R appuser:appuser /data /portal-state /home/appuser \
+    && chmod -R a+rX /ms-playwright
+
+COPY --chown=appuser:appuser contador_ai ./contador_ai
+COPY --chown=appuser:appuser scripts/run_portal_worker.sh /usr/local/bin/run_portal-worker
+RUN chmod 0755 /usr/local/bin/run_portal-worker
+
+USER appuser
+VOLUME ["/data", "/portal-state"]
+EXPOSE 6080
+
+ENTRYPOINT ["run_portal-worker"]

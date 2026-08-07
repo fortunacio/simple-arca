@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -11,7 +12,10 @@ from contador_ai.ccma_worker import (
     CcmaBrowserConnector,
     EncryptedArcaCredentials,
     EncryptedBrowserState,
+    sync_portal_sources,
 )
+from contador_ai.db import Database
+from contador_ai.iibb_payment import IibbPaymentStore
 
 
 SUMMARY = """
@@ -134,3 +138,37 @@ class CcmaParserTest(TestCase):
                 "Complete la validación de seguridad"
             )
         )
+
+    def test_initial_sync_marks_the_portal_access_ready(self):
+        class Worker:
+            def __init__(self):
+                self.calls = []
+
+            def sync_chat(self, chat_id):
+                self.calls.append(chat_id)
+
+        with TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.ensure_user(1001)
+            db.set_pending_tax_identity(1001, "20383717419", "production")
+            db.mark_tax_identity_verified(1001)
+            db.mark_portal_access_verified(
+                1001, "20383717419", datetime.now(timezone.utc).isoformat()
+            )
+            ccma, seti, santa_fe = Worker(), Worker(), Worker()
+
+            ready = sync_portal_sources(
+                1001,
+                db,
+                ccma,
+                seti,
+                santa_fe,
+                IibbPaymentStore(db),
+            )
+
+            self.assertTrue(ready)
+            self.assertEqual(ccma.calls, [1001])
+            self.assertEqual(seti.calls, [1001])
+            self.assertEqual(santa_fe.calls, [1001])
+            self.assertIsNotNone(db.get_portal_access(1001)["ready_at"])

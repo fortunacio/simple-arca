@@ -7,6 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 
 from .db import Database
 from .bot_reply import BotReply
@@ -258,7 +259,7 @@ class TelegramClient:
                     continue
             response = self.service.dispatch(text, chat_id)
             keyboard = ()
-            if command == "/configurar_arca":
+            if command in {"/conectar", "/configurar_arca"}:
                 setup_url = next(
                     (
                         line.strip()
@@ -268,7 +269,12 @@ class TelegramClient:
                     "",
                 )
                 if setup_url:
-                    keyboard = ((("Abrir configuración de ARCA", setup_url),),)
+                    label = (
+                        "Completar conexión"
+                        if command == "/conectar"
+                        else "Abrir configuración de ARCA"
+                    )
+                    keyboard = (((label, setup_url),),)
             self.send_message(chat_id, response, keyboard)
             handled += 1
         return handled
@@ -302,11 +308,31 @@ class TelegramClient:
                 LOGGER.exception("No pude entregar una novedad de pago de Ingresos Brutos")
         return sent
 
+    def run_portal_access_notifications(self) -> int:
+        sent = 0
+        for row in self.db.pending_portal_access_notifications(self.allowed_chat_ids):
+            chat_id = int(row["chat_id"])
+            try:
+                self.send_message(
+                    chat_id,
+                    "Tu cuenta está lista. Ya actualicé Monotributo e Ingresos "
+                    "Brutos.",
+                    ((("Ver resumen", "tax:summary"),),),
+                )
+                self.db.mark_portal_access_notified(
+                    chat_id, datetime.now(timezone.utc).isoformat()
+                )
+                sent += 1
+            except Exception:
+                LOGGER.exception("No pude confirmar que la cuenta quedó lista")
+        return sent
+
     def run(self) -> None:
         try:
             self.set_commands()
         except Exception:
             LOGGER.exception("No pude actualizar el menú de comandos de Telegram")
+        self.run_portal_access_notifications()
         self.run_monitor_once()
         next_monitor = time.monotonic() + self.monitor_interval_seconds
         LOGGER.info("Bot multiusuario iniciado")
@@ -314,6 +340,7 @@ class TelegramClient:
             try:
                 self.poll_once(timeout=10 if self.iibb_payment_bot is not None else 30)
                 self.run_iibb_payment_notifications()
+                self.run_portal_access_notifications()
                 if time.monotonic() >= next_monitor:
                     self.run_monitor_once()
                     next_monitor = time.monotonic() + self.monitor_interval_seconds

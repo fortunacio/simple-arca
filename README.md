@@ -87,17 +87,20 @@ Para ejecutar comandos o pruebas sin Docker:
 
 ## Alta privada de CUIT y clave fiscal
 
-La conexión tiene dos partes distintas, pero sólo una requiere cargar la clave:
+La conexión tiene dos mecanismos internos, pero el usuario completa un solo flujo:
 
 - `/conectar CUIT` verifica automáticamente la identidad mediante el certificado ya
-  autorizado en ARCA. No requiere volver a autorizarlo en cada instalación.
-- `/configurar_arca` genera un enlace de un solo uso para guardar la clave fiscal. Esa
-  clave compartida permite consultar tanto Monotributo como Ingresos Brutos y se carga
-  una sola vez por instalación persistente.
+  autorizado en ARCA. Si todavía falta el acceso web, la misma respuesta incluye el
+  botón `Completar conexión`.
+- El formulario guarda una única clave fiscal cifrada para consultar tanto Monotributo
+  como Ingresos Brutos. Al terminar, ambos servicios se actualizan y Telegram confirma
+  que la cuenta quedó lista.
 
-`/configurar_arca` genera un enlace de un solo uso y diez minutos de duración. El
+El enlace es de un solo uso y dura diez minutos. El
 formulario manda el CUIT y la clave directamente a `portal-worker`; esos datos no
 pasan por Telegram. La clave se valida contra ARCA y sólo se conserva cifrada.
+`/configurar_arca` queda disponible como comando oculto para reemplazar una clave que
+haya cambiado o haya sido rechazada.
 
 `/desconectar` deja de consultar y mostrar la cuenta inmediatamente. Las facturas
 emitidas y la clave cifrada se conservan para permitir una reconexión sin repetir toda

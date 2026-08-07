@@ -271,8 +271,41 @@ class TaxNotificationMonitor:
             "SANTA_FE_IIBB": "Ingresos Brutos",
         }
         connections = {row["provider"]: row for row in self.db.get_connections(chat_id)}
+        portal_providers = {"ARCA_CCMA", "ARCA_SETI", "SANTA_FE_IIBB"}
+        identity = self.db.get_tax_identity(chat_id)
+        portal_access = self.db.get_portal_access(chat_id)
+        portal_enabled = any(
+            provider in self.service.live_synchronizers for provider in portal_providers
+        )
+        portal_needs_credentials = (
+            portal_enabled
+            and identity is not None
+            and identity["status"] == "VERIFIED"
+            and (
+                portal_access is None
+                or portal_access["represented_cuit"] != identity["represented_cuit"]
+            )
+        )
+        if portal_needs_credentials:
+            had_portal_access = any(
+                connection is not None and connection["last_success_at"]
+                for provider, connection in connections.items()
+                if provider in portal_providers
+            )
+            add(
+                "Acceso a ARCA",
+                "portal-access",
+                "missing",
+                "• El acceso guardado dejó de funcionar. Volvé a cargar tu clave "
+                "fiscal una vez."
+                if had_portal_access
+                else "• Falta completar la conexión una sola vez para consultar "
+                "Monotributo e Ingresos Brutos.",
+            )
         for provider, maximum_age in STALE_AFTER.items():
             if provider not in self.service.live_synchronizers:
+                continue
+            if portal_needs_credentials and provider in portal_providers:
                 continue
             connection = connections.get(provider)
             snapshot = self._snapshot(chat_id, provider)

@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS tax_identities (
     FOREIGN KEY (chat_id) REFERENCES users(chat_id)
 );
 
+CREATE TABLE IF NOT EXISTS portal_access (
+    chat_id INTEGER PRIMARY KEY,
+    represented_cuit TEXT NOT NULL,
+    verified_at TEXT NOT NULL,
+    ready_at TEXT,
+    notified_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS bot_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -451,6 +461,76 @@ class Database:
                 WHERE chat_id = ?
                 """,
                 (error[:500], chat_id),
+            )
+
+    def mark_portal_access_verified(
+        self, chat_id: int, represented_cuit: str, verified_at: str
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO portal_access(
+                    chat_id, represented_cuit, verified_at, ready_at, notified_at
+                ) VALUES (?, ?, ?, NULL, NULL)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    represented_cuit = excluded.represented_cuit,
+                    verified_at = excluded.verified_at,
+                    ready_at = NULL,
+                    notified_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, represented_cuit, verified_at),
+            )
+
+    def get_portal_access(self, chat_id: int):
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM portal_access WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+
+    def clear_portal_access(self, chat_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM portal_access WHERE chat_id = ?", (chat_id,))
+
+    def mark_portal_access_ready(self, chat_id: int, ready_at: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE portal_access
+                SET ready_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ?
+                """,
+                (ready_at, chat_id),
+            )
+
+    def pending_portal_access_notifications(self, allowed_chat_ids: frozenset[int]):
+        if not allowed_chat_ids:
+            return []
+        placeholders = ",".join("?" for _ in allowed_chat_ids)
+        with self.connect() as connection:
+            return connection.execute(
+                f"""
+                SELECT portal_access.* FROM portal_access
+                JOIN tax_identities USING(chat_id)
+                WHERE portal_access.ready_at IS NOT NULL
+                  AND portal_access.notified_at IS NULL
+                  AND tax_identities.status = 'VERIFIED'
+                  AND tax_identities.represented_cuit = portal_access.represented_cuit
+                  AND portal_access.chat_id IN ({placeholders})
+                ORDER BY portal_access.ready_at
+                """,
+                tuple(sorted(allowed_chat_ids)),
+            ).fetchall()
+
+    def mark_portal_access_notified(self, chat_id: int, notified_at: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE portal_access
+                SET notified_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ? AND ready_at IS NOT NULL
+                """,
+                (notified_at, chat_id),
             )
 
     def upsert_connection(

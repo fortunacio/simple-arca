@@ -190,8 +190,8 @@ la vuelve a sus valores iniciales.
 
 No se precargan credenciales, sesiones, snapshots tributarios, mensajes, pagos, VEP,
 borradores ni auditoría del Mac. Las consultas oficiales vuelven a obtener el estado
-actual; la clave fiscal se guarda nuevamente con `/configurar_arca` en el volumen
-`portal_state`.
+actual; `/conectar CUIT` entrega el formulario para guardar nuevamente la clave fiscal
+en el volumen `portal_state`.
 
 ## Red y formulario privado
 
@@ -260,10 +260,10 @@ cargan ambas fuentes, el healthcheck del bot falla con el mensaje
 7. Desplegar ambos servicios.
 8. Esperar que `bot` y `portal-worker` estén `healthy`.
 9. En una instalación nueva, ejecutar `/conectar 20383717419`. El bot debe verificar
-   el CUIT automáticamente con el certificado ya autorizado y responder que quedó
-   verificado. Luego ejecutar `/configurar_arca` para guardar la clave mediante
-   Tailscale.
-10. Confirmar que el alta termine en “Acceso guardado”.
+   el CUIT automáticamente y mostrar `Completar conexión` en la misma respuesta.
+10. Abrir ese botón mediante Tailscale y confirmar que el alta termine en “Acceso
+    guardado”. El worker debe actualizar las fuentes inmediatamente y Telegram debe
+    avisar que la cuenta quedó lista.
 11. Ejecutar `/resumen` y `/facturas` y verificar la actualización de Monotributo e
    Ingresos Brutos.
 12. Abrir `Pagos y vencimientos` y comprobar que el botón de pago sólo aparece en el

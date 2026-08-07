@@ -8,12 +8,22 @@ from contador_ai.telegram import BOT_COMMANDS, TelegramClient
 class FakeDatabase:
     def __init__(self):
         self.state = {}
+        self.portal_notifications = []
+        self.portal_notified = []
 
     def get_bot_state(self, key, default=None):
         return self.state.get(key, default)
 
     def set_bot_state(self, key, value):
         self.state[key] = value
+
+    def pending_portal_access_notifications(self, allowed_chat_ids):
+        return [
+            row for row in self.portal_notifications if row["chat_id"] in allowed_chat_ids
+        ]
+
+    def mark_portal_access_notified(self, chat_id, notified_at):
+        self.portal_notified.append((chat_id, notified_at))
 
 
 class FakeService:
@@ -35,6 +45,11 @@ class FakeService:
             return (
                 "Configuración de ARCA\n\n"
                 "http://localhost:8090/arca/setup/token-seguro"
+            )
+        if text.startswith("/conectar"):
+            return (
+                "Listo, verifiqué tu CUIT.\n\n"
+                "http://localhost:8090/arca/setup/token-conexion"
             )
         return "respuesta"
 
@@ -211,6 +226,38 @@ class TelegramAccessTest(TestCase):
             "http://localhost:8090/arca/setup/token-seguro",
         )
         self.assertNotIn("callback_data", button)
+
+    def test_connect_sends_the_setup_as_part_of_the_same_flow(self):
+        client = FakeTelegramClient(
+            [
+                {
+                    "update_id": 32,
+                    "message": {
+                        "chat": {"id": 123},
+                        "text": "/conectar 20383717419",
+                    },
+                }
+            ],
+            {123},
+        )
+
+        self.assertEqual(client.poll_once(timeout=0), 1)
+        payload = client.sent[0][1]
+        button = __import__("json").loads(payload["reply_markup"])["inline_keyboard"][0][0]
+        self.assertEqual(button["text"], "Completar conexión")
+        self.assertEqual(
+            button["url"],
+            "http://localhost:8090/arca/setup/token-conexion",
+        )
+
+    def test_notifies_when_the_initial_account_sync_is_ready(self):
+        client = FakeTelegramClient([], {123})
+        client.fake_db.portal_notifications = [{"chat_id": 123}]
+
+        self.assertEqual(client.run_portal_access_notifications(), 1)
+
+        self.assertIn("Tu cuenta está lista", client.sent[0][1]["text"])
+        self.assertEqual(client.fake_db.portal_notified[0][0], 123)
 
     def test_unauthorized_callback_is_silently_ignored(self):
         client = FakeTelegramClient(

@@ -397,6 +397,57 @@ def _chat_ids(value: str) -> tuple[int, ...]:
         raise SystemExit("CCMA_CHAT_IDS debe contener números separados por coma") from exc
 
 
+def sync_portal_sources(
+    chat_id: int,
+    database: Database,
+    ccma_worker: CcmaWorker,
+    seti_worker: SetiPaymentsWorker | None,
+    santa_fe_worker: SantaFeIibbWorker | None,
+    iibb_payment_store: IibbPaymentStore,
+) -> bool:
+    ccma_ready = False
+    santa_fe_ready = santa_fe_worker is None
+    try:
+        ccma_worker.sync_chat(chat_id)
+        ccma_ready = True
+    except CcmaCredentialsRejected:
+        database.clear_portal_access(chat_id)
+        LOGGER.error("ARCA rechazó las credenciales guardadas para chat_id=%s", chat_id)
+    except CcmaSessionRequired:
+        database.clear_portal_access(chat_id)
+        LOGGER.warning("CCMA necesita configurar el acceso para chat_id=%s", chat_id)
+    except Exception:
+        LOGGER.exception("Falló la sincronización CCMA para chat_id=%s", chat_id)
+
+    if seti_worker is not None and ccma_ready:
+        try:
+            seti_worker.sync_chat(chat_id)
+        except Exception:
+            LOGGER.exception("Falló la consulta de pagos de ARCA para chat_id=%s", chat_id)
+
+    if santa_fe_worker is not None:
+        try:
+            santa_fe_worker.sync_chat(chat_id)
+            iibb_payment_store.reconcile_paid(chat_id)
+            santa_fe_ready = True
+        except (CcmaCredentialsRejected, CcmaSessionRequired):
+            database.clear_portal_access(chat_id)
+            LOGGER.warning(
+                "Ingresos Brutos necesita configurar el acceso para chat_id=%s",
+                chat_id,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Falló la sincronización de Ingresos Brutos para chat_id=%s",
+                chat_id,
+            )
+
+    ready = ccma_ready and santa_fe_ready
+    if ready and database.get_portal_access(chat_id) is not None:
+        database.mark_portal_access_ready(chat_id, datetime.now(timezone.utc).isoformat())
+    return ready
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sincronizador personal de CCMA")
     parser.add_argument("--once", action="store_true")
@@ -505,6 +556,14 @@ def main() -> None:
             ),
             database,
             connector,
+            on_verified=lambda chat_id: sync_portal_sources(
+                chat_id,
+                database,
+                worker,
+                seti_worker,
+                santa_fe_worker,
+                iibb_payment_store,
+            ),
         )
         enrollment_server.start()
         LOGGER.info("Alta privada de ARCA disponible en el puerto %s", enrollment_server.server_port)
@@ -528,41 +587,14 @@ def main() -> None:
             time.sleep(1)
             continue
         for chat_id in chat_ids:
-            try:
-                worker.sync_chat(chat_id)
-            except CcmaCredentialsRejected:
-                LOGGER.error("ARCA rechazó las credenciales guardadas para chat_id=%s", chat_id)
-            except CcmaSessionRequired:
-                LOGGER.warning("CCMA necesita iniciar sesión para chat_id=%s", chat_id)
-            except Exception:
-                LOGGER.exception("Falló la sincronización CCMA para chat_id=%s", chat_id)
-            if seti_worker is not None:
-                try:
-                    seti_worker.sync_chat(chat_id)
-                except Exception:
-                    LOGGER.exception(
-                        "Falló la consulta de pagos de ARCA para chat_id=%s",
-                        chat_id,
-                    )
-            if santa_fe_worker is not None:
-                try:
-                    santa_fe_worker.sync_chat(chat_id)
-                    iibb_payment_store.reconcile_paid(chat_id)
-                except CcmaCredentialsRejected:
-                    LOGGER.error(
-                        "ARCA rechazó las credenciales de Santa Fe para chat_id=%s",
-                        chat_id,
-                    )
-                except CcmaSessionRequired:
-                    LOGGER.warning(
-                        "Ingresos Brutos necesita configurar ARCA para chat_id=%s",
-                        chat_id,
-                    )
-                except Exception:
-                    LOGGER.exception(
-                        "Falló la sincronización de Ingresos Brutos para chat_id=%s",
-                        chat_id,
-                    )
+            sync_portal_sources(
+                chat_id,
+                database,
+                worker,
+                seti_worker,
+                santa_fe_worker,
+                iibb_payment_store,
+            )
         if args.once:
             return
         next_sync = time.monotonic() + max(1, interval)

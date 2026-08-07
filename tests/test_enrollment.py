@@ -1,6 +1,7 @@
 import urllib.error
 import urllib.parse
 import urllib.request
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -67,14 +68,21 @@ class EnrollmentTest(TestCase):
     def test_password_goes_directly_to_connector_and_token_is_consumed(self):
         link = self._new_link()
         payload = urllib.parse.urlencode({"password": "clave-secreta"}).encode()
+        refreshed = threading.Event()
+        self.server.on_verified = lambda chat_id: refreshed.set() if chat_id == 1001 else None
 
         with urllib.request.urlopen(link, data=payload) as response:
-            self.assertIn("Acceso guardado", response.read().decode())
+            body = response.read().decode()
+            self.assertIn("Acceso guardado", body)
+            self.assertIn("Te aviso por Telegram", body)
 
         self.assertEqual(
             self.connector.received,
             [(1001, "20383717419", "clave-secreta")],
         )
+        access = self.db.get_portal_access(1001)
+        self.assertEqual(access["represented_cuit"], "20383717419")
+        self.assertTrue(refreshed.wait(timeout=1))
         with self.assertRaises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(link)
         self.assertEqual(error.exception.code, 410)

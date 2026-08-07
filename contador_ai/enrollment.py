@@ -8,7 +8,7 @@ import threading
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from .ccma import CcmaCredentialsRejected, CcmaError, CcmaSessionRequired
 from .db import Database
@@ -78,9 +78,11 @@ class ArcaEnrollmentServer(ThreadingHTTPServer):
         address: tuple[str, int],
         db: Database,
         connector: CcmaBrowserConnector,
+        on_verified: Callable[[int], None] | None = None,
     ):
         self.db = db
         self.connector = connector
+        self.on_verified = on_verified
         super().__init__(address, ArcaEnrollmentHandler)
 
     def start(self) -> threading.Thread:
@@ -91,6 +93,24 @@ class ArcaEnrollmentServer(ThreadingHTTPServer):
         )
         thread.start()
         return thread
+
+    def refresh_after_verification(self, chat_id: int) -> None:
+        if self.on_verified is None:
+            return
+
+        def run() -> None:
+            try:
+                self.on_verified(chat_id)
+            except Exception:
+                LOGGER.exception(
+                    "No se pudo actualizar la cuenta después de guardar el acceso"
+                )
+
+        threading.Thread(
+            target=run,
+            name=f"arca-initial-sync-{chat_id}",
+            daemon=True,
+        ).start()
 
 
 class ArcaEnrollmentHandler(BaseHTTPRequestHandler):
@@ -243,10 +263,20 @@ Verificando tus datos con ARCA. Puede tardar hasta dos minutos; no cierres esta 
                 ),
             )
             return
+        chat_id = int(row["chat_id"])
+        self.server.db.mark_portal_access_verified(
+            chat_id,
+            str(row["represented_cuit"]),
+            datetime.now(timezone.utc).isoformat(),
+        )
         self._send(
             200,
             _page(
                 "Acceso guardado",
-                "<p>La clave quedó verificada y cifrada. Ya podés cerrar esta página.</p>",
+                "<p>La clave quedó verificada y cifrada.</p>"
+                "<p>Estoy actualizando Monotributo e Ingresos Brutos. Te aviso "
+                "por Telegram cuando la cuenta esté lista.</p>"
+                "<p>Ya podés cerrar esta página.</p>",
             ),
         )
+        self.server.refresh_after_verification(chat_id)

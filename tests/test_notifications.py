@@ -214,3 +214,18 @@ class NotificationMonitorTest(TestCase):
         ).check_chat(1001)
 
         self.assertIn("Monotributo lleva demasiado tiempo sin actualizarse", batch.text)
+
+    def test_missing_shared_access_is_reported_only_once(self):
+        self.db.set_pending_tax_identity(1001, "20383717419", "production")
+        self.db.mark_tax_identity_verified(1001)
+        self.db.upsert_connection(1001, "ARCA_CCMA", "LOGIN_REQUIRED")
+        self.db.upsert_connection(1001, "SANTA_FE_IIBB", "LOGIN_REQUIRED")
+
+        batch = TaxNotificationMonitor(
+            self.db,
+            self.service,
+            now=lambda: self.now,
+        ).check_chat(1001)
+
+        self.assertEqual(batch.text.count("completar la conexión una sola vez"), 1)
+        self.assertNotIn("volver a validar", batch.text)

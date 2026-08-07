@@ -182,6 +182,13 @@ class TaxMonitorService:
         identity = self.db.get_tax_identity(chat_id)
         if identity is None or identity["status"] != "VERIFIED":
             return "Primero conectá y verificá tu cuenta de ARCA con /conectar."
+        return self._portal_setup_message(
+            chat_id,
+            "Actualizá el acceso guardado",
+            "Abrí este enlace privado y cargá tu clave fiscal:",
+        )
+
+    def _portal_setup_message(self, chat_id: int, title: str, instruction: str) -> str:
         if not self.arca_enrollment_base_url:
             return "El alta web de ARCA todavía no está configurada en este servidor."
         token = secrets.token_urlsafe(32)
@@ -190,14 +197,36 @@ class TaxMonitorService:
         self.db.create_onboarding_token(digest, chat_id, expires_at.isoformat())
         return "\n".join(
             [
-                "Configuración de ARCA",
+                title,
                 "",
-                "Abrí este enlace privado y cargá la clave fiscal:",
+                instruction,
                 f"{self.arca_enrollment_base_url}/arca/setup/{token}",
                 "",
                 "El enlace vence en 10 minutos y puede usarse una sola vez.",
             ]
         )
+
+    def _portal_access_enabled(self) -> bool:
+        return any(
+            provider in self.live_synchronizers
+            for provider in {"ARCA_CCMA", "ARCA_SETI", "SANTA_FE_IIBB"}
+        )
+
+    def _complete_connection(self, chat_id: int, cuit: str) -> str:
+        verified = f"Listo, verifiqué el CUIT {mask_cuit(cuit)} en ARCA."
+        if not self._portal_access_enabled():
+            return verified
+        access = self.db.get_portal_access(chat_id)
+        if access is not None and access["represented_cuit"] == cuit:
+            if access["ready_at"]:
+                return f"{verified}\n\nTu cuenta ya está lista para usar."
+            return f"{verified}\n\nEl acceso ya está guardado. Estoy actualizando tu información."
+        setup = self._portal_setup_message(
+            chat_id,
+            "Terminemos de conectar tu cuenta",
+            "Para consultar Monotributo e Ingresos Brutos, cargá tu clave fiscal una sola vez:",
+        )
+        return f"{verified}\n\n{setup}"
 
     def connection_map(self, chat_id: int) -> dict[str, object]:
         return {row["provider"]: row for row in self.db.get_connections(chat_id)}
@@ -252,7 +281,9 @@ class TaxMonitorService:
         identity = self.db.get_tax_identity(chat_id)
         if not argument:
             if identity and identity["status"] == "VERIFIED":
-                return "Tu CUIT ya está verificado en ARCA."
+                return self._complete_connection(
+                    chat_id, str(identity["represented_cuit"])
+                )
             if identity:
                 return "La conexión con ARCA todavía está pendiente."
             return "Enviá /conectar seguido de tu CUIT. Por ejemplo: /conectar 20123456786"
@@ -263,7 +294,7 @@ class TaxMonitorService:
         if identity:
             if identity["represented_cuit"] == cuit:
                 if identity["status"] == "VERIFIED":
-                    return "Tu CUIT ya está verificado en ARCA."
+                    return self._complete_connection(chat_id, cuit)
                 return self.verify_pending_identity(chat_id, cuit)
             return "Ya hay otro CUIT vinculado. Usá /desconectar antes de cambiarlo."
         try:
@@ -295,7 +326,7 @@ class TaxMonitorService:
                 f"Guardé el CUIT {mask_cuit(cuit)}, pero ARCA todavía no confirmó "
                 "la conexión. Volvé a enviar el mismo comando para reintentar."
             )
-        return f"Listo, verifiqué el CUIT {mask_cuit(cuit)} en ARCA."
+        return self._complete_connection(chat_id, cuit)
 
     def valid_snapshot(self, chat_id: int, provider: str, kind: str) -> dict | None:
         row = self.db.get_live_snapshot(chat_id, provider, kind)
@@ -885,11 +916,14 @@ class TaxMonitorService:
         alerts: set[str] = set()
         connections = list(self.db.get_connections(chat_id))
         portal_providers = {"ARCA_CCMA", "ARCA_SETI", "SANTA_FE_IIBB"}
-        portal_needs_credentials = any(
-            str(row["provider"]) in portal_providers
-            and str(row["status"]) in {"LOGIN_REQUIRED", "CREDENTIALS_REQUIRED"}
-            for row in connections
+        identity = self.db.get_tax_identity(chat_id)
+        access = self.db.get_portal_access(chat_id)
+        portal_access_matches = (
+            identity is not None
+            and access is not None
+            and access["represented_cuit"] == identity["represented_cuit"]
         )
+        portal_needs_credentials = self._portal_access_enabled() and not portal_access_matches
         if portal_needs_credentials:
             had_portal_access = any(
                 str(row["provider"]) in portal_providers and row["last_success_at"]
@@ -925,10 +959,15 @@ class TaxMonitorService:
 
     def _summary_keyboard(self, chat_id: int) -> tuple[tuple[tuple[str, str], ...], ...]:
         rows: list[tuple[tuple[str, str], ...]] = []
-        if any(
-            str(row["status"]) in {"LOGIN_REQUIRED", "CREDENTIALS_REQUIRED"}
-            for row in self.db.get_connections(chat_id)
-            if str(row["provider"]) in {"ARCA_CCMA", "ARCA_SETI", "SANTA_FE_IIBB"}
+        identity = self.db.get_tax_identity(chat_id)
+        access = self.db.get_portal_access(chat_id)
+        if (
+            self._portal_access_enabled()
+            and identity is not None
+            and (
+                access is None
+                or access["represented_cuit"] != identity["represented_cuit"]
+            )
         ):
             rows.append((("Completar acceso", "tax:setup"),))
         rows.extend((

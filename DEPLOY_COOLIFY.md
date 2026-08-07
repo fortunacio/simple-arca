@@ -234,6 +234,11 @@ No cargar en Coolify `TAX_MONITOR_DB`, `CCMA_SESSION_DIR`,
 `ARCA_ENROLLMENT_BIND`, `ARCA_ENROLLMENT_PORT` ni `DISPLAY`: sus valores internos ya
 están fijados por el Compose y las imágenes.
 
+El contenedor convierte `SESSION_ENCRYPTION_KEY` en un archivo temporal al arrancar.
+Por eso `SESSION_ENCRYPTION_KEY_FILE` debe quedar sin configurar en Coolify. Si se
+cargan ambas fuentes, el healthcheck del bot falla con el mensaje
+`Configurar sólo SESSION_ENCRYPTION_KEY o SESSION_ENCRYPTION_KEY_FILE`.
+
 ## Primer despliegue
 
 1. Confirmar que esta versión esté confirmada y publicada en la rama que leerá

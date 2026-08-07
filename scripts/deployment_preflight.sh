@@ -93,6 +93,17 @@ expected_winston_ports = {
 if winston_ports != expected_winston_ports:
     errors.append(f"winston: puertos renderizados inesperados: {sorted(winston_ports)}")
 
+for rendered_name, rendered in (("producción", production), ("winston", winston)):
+    for service_name, service in rendered.get("services", {}).items():
+        environment = service.get("environment") or {}
+        if environment.get("SESSION_ENCRYPTION_KEY") and environment.get(
+            "SESSION_ENCRYPTION_KEY_FILE"
+        ):
+            errors.append(
+                f"{rendered_name}/{service_name}: SESSION_ENCRYPTION_KEY y "
+                "SESSION_ENCRYPTION_KEY_FILE no pueden estar configuradas juntas"
+            )
+
 for dockerfile in (project / "Dockerfile", project / "Dockerfile.portal"):
     users = [
         line.split(maxsplit=1)[1].strip()

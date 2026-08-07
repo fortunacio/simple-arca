@@ -37,6 +37,24 @@ class CcmaBalance:
         }
 
 
+@dataclass(frozen=True)
+class CcmaPayment:
+    period: str
+    tax: str
+    description: str
+    paid_on: date
+    amount: Decimal
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "period": self.period,
+            "tax": self.tax,
+            "description": self.description,
+            "paid_on": self.paid_on.isoformat(),
+            "amount": str(self.amount),
+        }
+
+
 def _money(value: str) -> Decimal:
     raw = value.strip()
     negative = raw.startswith("(") and raw.endswith(")")
@@ -89,6 +107,7 @@ def parse_ccma_account(
     debtor_total = _summary_amount(summary_text, "Total Saldo Deudor:")
     creditor_total = _summary_amount(summary_text, "Total Saldo Acreedor:")
     balances: list[CcmaBalance] = []
+    payments: list[CcmaPayment] = []
     current: tuple[str, str, str, date] | None = None
 
     for raw_cells in rows:
@@ -124,6 +143,25 @@ def parse_ccma_account(
         tax = tail[tax_index]
         date_index = tail.index(movement_date)
         description = tail[date_index - 1] if date_index else ""
+        if description.lower().startswith("pago"):
+            amount_text = next(
+                (
+                    cell
+                    for cell in reversed(tail[date_index + 1 :])
+                    if re.fullmatch(r"[0-9,]+\.\d{2}", cell)
+                ),
+                "",
+            )
+            if amount_text:
+                payments.append(
+                    CcmaPayment(
+                        _period_iso(period),
+                        tax,
+                        description,
+                        _date(movement_date),
+                        abs(_money(f"({amount_text})")),
+                    )
+                )
         current = (_period_iso(period), tax, description, _date(movement_date))
 
     overdue = tuple(
@@ -144,6 +182,29 @@ def parse_ccma_account(
     if abs(detailed_credit - creditor_total) > Decimal("0.02"):
         raise CcmaError("El detalle de crédito no coincide con el total informado por CCMA")
 
+    recent_payments = sorted(
+        payments,
+        key=lambda item: (item.paid_on, item.period, item.tax, item.description),
+        reverse=True,
+    )[:30]
+    latest_payment_date = max((item.paid_on for item in payments), default=None)
+    latest_payment_total = sum(
+        (item.amount for item in payments if item.paid_on == latest_payment_date),
+        Decimal("0"),
+    )
+    overdue_periods = {item.period for item in overdue}
+    latest_periods = {
+        item.period for item in payments if item.paid_on == latest_payment_date
+    }
+    payment_reconciliation = (
+        "PARTIAL"
+        if latest_payment_date is not None
+        and debtor_total > 0
+        and bool(overdue_periods & latest_periods)
+        else "POSTED"
+        if latest_payment_date is not None
+        else "UNKNOWN"
+    )
     return {
         "calculated_on": calculated_on.isoformat(),
         "window_from": _period_iso(period_match.group(1)),
@@ -153,4 +214,8 @@ def parse_ccma_account(
         "overdue": [item.to_payload() for item in overdue],
         "upcoming": [item.to_payload() for item in upcoming],
         "credits": [item.to_payload() for item in credits],
+        "payments": [item.to_payload() for item in recent_payments],
+        "latest_payment_date": latest_payment_date.isoformat() if latest_payment_date else "",
+        "latest_payment_total": str(latest_payment_total),
+        "payment_reconciliation": payment_reconciliation,
     }

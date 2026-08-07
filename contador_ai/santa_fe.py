@@ -29,6 +29,16 @@ class SantaFeMaintenance(SantaFeIibbError):
     pass
 
 
+class IibbGenerationUnknown(SantaFeIibbError):
+    """La solicitud pudo haber llegado a Santa Fe y no debe repetirse."""
+
+
+class IibbQuoteChanged(SantaFeIibbError):
+    def __init__(self, quote: dict[str, str]):
+        super().__init__("El importe cambió antes de generar el VEP")
+        self.quote = quote
+
+
 class CredentialsStore(Protocol):
     def load(self, chat_id: int) -> dict[str, str] | None: ...
 
@@ -276,6 +286,13 @@ def parse_period_quote(html_text: str, period: str) -> dict[str, object]:
     }
 
 
+def parse_interest(value: str) -> str:
+    text = _normalized(_visible_text(value))
+    if "error" in text.lower():
+        raise SantaFeIibbError(text[:240])
+    return _money(text)
+
+
 def _periods_between(first: str, last: str) -> list[str]:
     start_year, start_month = (int(part) for part in first.split("-"))
     end_year, end_month = (int(part) for part in last.split("-"))
@@ -376,6 +393,123 @@ class SantaFeIibbConnector:
             headers={"User-Agent": "Mozilla/5.0", "Referer": login.url},
         )
 
+    @staticmethod
+    def _open_regsim(client: httpx.Client, represented_cuit: str) -> None:
+        menu = client.post(
+            REGSIM_URL,
+            data={"action": "Ingreso::menu", "cuit": represented_cuit},
+        )
+        menu.raise_for_status()
+        form = client.get(f"{REGSIM_URL}?action=Registro::boletasPago")
+        form.raise_for_status()
+
+    @staticmethod
+    def _quote_with_client(
+        client: httpx.Client,
+        period: str,
+        payment_date: date,
+    ) -> dict[str, str]:
+        period_response = client.post(
+            f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarPeriodoVep",
+            data={"periodo_osiris": period.replace("-", "")},
+        )
+        period_response.raise_for_status()
+        base = parse_period_quote(period_response.text, period)
+        interest_response = client.post(
+            f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarInteres",
+            data={
+                "vencimi_periodo": datetime.strptime(
+                    str(base["due_date"]), "%Y-%m-%d"
+                ).strftime("%d/%m/%Y"),
+                "fecha_pago": payment_date.strftime("%d/%m/%Y"),
+                "importe": str(base["amount"]).replace(".", ","),
+            },
+        )
+        interest_response.raise_for_status()
+        interest = parse_interest(interest_response.text)
+        principal = str(base["amount"])
+        return {
+            "period": period,
+            "due_date": str(base["due_date"]),
+            "payment_date": payment_date.isoformat(),
+            "principal": principal,
+            "interest": interest,
+            "total": str(Decimal(principal) + Decimal(interest)),
+        }
+
+    def quote_payment(
+        self,
+        chat_id: int,
+        represented_cuit: str,
+        *,
+        period: str,
+        payment_date: date,
+    ) -> dict[str, str]:
+        current = datetime.now(ARGENTINA_TIMEZONE).date()
+        if payment_date < current or payment_date > current + timedelta(days=25):
+            raise SantaFeIibbError("La fecha de pago debe estar entre hoy y los próximos 25 días")
+        login = self._login(chat_id, represented_cuit, "santafe_regsim")
+        with self._client(login) as client:
+            self._open_regsim(client, represented_cuit)
+            return self._quote_with_client(client, period, payment_date)
+
+    def generate_vep(
+        self,
+        chat_id: int,
+        represented_cuit: str,
+        *,
+        account: str,
+        period: str,
+        payment_date: date,
+        network_id: str,
+        expected_quote: dict[str, str],
+    ) -> dict[str, object]:
+        if network_id not in {"1001", "1002", "1003"}:
+            raise SantaFeIibbError("La red de pago no es válida")
+        login = self._login(chat_id, represented_cuit, "santafe_regsim")
+        with self._client(login) as client:
+            self._open_regsim(client, represented_cuit)
+            quote = self._quote_with_client(client, period, payment_date)
+            comparable = ("due_date", "principal", "interest", "total")
+            if any(str(quote[key]) != str(expected_quote.get(key, "")) for key in comparable):
+                raise IibbQuoteChanged(quote)
+            try:
+                response = client.post(
+                    f"{REGSIM_URL}?header=AJAX&action=Registro::liquidar_VEP",
+                    data={
+                        "nro_iibb": account,
+                        "id_entidad": network_id,
+                        "periodo": period.replace("-", ""),
+                        "importe": quote["principal"].replace(".", ","),
+                        "fe_vencimi": datetime.strptime(
+                            quote["due_date"], "%Y-%m-%d"
+                        ).strftime("%d/%m/%Y"),
+                        "fe_pago": payment_date.strftime("%d/%m/%Y"),
+                        "interes": quote["interest"].replace(".", ","),
+                    },
+                )
+                response.raise_for_status()
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                raise IibbGenerationUnknown(
+                    "No se pudo confirmar si Santa Fe generó el VEP"
+                ) from exc
+            body = _normalized(_visible_text(response.text))
+            if body.upper().startswith("ERROR;"):
+                raise SantaFeIibbError(body.split(";", 1)[1][:240])
+            match = re.search(r"\b\d{6,}\b", body)
+            if not match:
+                raise IibbGenerationUnknown(
+                    "Santa Fe respondió sin un número de VEP reconocible"
+                )
+            vep_number = match.group(0)
+            document = client.get(
+                f"{REGSIM_URL}?action=ImpresionReportes::imprimirVEP&nro_vep={vep_number}"
+            )
+            document.raise_for_status()
+            if not document.content.startswith(b"%PDF"):
+                raise SantaFeIibbError("Santa Fe no devolvió el comprobante PDF del VEP")
+            return {"vep_number": vep_number, "quote": quote, "pdf": document.content}
+
     def fetch_regsim(
         self,
         chat_id: int,
@@ -385,11 +519,7 @@ class SantaFeIibbConnector:
     ) -> dict[str, object]:
         login = self._login(chat_id, represented_cuit, "santafe_regsim")
         with self._client(login) as client:
-            menu = client.post(
-                REGSIM_URL,
-                data={"action": "Ingreso::menu", "cuit": represented_cuit},
-            )
-            menu.raise_for_status()
+            self._open_regsim(client, represented_cuit)
             response = client.get(f"{REGSIM_URL}?action=Registro::boletasPago")
             response.raise_for_status()
             quotes = []

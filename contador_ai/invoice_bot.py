@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from .bot_reply import BotReply
 from .identity import is_valid_cuit, normalize_cuit
 from .invoice_gateway import InvoiceGateway
 from .invoice_pdf import build_invoice_pdf, invoice_filename
@@ -15,15 +15,6 @@ from .invoice_store import InvoiceStore, decimal_text
 
 
 ARGENTINA = ZoneInfo("America/Argentina/Buenos_Aires")
-
-
-@dataclass(frozen=True)
-class BotReply:
-    text: str
-    keyboard: tuple[tuple[tuple[str, str], ...], ...] = field(default_factory=tuple)
-    replace_message: bool = False
-    document: bytes | None = None
-    filename: str = ""
 
 
 def _today() -> date:
@@ -157,6 +148,7 @@ class InvoiceBotService:
         if navigation:
             keyboard.append(tuple(navigation))
         keyboard.append((("Nueva factura", "tpl:list:0"),))
+        keyboard.append((("Volver al resumen", "tax:summary"),))
         return BotReply("\n".join(lines), tuple(keyboard), replace)
 
     def invoice_detail(self, chat_id: int, invoice_id: int, replace: bool = False) -> BotReply:

@@ -1,5 +1,7 @@
 from unittest import TestCase
 
+from contador_ai.bot_reply import BotReply
+from contador_ai.notifications import NotificationBatch, NotificationDelivery
 from contador_ai.telegram import BOT_COMMANDS, TelegramClient
 
 
@@ -17,6 +19,15 @@ class FakeDatabase:
 class FakeService:
     def __init__(self):
         self.dispatched = []
+        self.navigated = []
+
+    def navigation(self, action, chat_id, replace=False):
+        self.navigated.append((action, chat_id, replace))
+        return BotReply(
+            f"pantalla {action}",
+            ((("Volver", "tax:summary"),),),
+            replace,
+        )
 
     def dispatch(self, text, chat_id):
         self.dispatched.append((text, chat_id))
@@ -48,6 +59,41 @@ class FakeTelegramClient(TelegramClient):
         return {}
 
 
+class FakeMonitor:
+    def __init__(self):
+        self.marked = []
+
+    def check_chat(self, chat_id):
+        return NotificationBatch(
+            "Resumen tributario\n\nAlgo para revisar",
+            (NotificationDelivery("event", "value"),),
+        )
+
+    def mark_sent(self, chat_id, batch):
+        self.marked.append((chat_id, batch))
+
+
+class FakePaymentStore:
+    def __init__(self):
+        self.notified = []
+
+    def mark_notified(self, row_id):
+        self.notified.append(row_id)
+
+
+class FakePaymentBot:
+    def __init__(self):
+        self.callbacks = []
+        self.store = FakePaymentStore()
+
+    def handle_callback(self, data, chat_id):
+        self.callbacks.append((data, chat_id))
+        return BotReply("preparando pago", replace_message=True)
+
+    def pending_replies(self):
+        return [(123, "payment-1", BotReply("VEP listo"))]
+
+
 class TelegramAccessTest(TestCase):
     def test_registers_a_short_command_menu_for_private_chats(self):
         client = FakeTelegramClient([], {123})
@@ -57,12 +103,25 @@ class TelegramAccessTest(TestCase):
         method, payload = client.sent[0]
         self.assertEqual(method, "setMyCommands")
         commands = __import__("json").loads(payload["commands"])
-        self.assertEqual(commands[0]["command"], "estado")
-        self.assertEqual(len(commands), len(BOT_COMMANDS))
+        self.assertEqual(
+            [item["command"] for item in commands],
+            ["resumen", "facturas", "ayuda"],
+        )
         self.assertEqual(
             __import__("json").loads(payload["scope"]),
             {"type": "all_private_chats"},
         )
+
+    def test_sends_and_marks_an_automatic_summary(self):
+        client = FakeTelegramClient([], {123})
+        monitor = FakeMonitor()
+        client.notification_monitor = monitor
+
+        self.assertEqual(client.run_monitor_once(), 1)
+
+        self.assertEqual(client.sent[0][0], "sendMessage")
+        self.assertIn("Resumen tributario", client.sent[0][1]["text"])
+        self.assertEqual(monitor.marked[0][0], 123)
 
     def test_unauthorized_private_chat_is_silently_ignored(self):
         client = FakeTelegramClient(
@@ -99,15 +158,37 @@ class TelegramAccessTest(TestCase):
             [
                 {
                     "update_id": 30,
-                    "message": {"chat": {"id": 123}, "text": "/estado"},
+                    "message": {"chat": {"id": 123}, "text": "/resumen"},
                 }
             ],
             {123},
         )
 
         self.assertEqual(client.poll_once(timeout=0), 1)
-        self.assertEqual(client.fake_service.dispatched, [("/estado", 123)])
+        self.assertEqual(client.fake_service.navigated, [("summary", 123, False)])
         self.assertEqual(client.sent[0][0], "sendMessage")
+
+    def test_tax_callback_edits_the_existing_message(self):
+        client = FakeTelegramClient(
+            [
+                {
+                    "update_id": 35,
+                    "callback_query": {
+                        "id": "callback",
+                        "data": "tax:payments",
+                        "message": {"message_id": 7, "chat": {"id": 123}},
+                    },
+                }
+            ],
+            {123},
+        )
+
+        self.assertEqual(client.poll_once(timeout=0), 1)
+        self.assertEqual(client.fake_service.navigated, [("payments", 123, True)])
+        self.assertEqual([method for method, _payload in client.sent], [
+            "answerCallbackQuery",
+            "editMessageText",
+        ])
 
     def test_arca_setup_is_sent_as_a_clickable_url_button(self):
         client = FakeTelegramClient(
@@ -148,3 +229,36 @@ class TelegramAccessTest(TestCase):
 
         self.assertEqual(client.poll_once(timeout=0), 0)
         self.assertEqual(client.sent, [])
+
+    def test_iibb_payment_callback_is_not_sent_to_invoice_handler(self):
+        client = FakeTelegramClient(
+            [
+                {
+                    "update_id": 41,
+                    "callback_query": {
+                        "id": "callback",
+                        "data": "iibbpay:start",
+                        "message": {"message_id": 8, "chat": {"id": 123}},
+                    },
+                }
+            ],
+            {123},
+        )
+        payment_bot = FakePaymentBot()
+        client.iibb_payment_bot = payment_bot
+
+        self.assertEqual(client.poll_once(timeout=0), 1)
+        self.assertEqual(payment_bot.callbacks, [("iibbpay:start", 123)])
+        self.assertEqual([method for method, _ in client.sent], [
+            "answerCallbackQuery",
+            "editMessageText",
+        ])
+
+    def test_marks_payment_notification_only_after_delivery(self):
+        client = FakeTelegramClient([], {123})
+        payment_bot = FakePaymentBot()
+        client.iibb_payment_bot = payment_bot
+
+        self.assertEqual(client.run_iibb_payment_notifications(), 1)
+        self.assertEqual(payment_bot.store.notified, ["payment-1"])
+        self.assertEqual(client.sent[0][1]["text"], "VEP listo")

@@ -8,5 +8,6 @@ secrets/
 *.key
 *.pem
 *.crt
+*.csr
 *.p12
 *.pfx

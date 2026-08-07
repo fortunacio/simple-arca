@@ -38,7 +38,8 @@ class ArcaProfileSynchronizer:
             if profile.cuit != represented_cuit:
                 raise ArcaError("Padrón devolvió un CUIT distinto del autorizado")
         except ArcaError as exc:
-            self.db.mark_tax_identity_failed(chat_id, str(exc))
+            if identity["status"] != "VERIFIED":
+                self.db.mark_tax_identity_failed(chat_id, str(exc))
             self.db.upsert_connection(
                 chat_id,
                 "ARCA_PROFILE",

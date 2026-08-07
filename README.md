@@ -1,164 +1,138 @@
-# Monitor tributario — servicio multiusuario
+# Simple ARCA
 
-Bot de Telegram desplegable en una VPS privada. Cada usuario debe vincular sus propias cuentas y toda respuesta tributaria debe provenir de una consulta en vivo identificada por fuente y fecha.
+Bot personal de Telegram para consultar obligaciones tributarias de ARCA y Santa Fe,
+recibir avisos útiles y emitir Facturas C mediante la API oficial WSFEv1.
 
-La arquitectura objetivo y sus límites oficiales están documentados en
-[ARQUITECTURA_OFICIAL_MULTIUSUARIO.md](ARQUITECTURA_OFICIAL_MULTIUSUARIO.md).
-El procedimiento técnico de certificados y pruebas está en
-[ONBOARDING_ARCA_WS.md](ONBOARDING_ARCA_WS.md).
+La interfaz visible tiene tres comandos:
 
-## Contrato del producto
+- `/resumen`: pagos, deuda que requiere atención, mensajes y riesgo de recategorización.
+- `/facturas`: historial, PDF, repetición como borrador y nueva Factura C.
+- `/ayuda`: explicación breve y acceso a la configuración privada.
 
-- No precarga categorías, deudas, pagos ni facturación de ninguna persona.
-- No importa datos desde conversaciones o documentos históricos.
-- Aísla conexiones y resultados por `chat_id`.
-- Si un organismo no está conectado, falla de forma explícita y no inventa una respuesta.
-- Los snapshots sólo pueden ser escritos por un conector real y tienen vencimiento.
+Los comandos técnicos anteriores siguen disponibles como alias ocultos para auditoría,
+pero no aparecen en el menú de Telegram.
 
-## Estado actual
+## Qué consulta
 
-Funciona:
+- Situación registral y categoría de Monotributo mediante servicios oficiales de ARCA.
+- Domicilio Fiscal Electrónico sin abrir comunicaciones.
+- Facturas emitidas por WSFE y las nuevas facturas generadas por el bot.
+- Cuenta corriente de Monotributo y pagos confirmados en los portales de ARCA.
+- Régimen Simplificado de Ingresos Brutos de Santa Fe y pagos registrados.
+- Topes vigentes de Monotributo publicados por ARCA, con respaldo local de la última
+  tabla válida.
 
-- Transporte multiusuario de Telegram.
-- Acceso global restringido por `BOT_ALLOWED_CHAT_IDS`: mensajes, botones y grupos
-  no autorizados se descartan antes de ejecutar comandos o crear datos.
-- Persistencia y aislamiento por usuario.
-- Comandos que fallan de forma segura mientras no exista conexión.
-- Revocación con `/desconectar`.
-- Imagen Docker no privilegiada con OpenSSL y certificados CA.
-- Transporte HTTP con conexiones verificadas y límites de tiempo.
-- WSAA: TRA, firma CMS mediante OpenSSL, SOAP Faults y caché en memoria por servicio.
-- Constancia de Inscripción: `dummy`, consulta oficial de categoría de monotributo,
-  impuestos y actividades, con verificación del CUIT representado.
-- WSCCOMU: consulta paginada de resúmenes no leídos sin abrir comunicaciones.
-- Compatibilidad con las respuestas XOP/MTOM usadas por WSCCOMU en producción.
-- WSFEv1: consulta de puntos de venta, parámetros, último comprobante y detalle;
-  emisión idempotente de Factura C mediante `FECAESolicitar` y recuperación ante
-  respuestas inciertas con `FECompConsultar`.
-- Flujo de Telegram para listar, repetir y emitir facturas desde borradores
-  editables, con autorización limitada por `INVOICE_EMISSION_CHAT_IDS`.
-- Clientes y plantillas, historial inmutable de facturas y auditoría de cada intento.
-- PDF Original A4 regenerable, con CAE y QR fiscal según RG 4892. Los borradores
-  quedan identificados como no válidos y nunca incluyen CAE ni QR.
-- Cálculo de facturación neta, promedio mensual y categoría proyectada para
-  recategorización con topes obtenidos de la tabla pública de ARCA, validados y
-  guardados en caché. Una tabla de un semestre anterior nunca se usa para proyectar.
-- Consolidación sin duplicados entre las facturas nuevas consultadas por WSFE y el
-  historial oficial de puntos de venta de Comprobantes en Línea. Cada importación
-  registra el origen, el período consultado y su cobertura; no se completa con
-  facturas recordadas, pagos ni valores simulados.
-- Vinculación Telegram/CUIT en estado pendiente y activación sólo después de una
-  respuesta oficial para ese mismo CUIT.
-- Persistencia opcional cifrada de Tickets de Acceso para sobrevivir reinicios;
-  es obligatoria al seleccionar producción.
-- Instalación personal conectada a producción: certificado validado, Constancia de
-  Inscripción, bandeja fiscal y autorización WSFE verificadas contra ARCA.
-- Punto de venta `00002` activo como Factura Electrónica - Monotributo - Web
-  Services y validado mediante `FEParamGetPtosVenta`. El `00001` permanece reservado
-  para Comprobantes en Línea.
-- CCMA: parser validado que separa deuda vencida, saldo a favor y obligaciones todavía
-  no vencidas. El ingreso se renueva por HTTPS y Chromium queda limitado a leer CCMA;
-  la sesión y las credenciales verificadas se guardan cifradas fuera de la base principal.
-- Ingresos Brutos Santa Fe: consulta automática del Régimen Simplificado y VEPAI con
-  la misma clave cifrada. Si VEPAI está en mantenimiento, el bot conserva la categoría
-  y los pagos visibles, pero no afirma que la cuenta esté al día.
+No existe una API pública única para toda esa información. El bot combina APIs
+oficiales con un worker aislado para los portales que requieren CUIT y clave fiscal.
 
-Pendiente:
+## Qué automatiza
 
-- Conciliación automática de períodos e importes de Ingresos Brutos Santa Fe.
-- Delegación de servicios a usuarios operadores y pool acotado de sesiones para CCMA,
-  Comprobantes en Línea y Santa Fe.
-- Extracción y normalización de respuestas de cada organismo.
+- Actualización de APIs oficiales cada seis horas.
+- Actualización de Monotributo, pagos e Ingresos Brutos cada seis horas.
+- Evaluación de alertas cada cinco minutos, con deduplicación persistente.
+- Recordatorios de vencimiento a 14, 7, 3, 1 y 0 días.
+- Avisos si una fuente deja de actualizarse.
+- Conciliación de pagos: si un pago está confirmado pero la cuenta aún no terminó de
+  reflejarlo, el bot avisa y nunca recomienda pagarlo otra vez.
+- Emisión de Factura C con CAE, QR fiscal y PDF Original.
+- Preparación y generación de VEP para la cuota corriente de Ingresos Brutos de
+  Santa Fe, siempre con revisión y confirmación expresa.
 
-## Comandos
+Los intervalos se pueden cambiar por variables de entorno. El detalle funcional está
+en [BOT_TELEGRAM_TRIBUTARIO.md](BOT_TELEGRAM_TRIBUTARIO.md).
 
-- `/conectar`
-- `/estado`
-- `/bandeja`
-- `/monotributo`
-- `/facturacion`
-- `/facturas`
-- `/nueva_factura`
-- `/nuevo_cliente`
-- `/categoria`
-- `/deuda_arca`
-- `/iibb`
-- `/vencimientos`
-- `/desconectar`
+## Arquitectura
 
-## Desarrollo local
+El Compose ejecuta dos contenedores no privilegiados:
+
+- `bot`: Telegram, APIs oficiales, WSAA/WSFE, PDF y avisos automáticos.
+- `portal-worker`: ingreso a portales, sincronización periódica y servidor privado de
+  configuración de credenciales.
+
+Comparten únicamente la base SQLite persistente. El estado del navegador se conserva
+en un volumen separado. Los certificados y la clave de cifrado no se guardan en la
+imagen ni en la base.
+
+En producción, Coolify entrega los secretos como variables protegidas. El entrypoint
+los escribe con modo `0600` dentro de un `tmpfs`, elimina sus valores del entorno y
+recién después inicia la aplicación.
+
+## Configuración local
+
+Requisitos: Docker Compose o Python 3.12 con las dependencias del proyecto.
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 -m unittest discover -v
-python3 -m contador_ai --command /estado --chat-id 123
-python3 -m contador_ai --arca-dummy
+cp config.example.env .env
+./scripts/generate_session_encryption_key.sh
+docker compose -f compose.yaml -f compose.local.yaml up --build -d bot
+docker compose -f compose.yaml -f compose.local.yaml --profile portal up --build -d portal-worker
 ```
 
-## Docker
+El override local monta `./secrets` como sólo lectura en `/run/local-secrets`. En el
+repositorio local se conservan únicamente:
 
-Completar `TELEGRAM_BOT_TOKEN` y `BOT_ALLOWED_CHAT_IDS` en `.env`. El bot no
-arranca si la lista global está vacía. Para emitir también se requieren
-`ARCA_WSFE_POINT_OF_SALE` e `INVOICE_EMISSION_CHAT_IDS`; una lista vacía bloquea
-toda emisión.
+- `session_encryption.key`
+- `simplearcaprod.key`
+- `simplearcaprod_7d17b50e91a73602.crt`
 
-Ejecutar:
+`secrets/`, `.env` y todos los formatos habituales de claves y certificados están
+ignorados por Git.
+
+Para ejecutar comandos o pruebas sin Docker:
 
 ```bash
-docker compose up --build
+.venv/bin/python -m contador_ai --command /resumen --chat-id CHAT_ID
+.venv/bin/python -m unittest discover -s tests
 ```
 
-La base se almacena en el volumen `tax_data` y `./secrets` se monta como sólo
-lectura en `/run/secrets`.
+## Alta privada de CUIT y clave fiscal
 
-### Conector personal de CCMA
+`/ayuda` permite generar un enlace de un solo uso y diez minutos de duración. El
+formulario manda el CUIT y la clave directamente a `portal-worker`; esos datos no
+pasan por Telegram. La clave se valida contra ARCA y sólo se conserva cifrada.
 
-El navegador de CCMA se ejecuta en un contenedor separado y su pantalla no se
-publica en la red: Docker enlaza noVNC exclusivamente con `127.0.0.1:6080`.
+En la VPS el enlace usa HTTP sobre Tailscale. El cifrado del transporte lo aporta el
+túnel WireGuard de Tailscale y Docker publica los puertos exclusivamente en la IP del
+tailnet. La aplicación sólo admite este modo si:
 
-El alta normal no usa noVNC. Configurar `ARCA_ENROLLMENT_BASE_URL` con una URL
-HTTPS del proxy de la VPS dirigida al puerto interno `8090`. Desde Telegram usar:
+- `ARCA_ENROLLMENT_ALLOW_TAILSCALE_HTTP=true`; y
+- la URL usa una IP `100.64.0.0/10` o un nombre completo terminado en `.ts.net`.
 
-```text
-/configurar_arca
-```
+No se debe asignar un dominio público de Coolify a los puertos `8090` o `6080`.
 
-El bot genera un enlace aleatorio válido por diez minutos y por un único intento.
-La clave se carga en esa página, viaja por HTTPS directamente al worker y nunca se
-envía por Telegram. El worker verifica el ingreso y el CUIT antes de cifrarla. En
-desarrollo puede usarse `http://127.0.0.1:8090`; cualquier URL remota sin HTTPS hace
-que el bot se niegue a iniciar.
+## Producción en Coolify
 
-noVNC queda sólo como recuperación excepcional si ARCA solicita CAPTCHA u otra
-validación manual. En una VPS se accede únicamente mediante un túnel SSH:
+El procedimiento completo, variables, secretos, persistencia, verificaciones y
+rollback está en [DEPLOY_COOLIFY.md](DEPLOY_COOLIFY.md).
 
-```bash
-ssh -L 6080:127.0.0.1:6080 usuario@vps
-```
+La configuración de producción es [compose.yaml](compose.yaml). El archivo
+[compose.local.yaml](compose.local.yaml) existe solamente para desarrollo y nunca se
+debe agregar como Compose adicional en Coolify.
 
-Después iniciar el sincronizador periódico:
+## Seguridad
 
-```bash
-docker compose --profile portal up -d portal-worker
-```
+- El bot rechaza chats y grupos no incluidos en `BOT_ALLOWED_CHAT_IDS`.
+- Sólo `INVOICE_EMISSION_CHAT_IDS` puede emitir facturas.
+- Sólo `IIBB_PAYMENT_CHAT_IDS` puede generar VEP provinciales. Generar el VEP no
+  debita dinero; el pago se confirma en ARCA o en la entidad elegida.
+- El bot nunca guarda CBU, tarjetas, claves bancarias ni credenciales de billeteras.
+- La Factura C se autoriza exclusivamente mediante WSFE; nunca se automatiza
+  Comprobantes en Línea con cookies.
+- El punto `00001` queda reservado al sistema manual. WSFE usa el punto `00002`.
+- CUIT, período, cliente e importe se controlan antes de emitir para advertir
+  duplicados.
+- Los borradores nunca incluyen CAE ni QR fiscal.
+- Las credenciales guardadas y los tickets WSAA están cifrados con Fernet.
+- El formulario privado tiene token de un solo uso, límite de tamaño, encabezados
+  contra caché y framing, y no registra la clave.
+- Los logs van a stdout/stderr y Docker limita su rotación.
 
-La sesión y las credenciales se cifran con `SESSION_ENCRYPTION_KEY` y quedan en el
-volumen `portal_state`, con permisos `0600`. Cuando la sesión vence, el worker vuelve
-a ingresar automáticamente. Si ARCA rechaza la clave o exige CAPTCHA/otra validación,
-no insiste en bucle y lo informa. El worker consulta CCMA, Régimen Simplificado y
-VEPAI cada seis horas y actualiza los datos que usan `/monotributo`, `/deuda_arca`
-y `/iibb`. No genera VEP ni realiza pagos.
+## Documentación
 
-## Autenticación prevista
-
-1. El usuario ejecuta `/conectar`.
-2. El bot genera un enlace HTTPS de un solo uso asociado al `chat_id`.
-3. El usuario delega los servicios necesarios a la identidad operadora desde ARCA.
-4. El servicio utiliza certificados oficiales. Para CCMA personal puede conservar
-   credenciales cifradas, dadas de alta fuera de Telegram, porque no existe una API
-   oficial equivalente para esa cuenta corriente.
-5. Cada comando consulta la fuente en vivo y conserva únicamente un resultado con vencimiento corto.
-
-Las APIs oficiales con certificado son el camino principal. Los portales sin API
-pública usarán, como transición, un conector interactivo delegado y centralizado; no
-se presentarán endpoints privados como APIs soportadas.
+- [BOT_TELEGRAM_TRIBUTARIO.md](BOT_TELEGRAM_TRIBUTARIO.md): comportamiento del bot.
+- [DEPLOY_COOLIFY.md](DEPLOY_COOLIFY.md): despliegue en la VPS.
+- [ONBOARDING_ARCA_WS.md](ONBOARDING_ARCA_WS.md): certificados, relaciones y renovación.
+- [ARQUITECTURA_OFICIAL_MULTIUSUARIO.md](ARQUITECTURA_OFICIAL_MULTIUSUARIO.md): fuentes y límites técnicos.
+- [PROCEDIMIENTOS_ARCA.md](PROCEDIMIENTOS_ARCA.md): procedimientos y evidencia histórica.
+- [CONSULTA_API_SANTA_FE.md](CONSULTA_API_SANTA_FE.md): respuesta administrativa provincial.
+- [CONTEXTO_TRIBUTARIO.md](CONTEXTO_TRIBUTARIO.md): contexto tributario personal verificado.

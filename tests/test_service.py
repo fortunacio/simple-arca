@@ -48,12 +48,27 @@ class ServiceTest(TestCase):
 
     def test_new_user_never_receives_seeded_tax_data(self):
         output = self.service.dispatch("/estado", 1001)
-        self.assertIn("Todavía no disponible:", output)
-        self.assertEqual(output.count("• "), len(PROVIDERS))
+        self.assertIn("conectá y verificá tu cuenta", output)
         self.assertNotIn("EN VIVO", output)
         self.assertNotIn("datos históricos ni simulados", output)
         for forbidden in ("150.784", "672.973", "Categoría F", "categoría 3"):
             self.assertNotIn(forbidden, output)
+
+    def _verified_user(self, chat_id=1001):
+        self.db.ensure_user(chat_id)
+        self.db.set_pending_tax_identity(chat_id, "20383717419", "production")
+        self.db.mark_tax_identity_verified(chat_id)
+
+    def _snapshot(self, chat_id, provider, kind, payload):
+        fetched_at = datetime.now(timezone.utc)
+        self.db.upsert_live_snapshot(
+            chat_id,
+            provider,
+            kind,
+            fetched_at.isoformat(),
+            (fetched_at + timedelta(days=1)).isoformat(),
+            json.dumps(payload),
+        )
 
     def test_users_are_isolated(self):
         self.db.ensure_user(1001)
@@ -193,6 +208,9 @@ class ServiceTest(TestCase):
                 }
             ],
             "credits": [{"period": "2024-06", "balance": "-1041.22"}],
+            "latest_payment_date": "2026-08-04",
+            "latest_payment_total": "29411.85",
+            "payment_reconciliation": "PARTIAL",
         }
         self.db.upsert_live_snapshot(
             1001,
@@ -213,6 +231,9 @@ class ServiceTest(TestCase):
         self.assertIn("Deuda vencida: $154.967,91", output)
         self.assertIn("febrero de 2026: $78.419,82", output)
         self.assertIn("Saldo a favor: $1.041,22", output)
+        self.assertIn("Último pago visible en CCMA", output)
+        self.assertIn("04/08/2026: $29.411,85", output)
+        self.assertIn("Saldo deudor que CCMA todavía informa", output)
         self.assertIn("agosto de 2026: $150.784,21 — 20/08/2026", output)
 
     def test_monotributo_requests_login_when_ccma_session_expired(self):
@@ -353,6 +374,344 @@ class ServiceTest(TestCase):
         self.assertIn("julio de 2026: $42.882,00", output)
         self.assertIn("Vence: 20/08/2026", output)
         self.assertIn("Pagos conciliados en VEPAI hasta junio de 2026", output)
+
+    def test_vencimientos_combines_payments_due_the_same_day(self):
+        self.db.ensure_user(1001)
+        fetched_at = datetime.now(timezone.utc)
+        for provider, payload in (
+            (
+                "ARCA_CCMA",
+                {
+                    "debtor_total": "125633.44",
+                    "latest_payment_date": "2026-08-04",
+                    "latest_payment_total": "29411.85",
+                    "payment_reconciliation": "PARTIAL",
+                    "upcoming": [
+                        {
+                            "period": "2026-08",
+                            "due_date": "2026-08-20",
+                            "balance": "150784.21",
+                        }
+                    ]
+                },
+            ),
+            (
+                "SANTA_FE_IIBB",
+                {
+                    "next_obligation": {
+                        "period": "2026-07",
+                        "due_date": "2026-08-20",
+                        "amount": "42882.00",
+                    },
+                    "vepai": {
+                        "status": "AVAILABLE",
+                        "payment_groups": [
+                            {
+                                "paid_on": "2026-08-04",
+                                "total": "672973.38",
+                                "periods": ["2025-04", "2026-06"],
+                            }
+                        ],
+                        "reconciliation": {
+                            "status": "COMPLETE",
+                            "through": "2026-06",
+                        },
+                    },
+                },
+            ),
+        ):
+            self.db.upsert_live_snapshot(
+                1001,
+                provider,
+                "account_status",
+                fetched_at.isoformat(),
+                (fetched_at + timedelta(hours=1)).isoformat(),
+                json.dumps(payload),
+            )
+        service = TaxMonitorService(self.db, today=date(2026, 8, 6))
+
+        output = service.dispatch("/vencimientos", 1001)
+
+        self.assertEqual(output.count("Vence: jueves 20/08/2026 (dentro de 14 días)"), 2)
+        self.assertIn("Ingresos Brutos\n• Período: julio de 2026", output)
+        self.assertIn("• Importe: $42.882,00", output)
+        self.assertIn("Monotributo\n• Período: agosto de 2026", output)
+        self.assertIn("• Importe: $150.784,21", output)
+        self.assertIn("Total con vencimiento el 20/08/2026: $193.666,21", output)
+        self.assertIn("Sin deuda vencida en VEPAI", output)
+        self.assertIn("Pagos imputados hasta junio de 2026", output)
+        self.assertIn("Último pago imputado: $672.973,38 el 04/08/2026", output)
+        self.assertIn("Movimientos identificados como pago en CCMA", output)
+        self.assertIn("04/08/2026: $29.411,85", output)
+        self.assertIn("Saldo deudor que CCMA todavía informa: $125.633,44", output)
+        self.assertIn("05/02/2027", output)
+
+    def test_pagos_arca_separates_seti_status_from_ccma_matches(self):
+        self.db.ensure_user(1001)
+        fetched_at = datetime.now(timezone.utc)
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            fetched_at.isoformat(),
+            (fetched_at + timedelta(hours=1)).isoformat(),
+            json.dumps(
+                {
+                    "veps": [
+                        {
+                            "number": "1661690467",
+                            "status": "PAID",
+                            "amount": "154843.13",
+                            "paid_on": "2026-08-04",
+                            "is_consolidated": True,
+                        },
+                        {
+                            "number": "1661690468",
+                            "status": "PAID",
+                            "amount": "55134.63",
+                            "paid_on": "2026-08-04",
+                            "description": "ARCA03/26",
+                            "is_consolidated": False,
+                            "ccma_match": False,
+                        },
+                    ],
+                    "ccma_reconciliation": {
+                        "paid_veps": 12,
+                        "matched_veps": 8,
+                        "unmatched_veps": 4,
+                        "ccma_debtor_total": "125633.44",
+                    },
+                }
+            ),
+        )
+        service = TaxMonitorService(
+            self.db,
+            live_synchronizers={"ARCA_SETI": lambda _chat_id: None},
+        )
+
+        output = service.dispatch("/pagos_arca", 1001)
+
+        self.assertIn("VEP: 1661690467", output)
+        self.assertIn("Importe: $154.843,13", output)
+        self.assertIn("SETI confirma 12 obligaciones pagadas", output)
+        self.assertIn("CCMA muestra el movimiento de 8 de esas 12", output)
+        self.assertIn("Marzo de 2026 — VEP 1661690468: $55.134,63", output)
+        self.assertIn("no significa que debas pagarlas otra vez", output)
+        self.assertNotIn("conciliar", output.lower())
+
+    def test_summary_prioritizes_confirmed_payment_without_internal_names(self):
+        self._verified_user()
+        self._snapshot(
+            1001,
+            "ARCA_CCMA",
+            "account_status",
+            {
+                "debtor_total": "125633.44",
+                "upcoming": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "balance": "150784.21",
+                    }
+                ],
+            },
+        )
+        self._snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            {
+                "veps": [
+                    {
+                        "status": "PAID",
+                        "is_consolidated": True,
+                        "paid_on": "2026-08-04",
+                        "amount": "154843.13",
+                    }
+                ],
+                "ccma_reconciliation": {
+                    "status": "PARTIAL",
+                    "unmatched_veps": 4,
+                },
+            },
+        )
+        self._snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            {
+                "next_obligation": {
+                    "period": "2026-07",
+                    "due_date": "2026-08-20",
+                    "amount": "42882.00",
+                },
+                "vepai": {"reconciliation": {"status": "COMPLETE"}},
+            },
+        )
+        service = TaxMonitorService(self.db, today=date(2026, 8, 6))
+
+        output = service.dispatch("/resumen", 1001)
+
+        self.assertIn("Tu pago de Monotributo del 04/08/2026", output)
+        self.assertIn("$154.843,13 está confirmado", output)
+        self.assertIn("ARCA todavía muestra un saldo de $125.633,44", output)
+        self.assertIn("No vuelvas a pagarlo por ahora", output)
+        self.assertIn("Próximo pago — jueves 20/08/2026", output)
+        self.assertIn("Total: $193.666,21", output)
+        self.assertIn("otros impuestos nacionales", output)
+        for forbidden in ("SETI", "CCMA", "VEPAI", "sub-VEP", "imputación"):
+            self.assertNotIn(forbidden, output)
+
+    def test_summary_treats_unmatched_debt_as_debt_to_pay(self):
+        self._verified_user()
+        self._snapshot(
+            1001,
+            "ARCA_CCMA",
+            "account_status",
+            {"debtor_total": "500.00", "upcoming": []},
+        )
+
+        output = TaxMonitorService(self.db, today=date(2026, 8, 6)).summary(1001)
+
+        self.assertIn("Tenés $500,00 de Monotributo vencido", output)
+        self.assertNotIn("No vuelvas a pagarlo", output)
+
+    def test_payments_page_changes_message_after_seven_days(self):
+        self._verified_user()
+        self._snapshot(
+            1001,
+            "ARCA_CCMA",
+            "account_status",
+            {"debtor_total": "125633.44", "upcoming": []},
+        )
+        self._snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            {
+                "veps": [
+                    {
+                        "status": "PAID",
+                        "is_consolidated": True,
+                        "paid_on": "2026-08-04",
+                        "amount": "154843.13",
+                    }
+                ],
+                "ccma_reconciliation": {
+                    "status": "PARTIAL",
+                    "unmatched_veps": 4,
+                },
+            },
+        )
+
+        output = TaxMonitorService(self.db, today=date(2026, 8, 20)).payments_overview(1001)
+
+        self.assertIn("El saldo requiere revisión", output)
+        self.assertIn("el pago sigue confirmado", output)
+        self.assertIn("No lo pagues nuevamente", output)
+        for forbidden in ("SETI", "CCMA", "VEPAI", "VEP", "imputación"):
+            self.assertNotIn(forbidden, output)
+
+    def test_category_overview_explains_same_lower_and_higher_projection(self):
+        for current, monthly, expected in (
+            (
+                "F LOCACIONES DE SERVICIOS",
+                Decimal("4000000"),
+                "seguirías en la categoría F",
+            ),
+            ("F", Decimal("3300000"), "podrías bajar de F a E"),
+            ("F", Decimal("4800000"), "podrías subir de F a G"),
+        ):
+            with self.subTest(expected=expected):
+                with TemporaryDirectory() as directory:
+                    db = Database(Path(directory) / "test.sqlite3")
+                    db.initialize()
+                    db.ensure_user(1001)
+                    db.set_pending_tax_identity(1001, "20383717419", "production")
+                    db.mark_tax_identity_verified(1001)
+                    fetched_at = datetime.now(timezone.utc)
+                    for provider, kind, payload in (
+                        (
+                            "ARCA_PROFILE",
+                            "taxpayer_profile",
+                            {"categories": [{"description": current, "status": "ACTIVO"}]},
+                        ),
+                        (
+                            "ARCA_INVOICES",
+                            "issued_invoices",
+                            {
+                                "window_from": "2025-08-01",
+                                "window_to": "2026-07-31",
+                                "total_pesos": str(monthly * 12),
+                                "invoice_count": 12,
+                                "invoices": [
+                                    {
+                                        "issued_at": f"2026-{month:02d}-15",
+                                        "net_total_pesos": str(monthly),
+                                    }
+                                    for month in range(2, 8)
+                                ],
+                            },
+                        ),
+                    ):
+                        db.upsert_live_snapshot(
+                            1001,
+                            provider,
+                            kind,
+                            fetched_at.isoformat(),
+                            (fetched_at + timedelta(days=1)).isoformat(),
+                            json.dumps(payload),
+                        )
+                    service = TaxMonitorService(
+                        db,
+                        today=date(2026, 8, 6),
+                        live_synchronizers={
+                            "ARCA_PROFILE": lambda _chat_id: None,
+                            "ARCA_INVOICES": lambda _chat_id: None,
+                        },
+                        category_limits_provider=lambda _today: TEST_CATEGORY_LIMITS,
+                    )
+
+                    output = service.category_overview(1001)
+
+                    self.assertIn(expected, output)
+                    self.assertNotIn("WSFE", output)
+
+    def test_navigation_contains_only_clear_user_actions(self):
+        self._verified_user()
+        reply = TaxMonitorService(self.db).navigation("summary", 1001)
+
+        labels = [button[0] for row in reply.keyboard for button in row]
+        self.assertEqual(
+            labels,
+            [
+                "Pagos y vencimientos",
+                "Categoría y facturación",
+                "Mensajes de ARCA",
+                "Facturas",
+            ],
+        )
+
+    def test_summary_names_failed_sources_in_plain_language(self):
+        self._verified_user()
+        self.db.upsert_connection(1001, "ARCA_CCMA", "ERROR")
+        self.db.upsert_connection(1001, "ARCA_SETI", "ERROR")
+        self.db.upsert_connection(1001, "SANTA_FE_IIBB", "ERROR")
+        service = TaxMonitorService(
+            self.db,
+            live_synchronizers={
+                "ARCA_CCMA": lambda _chat_id: None,
+                "ARCA_SETI": lambda _chat_id: None,
+                "SANTA_FE_IIBB": lambda _chat_id: None,
+            },
+        )
+
+        output = service.summary(1001)
+
+        self.assertEqual(output.count("No pude actualizar Monotributo"), 1)
+        self.assertEqual(output.count("No pude actualizar Ingresos Brutos"), 1)
+        for forbidden in ("SETI", "CCMA", "VEPAI", "VEP", "imputación"):
+            self.assertNotIn(forbidden, output)
 
     def test_failed_live_sync_never_falls_back_to_snapshot(self):
         def fail(_chat_id):

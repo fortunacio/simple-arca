@@ -79,6 +79,19 @@ class ArcaSyncTest(TestCase):
         self.assertEqual(identity["status"], "PENDING")
         self.assertEqual(self.db.get_connections(1001)[0]["status"], "ERROR")
 
+    def test_a_failed_refresh_does_not_disconnect_a_verified_identity(self):
+        self.db.mark_tax_identity_verified(1001)
+        synchronizer = ArcaProfileSynchronizer(
+            self.db,
+            FakeWsaa(),
+            FakePadron("20999999999"),
+        )
+
+        with self.assertRaisesRegex(Exception, "CUIT distinto"):
+            synchronizer.sync_chat(1001)
+
+        self.assertEqual(self.db.get_tax_identity(1001)["status"], "VERIFIED")
+
     def test_invoice_sync_stores_net_live_total(self):
         self.db.mark_tax_identity_verified(1001)
         synchronizer = ArcaInvoicesSynchronizer(

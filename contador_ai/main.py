@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import logging
 import os
 import urllib.parse
+from datetime import timedelta
 from pathlib import Path
 
 from .arca.dfe import DfeClient
@@ -21,7 +23,9 @@ from .db import Database
 from .invoice_bot import InvoiceBotService
 from .invoice_gateway import InvoiceGateway
 from .invoice_store import InvoiceStore
+from .iibb_payment import IibbPaymentBotService, IibbPaymentStore
 from .monotributo import ArcaCategoryLimitsProvider
+from .notifications import TaxNotificationMonitor
 from .service import TaxMonitorService
 from .telegram import TelegramClient
 
@@ -95,9 +99,25 @@ def arca_enrollment_base_url() -> str:
         return ""
     parsed = urllib.parse.urlsplit(value)
     local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and local):
+    tailscale_http_enabled = os.environ.get(
+        "ARCA_ENROLLMENT_ALLOW_TAILSCALE_HTTP", "false"
+    ).strip().lower() in {"1", "true", "yes"}
+    tailscale_host = False
+    if parsed.hostname:
+        try:
+            tailscale_host = ipaddress.ip_address(parsed.hostname) in ipaddress.ip_network(
+                "100.64.0.0/10"
+            )
+        except ValueError:
+            tailscale_host = parsed.hostname.lower().endswith(".ts.net")
+    allowed_http = parsed.scheme == "http" and (
+        local or (tailscale_http_enabled and tailscale_host)
+    )
+    if parsed.scheme != "https" and not allowed_http:
         raise SystemExit(
-            "ARCA_ENROLLMENT_BASE_URL debe usar HTTPS; HTTP sólo se permite en localhost."
+            "ARCA_ENROLLMENT_BASE_URL debe usar HTTPS. HTTP sólo se permite en "
+            "localhost o, con ARCA_ENROLLMENT_ALLOW_TAILSCALE_HTTP=true, en una "
+            "IP de Tailscale o un nombre terminado en .ts.net."
         )
     return value
 
@@ -168,6 +188,7 @@ def build_live_synchronizers(db: Database):
         }
     if os.environ.get("CCMA_ENABLED", "").strip().lower() in {"1", "true", "yes"}:
         synchronizers["ARCA_CCMA"] = lambda _chat_id: None
+        synchronizers["ARCA_SETI"] = lambda _chat_id: None
         if os.environ.get("SANTA_FE_IIBB_ENABLED", "true").strip().lower() in {
             "1",
             "true",
@@ -252,6 +273,20 @@ def build_invoice_bot(db: Database) -> InvoiceBotService | None:
     return InvoiceBotService(store, gateway)
 
 
+def build_iibb_payment_bot(db: Database) -> IibbPaymentBotService:
+    enabled = os.environ.get("IIBB_PAYMENTS_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    allowed = parse_chat_ids(
+        os.environ.get("IIBB_PAYMENT_CHAT_IDS", "").strip()
+        or os.environ.get("INVOICE_EMISSION_CHAT_IDS", ""),
+        "IIBB_PAYMENT_CHAT_IDS",
+    )
+    return IibbPaymentBotService(IibbPaymentStore(db), allowed, enabled=enabled)
+
+
 def main() -> None:
     args = build_parser().parse_args()
     logging.basicConfig(
@@ -316,6 +351,22 @@ def main() -> None:
         service,
         allowed_chat_ids=allowed_chat_ids,
         invoice_bot=build_invoice_bot(db),
+        iibb_payment_bot=build_iibb_payment_bot(db),
+        notification_monitor=(
+            TaxNotificationMonitor(
+                db,
+                service,
+                refresh_interval=timedelta(
+                    seconds=int(os.environ.get("AUTOMATIC_SYNC_INTERVAL_SECONDS", "21600"))
+                ),
+            )
+            if os.environ.get("AUTOMATIC_MONITOR_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes"}
+            else None
+        ),
+        monitor_interval_seconds=int(
+            os.environ.get("AUTOMATIC_MONITOR_CHECK_SECONDS", "300")
+        ),
     )
     if args.poll_once:
         handled = client.poll_once(timeout=1)

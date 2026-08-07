@@ -24,6 +24,7 @@ Toda operación que emita un comprobante, presente una declaración, genere un p
 | Crear y consultar VEP (`SETIWS-PAGO-API`) | API REST oficial | Uso exclusivo de organismos con convenio vigente con ARCA | No utilizable directamente por un contribuyente individual |
 | Presentar DDJJ | WS oficial de Presentación de DDJJ | Existe, pero debe validarse por formulario/impuesto | Evaluar sólo si luego se automatizan DDJJ específicas |
 | Consultar inscripción/impuestos | WS Padrón A4 / Constancia de Inscripción | Posible con autorización correspondiente | Útil para configuración y controles del bot, no reemplaza CCMA |
+| Generar cuota/VEP de IIBB Santa Fe | Formulario 5426 del Régimen Simplificado | Sí, mediante la relación ya habilitada | Automatizado con confirmación humana; el pago bancario queda fuera del bot |
 
 ## Arquitectura oficial para facturación
 
@@ -96,6 +97,64 @@ Referencia técnica de `SETIWS-PAGO-API`, sólo para evaluar su alcance:
 - Manual: `https://www.arca.gob.ar/ws/SETIWS-PAGO-API/Manual_para_el_desarrollador_setiws-pago-api.pdf`
 
 Estos endpoints no deben probarse con credenciales personales sin que ARCA haya otorgado la relación y el convenio requeridos.
+
+## VEP de Ingresos Brutos de Santa Fe
+
+El Régimen Simplificado provincial expone el Formulario 5426 desde
+`https://www.santafe.gob.ar/e-regsim/index.php?action=Registro::boletasPago`. La
+aplicación oficial permite enviar el VEP a:
+
+- `1001`: Red Link;
+- `1002`: Pago Mis Cuentas;
+- `1003`: Interbanking.
+
+La integración implementada usa la misma sesión autenticada que las consultas de
+Santa Fe y conserva este orden:
+
+1. consultar el período con `Registro::actualizarPeriodoVep`;
+2. calcular los intereses a la fecha con `Registro::actualizarInteres`;
+3. guardar la cotización y solicitar confirmación en Telegram;
+4. volver a cotizar en la misma sesión antes de generar;
+5. si no cambió, enviar una sola vez a `Registro::liquidar_VEP`;
+6. guardar el número y el PDF de `ImpresionReportes::imprimirVEP`;
+7. abrir `https://seti.afip.gob.ar/setiweb/#/pago/veps-a-enviar` para que el usuario
+   confirme el pago, incluso mediante QR;
+8. considerar el período pagado únicamente cuando Santa Fe lo refleje.
+
+Los parámetros de generación verificados son `nro_iibb`, `id_entidad`, `periodo`,
+`importe`, `fe_vencimi`, `fe_pago` e `interes`. Estas rutas son formularios web del
+organismo, no una API pública con contrato estable; por eso se monitorean los errores
+y no se interpretan respuestas ambiguas como éxito.
+
+Controles de seguridad e idempotencia:
+
+- el bot no posee la clave fiscal; el trabajo lo ejecuta `portal-worker`;
+- sólo pueden generar los chats de `IIBB_PAYMENT_CHAT_IDS`;
+- una cotización modificada exige una segunda confirmación;
+- doble pulsación y concurrencia se bloquean por cuenta y período;
+- un timeout o reinicio durante el envío queda `UNKNOWN` y nunca se reintenta solo;
+- generar un VEP no debita fondos;
+- no se guardan CBU, tarjetas, claves bancarias ni tokens de billeteras.
+
+La documentación de ARCA sobre billeteras virtuales indica que un VEP ya generado
+puede pagarse por QR aunque al crearlo se haya elegido otra entidad:
+`https://www.afip.gob.ar/comoPagarImpuestos/documentos/billeteras-virtuales.pdf`.
+El MVP abre el flujo oficial; no intenta fabricar ni extraer un QR sin una interfaz
+pública documentada.
+
+### Información posterior según la red
+
+- Para Santander se utiliza `1002` — Pago Mis Cuentas. Santander indica `Transacciones
+  → Pago de Servicios → Nuevo pago`, buscar `VEP` e informar CUIT contribuyente y CUIT
+  generador. También advierte que puede tardar al menos tres horas y no siempre aparece
+  en el calendario: `https://ayuda.santander.com.ar/3WR6AZDV3B-1/article/KFCQ44ND0R-que-es-vep-como-pagarlo/`.
+- Para Red Link sólo se informa el procedimiento general de ARCA y se aclara que el
+  menú depende del banco. No se atribuye a todos los bancos una ruta que no fue
+  verificada: `https://serviciosweb.arca.gob.ar/genericos/guiasPasoPaso/VerGuia.aspx?id=66`.
+- Para Interbanking se informa únicamente lo publicado: el VEP se autoriza en la
+  plataforma y el corte para procesamiento en el mismo día hábil es a las 16:00. Si
+  vence ese día y se envía después, debe generarse otro:
+  `https://prehome.interbanking.com.ar/nuevo-horario`.
 
 ## Procedimiento de pago de deuda de Monotributo — ejecución 04/08/2026
 
@@ -222,20 +281,29 @@ El detalle expandido mostró los 12 sub-VEP también en estado `Pagado`: 1661690
 
 A las 15:19 se recalculó CCMA para 02/2026–03/2026 con fecha 04/08/2026. Todavía mostró `Total Saldo Deudor: 154.843,13`, con capital $136.125,82 e intereses $18.717,31. Como SETI ya confirmó el pago apenas ocho minutos antes, se registra como **VEP pagado con imputación pendiente en CCMA**. No se generó un segundo VEP. La próxima acción segura es volver a consultar CCMA; sólo cuando el saldo deudor desaparezca o el pago figure en los movimientos corresponde dar la deuda por conciliada.
 
-## Diseño preliminar del bot de Telegram
+## Bot de Telegram implementado
 
-Separar capacidades por nivel de riesgo:
+La interfaz vigente muestra `/resumen`, `/facturas` y `/ayuda`. Las consultas de
+cuenta, pagos e Ingresos Brutos se renuevan automáticamente con credenciales cifradas;
+la clave fiscal se carga mediante un formulario privado y nunca pasa por Telegram.
 
-1. **Consultas:** estado de categoría, próximos vencimientos, facturación acumulada y alertas. Respuestas de solo lectura.
-2. **Facturación:** preparar un borrador, mostrar receptor/concepto/importe y exigir confirmación explícita antes de solicitar CAE por WSFEv1.
-3. **Deuda:** consultar mediante un adaptador de CCMA que requiera una sesión iniciada por el contribuyente, hasta que exista una API oficial accesible. El bot nunca recibe la clave fiscal.
-4. **Pagos:** generar una propuesta o VEP cuando el canal sea legal y soportado; el pago bancario final permanece bajo control del contribuyente.
+La facturación prepara un borrador editable y exige confirmación explícita antes de
+solicitar CAE por WSFEv1. La aplicación conserva número, CAE, respuesta y auditoría para
+resolver timeouts sin duplicar comprobantes.
 
-Medidas mínimas:
+El bot no genera VEP ni ejecuta pagos. Cuando detecta un pago confirmado que todavía
+no terminó de reflejarse en la cuenta, informa que no debe repetirse y suprime la alerta
+contradictoria de deuda para ese saldo.
 
-- lista blanca del `chat_id` autorizado;
-- secretos y clave privada fuera del repositorio, en un gestor de secretos;
-- cifrado y permisos mínimos para certificados;
+Controles implementados:
+
+- lista cerrada de chats y una lista más restrictiva para emitir;
+- certificados y claves fuera del repositorio;
+- cifrado de credenciales y tickets;
 - registro de auditoría sin tokens ni datos bancarios;
-- idempotencia para facturación y pagos;
-- modo de solo lectura por defecto y confirmación de dos pasos para emitir o pagar.
+- idempotencia de facturación;
+- avisos deduplicados y control de fuentes atrasadas;
+- confirmación humana para toda emisión fiscal irreversible.
+
+La operación actual está documentada en `README.md`, `BOT_TELEGRAM_TRIBUTARIO.md` y
+`DEPLOY_COOLIFY.md`.

@@ -1,180 +1,143 @@
-# Onboarding de ARCA Web Services
+# ARCA: certificados, relaciones y credenciales
 
-## Estado implementado
+## Estado actual
 
-El servicio ya puede:
+La instalación personal usa producción y tiene:
 
-- validar el formato y dígito verificador de un CUIT;
-- mantener la relación Telegram/CUIT en estado pendiente;
-- crear y firmar un TRA para WSAA;
-- reutilizar un Ticket de Acceso mientras continúe vigente;
-- persistir Tickets de Acceso cifrados para sobrevivir reinicios;
-- consultar la Constancia de Inscripción y verificar que ARCA responda por el mismo CUIT;
-- consultar resúmenes no leídos de WSCCOMU sin abrir comunicaciones;
-- consultar comprobantes existentes mediante WSFEv1 sin emitir nuevos;
-- rechazar datos anteriores cuando una consulta en vivo falla.
+- certificado X.509 vigente hasta el 04/08/2028;
+- clave privada correspondiente;
+- relación al servicio de Facturación Electrónica `wsfe`;
+- punto de venta Webservices `00002`;
+- WSAA con tickets cifrados y reutilizables;
+- Factura C real mediante WSFEv1;
+- consulta de situación registral, DFE y comprobantes autorizados;
+- alta privada de CUIT y clave fiscal para los portales sin API pública.
 
-## Preparar homologación
+Homologación ya cumplió su función. Se eliminaron del directorio operativo su
+certificado, clave y CSR. También se eliminó el CSR de producción: una solicitud ya
+emitida no es necesaria para ejecutar ni renovar el servicio.
 
-### 1. Crear clave privada y CSR
+## Archivos locales necesarios
 
-Desde la raíz del proyecto:
+`secrets/` contiene únicamente:
+
+| Archivo | Función | Permiso |
+|---|---|---:|
+| `simplearcaprod_7d17b50e91a73602.crt` | Certificado público de producción | `0644` |
+| `simplearcaprod.key` | Clave privada de producción | `0600` |
+| `session_encryption.key` | Clave Fernet para credenciales y tickets | `0600` |
+
+Los tres están ignorados por Git. La pérdida de la clave Fernet impide descifrar las
+credenciales y tickets persistidos; debe existir una copia de seguridad fuera del
+repositorio.
+
+## Dos mecanismos diferentes
+
+### APIs oficiales
+
+WSAA autentica al certificado y entrega un Ticket de Acceso para cada servicio. La
+clave fiscal personal no participa en WSFE, Padrón ni DFE.
+
+Flujo:
+
+1. firmar un LoginTicketRequest con la clave privada;
+2. solicitar token y sign a WSAA;
+3. cifrar el ticket en SQLite;
+4. usarlo hasta antes de su vencimiento;
+5. renovarlo automáticamente.
+
+### Portales interactivos
+
+Monotributo, pagos e Ingresos Brutos requieren CUIT y clave fiscal porque no exponen
+una API pública equivalente. Desde `/ayuda` se genera una URL privada. El formulario
+valida los datos contra ARCA y guarda la clave cifrada en `portal_state`.
+
+La URL no contiene la clave. En producción usa HTTP dentro de Tailscale; Telegram
+transporta únicamente el enlace de un solo uso.
+
+## Configuración local
+
+La `.env` local usa archivos montados como sólo lectura:
+
+```env
+ARCA_ENVIRONMENT=production
+ARCA_CERTIFICATE_PATH=/run/local-secrets/simplearcaprod_7d17b50e91a73602.crt
+ARCA_PRIVATE_KEY_PATH=/run/local-secrets/simplearcaprod.key
+SESSION_ENCRYPTION_KEY_FILE=/run/local-secrets/session_encryption.key
+ARCA_WSFE_POINT_OF_SALE=2
+```
+
+Levantar el bot y el worker con el override local:
 
 ```bash
-chmod +x scripts/generate_arca_csr.sh
-./scripts/generate_arca_csr.sh CUIT alias-homologacion
+docker compose -f compose.yaml -f compose.local.yaml up --build -d bot
+docker compose -f compose.yaml -f compose.local.yaml --profile portal up --build -d portal-worker
 ```
 
-Se generan dos archivos dentro de `secrets/`:
+## Configuración en Coolify
 
-- `alias-homologacion.key`: clave privada; no sale del servidor.
-- `alias-homologacion.csr`: solicitud que se carga en WSASS.
+Coolify no monta `secrets/` ni ningún archivo del checkout. Cargar como variables
+secretas:
 
-El script no sobrescribe claves existentes.
+- `ARCA_CERTIFICATE_B64`
+- `ARCA_PRIVATE_KEY_B64`
+- `SESSION_ENCRYPTION_KEY`
 
-WSASS sólo admite letras y números en el nombre simbólico. El alias visible puede
-diferir del nombre local de los archivos; por ejemplo, `simplearca` es válido y
-`simple_arca` no.
+El entrypoint las materializa en un `tmpfs` con modo `0600` y las elimina del entorno
+antes de iniciar Python. El procedimiento completo está en
+[DEPLOY_COOLIFY.md](DEPLOY_COOLIFY.md).
 
-### 2. Emitir el certificado de homologación
+## Relaciones que deben conservarse
 
-1. Adherir el servicio WSASS desde Administrador de Relaciones de ARCA.
-2. Ingresar en WSASS.
-3. Crear el certificado utilizando el CSR generado.
-4. Descargar el certificado emitido dentro de `secrets/`.
-5. Autorizar el mismo DN para estos servicios:
-   - `ws_sr_constancia_inscripcion`
-   - `veconsumerws`
-   - `wsfe`
+En Administrador de Relaciones de Clave Fiscal, el certificado/DN de producción debe
+estar autorizado para el CUIT representado y cada Web Service utilizado. Como mínimo,
+la emisión requiere `wsfe`.
 
-Para una prueba multi-CUIT, el certificado/DN debe quedar autorizado para el CUIT
-representado según el procedimiento de WSASS. Producción usa Administrador de
-Certificados Digitales y Administrador de Relaciones, no los certificados de WSASS.
+Las relaciones de servicios interactivos y las relaciones de Web Services de negocio
+no son intercambiables. Crear un punto de venta no crea automáticamente la relación al
+certificado, y asociar `wsfe` no crea el punto de venta.
 
-### 3. Configurar el proceso
+## Verificaciones seguras
 
-```dotenv
-ARCA_ENVIRONMENT=homologation
-ARCA_OPERATOR_CUIT=CUIT_DEL_OPERADOR
-ARCA_CERTIFICATE_ALIAS=alias-homologacion
-ARCA_CERTIFICATE_PATH=./secrets/alias-homologacion.crt
-ARCA_PRIVATE_KEY_PATH=./secrets/alias-homologacion.key
-```
-
-No copiar claves privadas dentro de la imagen Docker. Deben montarse como secretos
-de sólo lectura.
-
-Generar una clave diferente por instalación y guardarla únicamente en el gestor de
-secretos o `.env` de la VPS:
+Comprobar que certificado y clave forman el mismo par sin mostrar material privado:
 
 ```bash
-python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+openssl x509 -in secrets/simplearcaprod_7d17b50e91a73602.crt -pubkey -noout \
+  | openssl pkey -pubin -outform DER | openssl dgst -sha256
+openssl pkey -in secrets/simplearcaprod.key -pubout -outform DER \
+  | openssl dgst -sha256
 ```
 
-Asignar el resultado a `SESSION_ENCRYPTION_KEY`. Si se pierde esa clave, los Tickets
-de Acceso guardados dejan de ser recuperables y WSAA deberá emitir otros; no se
-pierden datos tributarios.
-
-Para Docker es preferible generar el archivo directamente y montarlo como secreto:
+Los hashes deben coincidir. Verificar vigencia:
 
 ```bash
-./scripts/generate_session_encryption_key.sh
+openssl x509 -in secrets/simplearcaprod_7d17b50e91a73602.crt -noout -dates
 ```
 
-Luego configurar `SESSION_ENCRYPTION_KEY_FILE=/run/secrets/session_encryption.key`.
-No configurar simultáneamente la variable directa y la variable terminada en
-`_FILE`.
+No imprimir la clave, no adjuntarla a tickets y no copiar token/sign de WSAA.
 
-## Verificación
+## Renovación
 
-### Disponibilidad sin datos personales
+Antes del vencimiento:
+
+1. generar una clave y CSR nuevos fuera del repositorio;
+2. emitir un certificado nuevo en ARCA;
+3. autorizar el nuevo certificado para los mismos servicios;
+4. validar en homologación sólo si cambió el flujo, no reutilizando datos de producción;
+5. cargar certificado y clave nuevos en Coolify;
+6. desplegar y comprobar WSAA/WSFE;
+7. conservar temporalmente el par anterior para rollback;
+8. eliminarlo cuando la nueva versión quede verificada.
+
+Nunca reemplazar sólo el certificado o sólo la clave: deben cambiar como par.
+
+## Generar un nuevo par cuando sea necesario
+
+El script permanece disponible para renovaciones:
 
 ```bash
-python3 -m contador_ai --arca-dummy
+./scripts/generate_arca_csr.sh nuevo_alias "CN=nuevo_alias,serialNumber=CUIT CUIT_SIN_GUIONES"
 ```
 
-Resultado esperado:
-
-```text
-appserver=OK authserver=OK dbserver=OK
-```
-
-### Vincular un CUIT desde Telegram
-
-```text
-/conectar 20123456786
-```
-
-Esto crea una solicitud `PENDING`. No demuestra autorización.
-
-### Verificar delegación y Padrón
-
-```bash
-python3 -m contador_ai --sync-arca-profile --chat-id CHAT_ID
-```
-
-La identidad pasa a `VERIFIED` únicamente si WSAA concede el ticket y la Constancia
-devuelve exactamente el CUIT vinculado.
-
-### Consultar bandeja sin abrir mensajes
-
-```bash
-python3 -m contador_ai --sync-arca-dfe --chat-id CHAT_ID
-```
-
-El conector sólo invoca `consultarComunicaciones`. No existe código que invoque
-`consumirComunicacion`.
-
-## Producción
-
-No cambiar `ARCA_ENVIRONMENT` a `production` hasta completar:
-
-- certificado de producción;
-- delegación de ambos WSN;
-- backup y rotación de claves;
-- rate limiting y observabilidad sin datos tributarios en logs.
-
-## Estado de la instalación de homologación
-
-- WSASS adherido.
-- Certificado `simplearca` emitido y verificado contra su clave privada.
-- Autorizaciones creadas para `ws_sr_padron_a4` y `veconsumerws` sobre el CUIT del
-  operador.
-- WSAA concedió Tickets de Acceso para ambos servicios.
-- Padrón A4 de homologación no contiene el CUIT real del operador; respondió
-  `No existe persona con ese Id`. Esto no es un rechazo de certificado.
-- La caché persistente cifrada quedó habilitada para evitar el error
-  `coe.alreadyAuthenticated` después de reinicios.
-- CSR de producción `simplearcaprod.csr` y clave privada asociada preparados
-  localmente.
-
-## Estado de la instalación de producción
-
-- Certificado `simplearcaprod` emitido por ARCA y válido hasta agosto de 2028.
-- Relaciones aceptadas para `ws_sr_constancia_inscripcion`, `ws_sr_padron_a13` y
-  `veconsumerws` sobre el CUIT del operador.
-- `ws_sr_padron_a4` rechazó la relación en producción con el mensaje oficial
-  `La persona no se encuentra habilitada para operar el servicio`; no se utiliza.
-- La Constancia de Inscripción reemplaza A4 porque devuelve expresamente
-  `categoriaMonotributo`, impuestos y actividades.
-- El manual publica `aws.arca.gov.ar`, pero ese nombre no resolvía por DNS al
-  05/08/2026; el endpoint operativo comprobado continúa en `aws.afip.gov.ar`.
-- Certificado `simplearcaprod_7d17b50e91a73602.crt` guardado localmente; su clave
-  pública coincide con `simplearcaprod.key` y el proceso ya usa producción.
-- La consulta real de Constancia quedó validada: ARCA informó estado activo,
-  categoría F de servicios y período 202608.
-- WSCCOMU quedó validado en producción mediante `consultarComunicaciones`: respondió
-  sin mensajes no leídos para la ventana 06/07/2026–05/08/2026 y no se invocó
-  `consumirComunicacion`.
-- WSCCOMU entrega la respuesta SOAP dentro de `multipart/related` XOP/MTOM. El
-  transporte extrae la parte `application/xop+xml` antes de parsear el XML.
-- La relación `wsfe` para `simplearcaprod` quedó creada y WSAA concedió un Ticket de
-  Acceso de producción.
-- WSFE de producción requiere compatibilidad con parámetros DH antiguos. El cliente
-  reduce `SECLEVEL` únicamente para ese endpoint y mantiene la validación del
-  certificado TLS.
-- La consulta real `FEParamGetPtosVenta` respondió `602: Sin Resultados`. El punto de
-  venta usado por Comprobantes en Línea no aparece en WSFE y no debe informarse una
-  facturación igual a cero.
-- Para calcular la proyección se necesita importar una vez el historial oficial y,
-  para la continuidad automática, emitir desde un punto de venta Web Services.
+Genera `.key` y `.csr` bajo `secrets/`. Después de emitir y validar el certificado, el
+CSR puede eliminarse. No ejecutar este paso para un redeploy normal.

@@ -17,6 +17,7 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir --requirement requirements.txt
 
 COPY --chown=appuser:appuser contador_ai ./contador_ai
+COPY --chown=appuser:appuser --chmod=0555 scripts/container_entrypoint.sh /usr/local/bin/container-entrypoint
 
 USER appuser
 VOLUME ["/data"]
@@ -24,4 +25,5 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD ["python", "-m", "contador_ai", "--healthcheck"]
 
+ENTRYPOINT ["container-entrypoint"]
 CMD ["python", "-m", "contador_ai"]

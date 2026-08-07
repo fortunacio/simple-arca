@@ -291,7 +291,7 @@ Al intentar ingresar a `API-SANTA FE - Régimen Simplificado - Gestión de Saldo
 4. **VEPAI confirmó el duplicado de $10.456,84**, pero se deja separado y no se reclama ahora para evitar una revisión de categoría.
 5. Utilizar la categoría III vigente en el padrón y los importes emitidos por el sistema; no solicitar un ajuste retroactivo voluntario.
 6. **Completado:** liquidación consolidada generada por $672.973,38; no se agregó 2026/07, que aún no venció al 04/08/2026.
-7. **Completado el 04/08/2026:** pago de las liquidaciones `850996529-27` y `850996530-23` mediante Plus Pagos/DEBIN por $672.973,38. API informó que el pago fue procesado correctamente; falta verificar su imputación en VEPAI.
+7. **Completado y verificado:** pago de las liquidaciones `850996529-27` y `850996530-23` mediante Plus Pagos/DEBIN por $672.973,38. El 06/08/2026 VEPAI mostró pagos para todos los períodos vencidos hasta junio de 2026.
 8. No tramitar exclusión ni presentar DDJJ del Régimen General mientras API mantenga el criterio informado por escrito.
 
 ## Fuentes oficiales

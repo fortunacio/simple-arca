@@ -14,6 +14,7 @@ from .ccma import CcmaCredentialsRejected, CcmaSessionRequired
 ARCA_LOGIN_BASE_URL = "https://auth.afip.gov.ar/contribuyente_/login.xhtml"
 ARCA_SYSTEM_TARGETS = {
     "admin_mono": "monotributo.afip.gob.ar",
+    "portal": "portalcf.cloud.afip.gob.ar",
     "santafe_vepai": "www.santafe.gob.ar",
     "santafe_regsim": "www.santafe.gob.ar",
 }
@@ -186,7 +187,11 @@ class ArcaHttpAuthenticator:
     def login(self, cuit: str, password: str, system: str) -> ArcaHttpLogin:
         if system not in ARCA_SYSTEM_TARGETS:
             raise ValueError("El servicio de ARCA no está habilitado por este cliente")
-        login_url = f"{ARCA_LOGIN_BASE_URL}?{urlencode({'action': 'SYSTEM', 'system': system})}"
+        login_url = (
+            ARCA_LOGIN_BASE_URL
+            if system == "portal"
+            else f"{ARCA_LOGIN_BASE_URL}?{urlencode({'action': 'SYSTEM', 'system': system})}"
+        )
         with httpx.Client(
             follow_redirects=True,
             timeout=self.timeout,

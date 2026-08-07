@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS bot_state (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    chat_id INTEGER NOT NULL,
+    event_key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, event_key, fingerprint),
+    FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS access_tickets (
     scope TEXT NOT NULL,
     service TEXT NOT NULL,
@@ -233,6 +242,45 @@ CREATE TABLE IF NOT EXISTS invoice_history_coverage (
     FOREIGN KEY (chat_id) REFERENCES users(chat_id)
 );
 
+CREATE TABLE IF NOT EXISTS iibb_payment_drafts (
+    id TEXT PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    represented_cuit TEXT NOT NULL,
+    account TEXT NOT NULL,
+    period TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'QUOTE_REQUESTED', 'QUOTING', 'QUOTED',
+        'GENERATION_REQUESTED', 'GENERATING', 'GENERATED',
+        'UNKNOWN', 'ERROR', 'PAID', 'EXPIRED', 'CANCELLED'
+    )),
+    network_id TEXT NOT NULL,
+    network_name TEXT NOT NULL,
+    payment_date TEXT NOT NULL,
+    obligation_due_date TEXT,
+    principal TEXT,
+    interest TEXT,
+    total TEXT,
+    vep_number TEXT,
+    vep_expires_on TEXT,
+    official_pdf BLOB,
+    last_error TEXT,
+    notification_pending INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS iibb_payment_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (draft_id) REFERENCES iibb_payment_drafts(id),
+    FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_invoices_chat_date
 ON invoices(chat_id, issue_date DESC, id DESC);
 
@@ -241,6 +289,19 @@ ON invoice_drafts(chat_id, status, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_invoice_history_chat_date
 ON invoice_history(chat_id, issued_at, point_of_sale, number);
+
+CREATE INDEX IF NOT EXISTS idx_iibb_payment_jobs
+ON iibb_payment_drafts(status, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_iibb_payment_notifications
+ON iibb_payment_drafts(notification_pending, updated_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_iibb_payment_one_active_period
+ON iibb_payment_drafts(chat_id, account, period)
+WHERE status IN (
+    'QUOTE_REQUESTED','QUOTING','QUOTED','GENERATION_REQUESTED',
+    'GENERATING','GENERATED','UNKNOWN'
+);
 """
 
 
@@ -280,6 +341,49 @@ class Database:
                 "SELECT value FROM bot_state WHERE key = ?", (key,)
             ).fetchone()
         return row["value"] if row else default
+
+    def notification_was_sent(
+        self,
+        chat_id: int,
+        event_key: str,
+        fingerprint: str,
+    ) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM notification_deliveries
+                WHERE chat_id = ? AND event_key = ? AND fingerprint = ?
+                """,
+                (chat_id, event_key, fingerprint),
+            ).fetchone()
+        return row is not None
+
+    def has_notification_event(self, chat_id: int, event_key: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM notification_deliveries
+                WHERE chat_id = ? AND event_key = ? LIMIT 1
+                """,
+                (chat_id, event_key),
+            ).fetchone()
+        return row is not None
+
+    def mark_notification_sent(
+        self,
+        chat_id: int,
+        event_key: str,
+        fingerprint: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO notification_deliveries(
+                    chat_id, event_key, fingerprint
+                ) VALUES (?, ?, ?)
+                """,
+                (chat_id, event_key, fingerprint),
+            )
 
     def ensure_user(self, chat_id: int) -> None:
         with self.connect() as connection:

@@ -6,7 +6,12 @@
 - Respondida por API el **04/08/2026**.
 - API indicó por escrito: **“Se puede mantener la adhesión a régimen simplificado con la deuda”** y explicó cómo cancelar las cuotas e intereses dentro de ese régimen.
 - No solicitar la exclusión ni presentar DDJJ del Régimen General.
-- Antes de pagar, conciliar VEPAI y el posible crédito de $10.456,84. No promover de oficio una recategorización retroactiva mientras API mantenga oficialmente la categoría 3 y emita las cuotas bajo esa categoría.
+- El posible crédito de $10.456,84 queda documentado pero separado. No promover de
+  oficio una recategorización retroactiva mientras API mantenga oficialmente la
+  categoría 3 y emita las cuotas bajo esa categoría.
+- La liquidación de $672.973,38 fue pagada el 04/08/2026. VEPAI ya muestra pagos para
+  todos los períodos vencidos hasta junio de 2026; el control siguiente es la cuota de
+  julio de 2026 con vencimiento el 20/08/2026.
 
 ## Respuesta recibida
 
@@ -17,6 +22,11 @@ API indicó que:
 3. Para pagar directamente, deben generarse las cuotas desde `Régimen Simplificado - Generar boletas/VEP` y liquidarse por separado los intereses en [IBINT](https://www.santafe.gov.ar/e-ibint/index.php).
 4. Para cancelar mediante una liquidación consolidada o plan de pagos, debe utilizarse `API-SANTA FE - LDAE (Liquidación deuda Impuestos de Autoliquidación)`, incorporándolo previamente en el Administrador de Relaciones de ARCA.
 5. En LDAE deben cargarse los períodos adeudados individualmente y luego generarse una liquidación única. El pago informado puede realizarse mediante home banking o Plus Pago; en Plus Pago, con tarjeta de débito o DEBIN.
+
+Para la cuota corriente, el bot implementa el camino separado indicado por API:
+generación del Formulario 5426/VEP desde Régimen Simplificado. No utiliza LDAE ni
+Plus Pago, que se reservan para deuda consolidada y planes. Antes de generar muestra
+capital, interés y total y exige confirmación expresa.
 
 La respuesta debe conservarse con remitente, fecha, destinatarios y el mensaje original enviado. Es un antecedente administrativo individual importante, aunque no tiene el mismo efecto jurídico que una Consulta Vinculante F. 1307. La instrucción de utilizar las cuotas impresas por la aplicación respalda, como posición operativa favorable al contribuyente, cancelar los importes que el propio sistema determina bajo la categoría 3 vigente en el padrón.
 
@@ -94,4 +104,4 @@ Si API posteriormente desconoce la continuidad en el Régimen Simplificado o emi
 
 Por decisión posterior del contribuyente, no se enviará esa solicitud de reimputación ni se utilizará el trámite de saldo a favor por ahora, para evitar que la gestión provoque una revisión de categoría. El crédito queda documentado pero separado de la liquidación a pagar.
 
-La auditoría LDAE del 04/08/2026, solicitud `300-682390`, confirmó quince períodos impagos bajo categoría III: capital $492.772,66, intereses $180.200,72 y total **$672.973,38**. La liquidación fue generada con los identificadores `850996529-27` por $557.918,88 y `850996530-23` por $115.054,50. Ambas liquidaciones se abonaron juntas mediante Plus Pagos/DEBIN; el contribuyente confirmó el pago y API informó que fue procesado correctamente. No se generó un plan. La imputación debe controlarse posteriormente en VEPAI.
+La auditoría LDAE del 04/08/2026, solicitud `300-682390`, confirmó quince períodos impagos bajo categoría III: capital $492.772,66, intereses $180.200,72 y total **$672.973,38**. La liquidación fue generada con los identificadores `850996529-27` por $557.918,88 y `850996530-23` por $115.054,50. Ambas liquidaciones se abonaron juntas mediante Plus Pagos/DEBIN; el contribuyente confirmó el pago y API informó que fue procesado correctamente. No se generó un plan. El 06/08/2026 VEPAI confirmó pagos para todos los períodos vencidos hasta junio de 2026.

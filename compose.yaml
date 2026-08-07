@@ -1,33 +1,95 @@
 services:
   bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
       TAX_MONITOR_DB: /data/tax_monitor.sqlite3
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      BOT_ALLOWED_CHAT_IDS: "${BOT_ALLOWED_CHAT_IDS:-}"
+      SESSION_ENCRYPTION_KEY: "${SESSION_ENCRYPTION_KEY:-}"
+      SESSION_ENCRYPTION_KEY_FILE: "${SESSION_ENCRYPTION_KEY_FILE:-/run/contador-secrets/session_encryption.key}"
+      ARCA_ENVIRONMENT: "${ARCA_ENVIRONMENT:-production}"
+      ARCA_OPERATOR_CUIT: "${ARCA_OPERATOR_CUIT:-}"
+      ARCA_CERTIFICATE_ALIAS: "${ARCA_CERTIFICATE_ALIAS:-}"
+      ARCA_CERTIFICATE_B64: "${ARCA_CERTIFICATE_B64:-}"
+      ARCA_PRIVATE_KEY_B64: "${ARCA_PRIVATE_KEY_B64:-}"
+      ARCA_CERTIFICATE_PATH: "${ARCA_CERTIFICATE_PATH:-/run/contador-secrets/arca.crt}"
+      ARCA_PRIVATE_KEY_PATH: "${ARCA_PRIVATE_KEY_PATH:-/run/contador-secrets/arca.key}"
+      ARCA_WSFE_POINT_OF_SALE: "${ARCA_WSFE_POINT_OF_SALE:-}"
+      INVOICE_EMISSION_CHAT_IDS: "${INVOICE_EMISSION_CHAT_IDS:-}"
+      IIBB_PAYMENTS_ENABLED: "${IIBB_PAYMENTS_ENABLED:-true}"
+      IIBB_PAYMENT_CHAT_IDS: "${IIBB_PAYMENT_CHAT_IDS:-}"
+      INVOICE_ISSUER_IIBB: "${INVOICE_ISSUER_IIBB:-}"
+      CCMA_ENABLED: "${CCMA_ENABLED:-true}"
+      CCMA_LOGIN_URL: "${CCMA_LOGIN_URL:-}"
+      ARCA_ENROLLMENT_BASE_URL: "${ARCA_ENROLLMENT_BASE_URL:-}"
+      ARCA_ENROLLMENT_ALLOW_TAILSCALE_HTTP: "${ARCA_ENROLLMENT_ALLOW_TAILSCALE_HTTP:-false}"
+      AUTOMATIC_MONITOR_ENABLED: "${AUTOMATIC_MONITOR_ENABLED:-true}"
+      AUTOMATIC_MONITOR_CHECK_SECONDS: "${AUTOMATIC_MONITOR_CHECK_SECONDS:-300}"
+      AUTOMATIC_SYNC_INTERVAL_SECONDS: "${AUTOMATIC_SYNC_INTERVAL_SECONDS:-21600}"
     volumes:
       - tax_data:/data
-      - ./secrets:/run/secrets:ro
+    tmpfs:
+      - /run/contador-secrets:mode=0700,uid=10001,gid=10001
+    healthcheck:
+      test: ["CMD", "python", "-m", "contador_ai", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   portal-worker:
-    profiles: ["portal"]
     build:
       context: .
       dockerfile: Dockerfile.portal
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
       TAX_MONITOR_DB: /data/tax_monitor.sqlite3
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      SESSION_ENCRYPTION_KEY: "${SESSION_ENCRYPTION_KEY:-}"
+      SESSION_ENCRYPTION_KEY_FILE: "${SESSION_ENCRYPTION_KEY_FILE:-/run/contador-secrets/session_encryption.key}"
+      CCMA_ENABLED: "${CCMA_ENABLED:-true}"
+      CCMA_CHAT_IDS: "${CCMA_CHAT_IDS:-}"
+      CCMA_SYNC_INTERVAL_SECONDS: "${CCMA_SYNC_INTERVAL_SECONDS:-21600}"
+      CCMA_SNAPSHOT_TTL_SECONDS: "${CCMA_SNAPSHOT_TTL_SECONDS:-86400}"
+      CCMA_BROWSER_HEADLESS: "${CCMA_BROWSER_HEADLESS:-true}"
       CCMA_SESSION_DIR: /portal-state
+      ARCA_SETI_ENABLED: "${ARCA_SETI_ENABLED:-true}"
+      ARCA_SETI_SNAPSHOT_TTL_SECONDS: "${ARCA_SETI_SNAPSHOT_TTL_SECONDS:-86400}"
+      SANTA_FE_IIBB_ENABLED: "${SANTA_FE_IIBB_ENABLED:-true}"
+      SANTA_FE_IIBB_SNAPSHOT_TTL_SECONDS: "${SANTA_FE_IIBB_SNAPSHOT_TTL_SECONDS:-86400}"
+      IIBB_PAYMENTS_ENABLED: "${IIBB_PAYMENTS_ENABLED:-true}"
+      IIBB_PAYMENT_CHAT_IDS: "${IIBB_PAYMENT_CHAT_IDS:-}"
+      INVOICE_EMISSION_CHAT_IDS: "${INVOICE_EMISSION_CHAT_IDS:-}"
+      ARCA_ENROLLMENT_ENABLED: "${ARCA_ENROLLMENT_ENABLED:-true}"
+      ARCA_ENROLLMENT_BIND: 0.0.0.0
+      ARCA_ENROLLMENT_PORT: 8090
     ports:
-      - "127.0.0.1:6080:6080"
-      - "127.0.0.1:8090:8090"
+      - "${TAILSCALE_BIND_IP:-127.0.0.1}:${ARCA_ENROLLMENT_HOST_PORT:-8090}:8090"
+      - "${TAILSCALE_BIND_IP:-127.0.0.1}:${CCMA_NOVNC_HOST_PORT:-6080}:6080"
     volumes:
       - tax_data:/data
       - portal_state:/portal-state
-      - ./secrets:/run/secrets:ro
+    tmpfs:
+      - /run/contador-secrets:mode=0700,uid=10001,gid=10001
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   tax_data:

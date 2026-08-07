@@ -28,6 +28,31 @@ PASSWORD_FORM = """
 
 
 class ArcaHttpAuthenticatorTest(TestCase):
+    def test_portal_login_uses_the_generic_arca_entrypoint(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(200, text=USERNAME_FORM)
+            if len(requests) == 2:
+                return httpx.Response(200, text=PASSWORD_FORM)
+            if len(requests) == 3:
+                return httpx.Response(
+                    302,
+                    headers={
+                        "Location": "https://portalcf.cloud.afip.gob.ar/portal/app/"
+                    },
+                )
+            return httpx.Response(200, text="<main>Portal de Clave Fiscal</main>")
+
+        login = ArcaHttpAuthenticator(
+            transport=httpx.MockTransport(handler)
+        ).login("20383717419", "clave-secreta", "portal")
+
+        self.assertEqual(requests[0].url.query, b"")
+        self.assertEqual(httpx.URL(login.url).host, "portalcf.cloud.afip.gob.ar")
+
     def test_logs_in_with_forms_and_returns_only_session_cookies(self):
         requests = []
 

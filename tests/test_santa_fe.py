@@ -12,6 +12,7 @@ from contador_ai.santa_fe import (
     SantaFeMaintenance,
     parse_regsim,
     parse_period_quote,
+    parse_interest,
     parse_vepai,
     reconcile_vepai,
 )
@@ -102,6 +103,9 @@ class SantaFeParserTest(TestCase):
             result,
             {"period": "2026-07", "due_date": "2026-08-20", "amount": "42882.00"},
         )
+
+    def test_parses_interest_quote(self):
+        self.assertEqual(parse_interest(" 1.234,56 "), "1234.56")
 
 
 class _Connector:

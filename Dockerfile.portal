@@ -24,10 +24,15 @@ RUN mkdir -p /ms-playwright \
 
 COPY --chown=appuser:appuser contador_ai ./contador_ai
 COPY --chown=appuser:appuser scripts/run_portal_worker.sh /usr/local/bin/run_portal-worker
+COPY --chown=appuser:appuser --chmod=0555 scripts/container_entrypoint.sh /usr/local/bin/container-entrypoint
 RUN chmod 0755 /usr/local/bin/run_portal-worker
 
 USER appuser
 VOLUME ["/data", "/portal-state"]
-EXPOSE 6080
+EXPOSE 6080 8090
 
-ENTRYPOINT ["run_portal-worker"]
+HEALTHCHECK --interval=30s --timeout=5s --retries=5 --start-period=30s \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).read()"]
+
+ENTRYPOINT ["container-entrypoint"]
+CMD ["run_portal-worker"]

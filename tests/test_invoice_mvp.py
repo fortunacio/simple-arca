@@ -276,3 +276,15 @@ class InvoiceMvpTest(TestCase):
             ).fetchone()
         self.assertEqual(draft["status"], "DRAFT")
         self.assertEqual(self.store.invoice_count(self.chat_id), 1)
+
+    def test_invoice_list_can_return_to_the_summary(self):
+        bot = InvoiceBotService(
+            self.store, self.gateway(), today_provider=lambda: date(2026, 8, 5)
+        )
+
+        reply = bot.invoice_list(self.chat_id, 0)
+
+        self.assertIn(
+            ("Volver al resumen", "tax:summary"),
+            [button for row in reply.keyboard for button in row],
+        )

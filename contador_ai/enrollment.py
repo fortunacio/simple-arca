@@ -159,7 +159,7 @@ class ArcaEnrollmentHandler(BaseHTTPRequestHandler):
 <p id="verification-status" class="status" role="status" aria-live="polite" hidden>
 Verificando tus datos con ARCA. Puede tardar hasta dos minutos; no cierres esta página.
 </p></form>
-<small>La clave se envía directamente a este servidor por HTTPS, se verifica en ARCA y se guarda cifrada. No pasa por Telegram.</small>"""
+<small>La clave se envía directamente a este servidor por el enlace privado, se verifica en ARCA y se guarda cifrada. No pasa por Telegram.</small>"""
         self._send(200, _page("Configurar acceso de ARCA", content))
 
     def do_POST(self) -> None:

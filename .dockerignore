@@ -1,8 +1,14 @@
 .git
 .env
+secrets
+*.key
+*.pem
+*.crt
+*.csr
+*.p12
+*.pfx
 __pycache__
 *.pyc
 data
 tests
 *.md
-

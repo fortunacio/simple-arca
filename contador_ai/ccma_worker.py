@@ -21,7 +21,9 @@ from .ccma import (
     parse_ccma_account,
 )
 from .db import Database
-from .santa_fe import SantaFeIibbConnector, SantaFeIibbWorker
+from .iibb_payment import IibbPaymentProcessor, IibbPaymentStore
+from .santa_fe import ARGENTINA_TIMEZONE, SantaFeIibbConnector, SantaFeIibbWorker
+from .seti import BrowserSetiConnector, SetiPaymentsWorker
 
 
 LOGGER = logging.getLogger(__name__)
@@ -424,7 +426,23 @@ def main() -> None:
             seconds=int(os.environ.get("CCMA_SNAPSHOT_TTL_SECONDS", "86400"))
         ),
     )
+    seti_worker = None
+    if os.environ.get("ARCA_SETI_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        seti_worker = SetiPaymentsWorker(
+            database,
+            BrowserSetiConnector(credentials),
+            snapshot_ttl=timedelta(
+                seconds=int(os.environ.get("ARCA_SETI_SNAPSHOT_TTL_SECONDS", "86400"))
+            ),
+        )
     santa_fe_worker = None
+    iibb_payment_store = IibbPaymentStore(database)
+    iibb_payment_store.recover_stale_jobs()
+    iibb_payment_processor = None
     if os.environ.get("SANTA_FE_IIBB_ENABLED", "true").strip().lower() in {
         "1",
         "true",
@@ -437,6 +455,25 @@ def main() -> None:
                 seconds=int(os.environ.get("SANTA_FE_IIBB_SNAPSHOT_TTL_SECONDS", "86400"))
             ),
         )
+        if os.environ.get("IIBB_PAYMENTS_ENABLED", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            payment_chat_ids = frozenset(
+                _chat_ids(
+                    os.environ.get("IIBB_PAYMENT_CHAT_IDS", "").strip()
+                    or os.environ.get("INVOICE_EMISSION_CHAT_IDS", "")
+                )
+            )
+            if payment_chat_ids:
+                iibb_payment_processor = IibbPaymentProcessor(
+                    iibb_payment_store,
+                    SantaFeIibbConnector(credentials),
+                    payment_chat_ids,
+                )
+            else:
+                LOGGER.warning("No hay chats autorizados para generar VEP de Ingresos Brutos")
     configured = _chat_ids(
         os.environ.get("CCMA_CHAT_IDS", "")
         or os.environ.get("INVOICE_EMISSION_CHAT_IDS", "")
@@ -481,7 +518,15 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    next_sync = 0.0
     while running:
+        if iibb_payment_processor is not None:
+            iibb_payment_processor.process_one()
+            iibb_payment_store.expire_generated(datetime.now(ARGENTINA_TIMEZONE).date())
+        now = time.monotonic()
+        if now < next_sync:
+            time.sleep(1)
+            continue
         for chat_id in chat_ids:
             try:
                 worker.sync_chat(chat_id)
@@ -491,9 +536,18 @@ def main() -> None:
                 LOGGER.warning("CCMA necesita iniciar sesión para chat_id=%s", chat_id)
             except Exception:
                 LOGGER.exception("Falló la sincronización CCMA para chat_id=%s", chat_id)
+            if seti_worker is not None:
+                try:
+                    seti_worker.sync_chat(chat_id)
+                except Exception:
+                    LOGGER.exception(
+                        "Falló la consulta de pagos de ARCA para chat_id=%s",
+                        chat_id,
+                    )
             if santa_fe_worker is not None:
                 try:
                     santa_fe_worker.sync_chat(chat_id)
+                    iibb_payment_store.reconcile_paid(chat_id)
                 except CcmaCredentialsRejected:
                     LOGGER.error(
                         "ARCA rechazó las credenciales de Santa Fe para chat_id=%s",
@@ -511,10 +565,7 @@ def main() -> None:
                     )
         if args.once:
             return
-        for _ in range(max(1, interval)):
-            if not running:
-                return
-            time.sleep(1)
+        next_sync = time.monotonic() + max(1, interval)
 
 
 if __name__ == "__main__":

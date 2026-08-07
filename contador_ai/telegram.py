@@ -9,24 +9,19 @@ import urllib.request
 import uuid
 
 from .db import Database
-from .invoice_bot import BotReply, InvoiceBotService
+from .bot_reply import BotReply
+from .invoice_bot import InvoiceBotService
+from .iibb_payment import IibbPaymentBotService
+from .notifications import TaxNotificationMonitor
 from .service import TaxMonitorService
 
 
 LOGGER = logging.getLogger(__name__)
 
 BOT_COMMANDS = (
-    ("estado", "Resumen de ARCA e Ingresos Brutos"),
-    ("iibb", "Deuda y próximo pago de Ingresos Brutos"),
-    ("monotributo", "Deuda y próximo vencimiento del monotributo"),
-    ("categoria", "Categoría actual y proyectada"),
-    ("facturacion", "Facturación de los últimos 12 meses"),
-    ("facturas", "Ver las últimas facturas"),
-    ("nueva_factura", "Preparar una Factura C"),
-    ("nuevo_cliente", "Guardar un cliente para facturar"),
-    ("bandeja", "Mensajes sin leer de ARCA"),
-    ("configurar_arca", "Guardar o actualizar la clave fiscal"),
-    ("ayuda", "Ver todos los comandos disponibles"),
+    ("resumen", "Qué requiere atención y qué tenés que pagar"),
+    ("facturas", "Ver, descargar o preparar una factura"),
+    ("ayuda", "Cómo usar el bot"),
 )
 
 
@@ -38,12 +33,18 @@ class TelegramClient:
         service: TaxMonitorService,
         allowed_chat_ids: frozenset[int],
         invoice_bot: InvoiceBotService | None = None,
+        iibb_payment_bot: IibbPaymentBotService | None = None,
+        notification_monitor: TaxNotificationMonitor | None = None,
+        monitor_interval_seconds: int = 300,
     ):
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.db = db
         self.service = service
         self.allowed_chat_ids = allowed_chat_ids
         self.invoice_bot = invoice_bot
+        self.iibb_payment_bot = iibb_payment_bot
+        self.notification_monitor = notification_monitor
+        self.monitor_interval_seconds = max(60, monitor_interval_seconds)
 
     def request(self, method: str, payload: dict) -> dict:
         data = urllib.parse.urlencode(payload).encode()
@@ -206,17 +207,24 @@ class TelegramClient:
                 data = callback.get("data")
                 if not isinstance(chat_id, int) or chat_id not in self.allowed_chat_ids:
                     continue
-                if (
-                    self.invoice_bot is not None
-                    and isinstance(message_id, int)
-                    and isinstance(data, str)
-                ):
+                if isinstance(message_id, int) and isinstance(data, str):
                     try:
-                        reply = self.invoice_bot.handle_callback(data, chat_id)
+                        if data.startswith("tax:"):
+                            reply = self.service.navigation(
+                                data.split(":", 1)[1],
+                                chat_id,
+                                replace=True,
+                            )
+                        elif data.startswith("iibbpay:") and self.iibb_payment_bot is not None:
+                            reply = self.iibb_payment_bot.handle_callback(data, chat_id)
+                        elif self.invoice_bot is not None:
+                            reply = self.invoice_bot.handle_callback(data, chat_id)
+                        else:
+                            raise ValueError("Esa opción no está disponible")
                         self.answer_callback(callback_id)
                         self.deliver(chat_id, reply, message_id=message_id)
                     except Exception as exc:
-                        LOGGER.exception("Falló una acción de facturación")
+                        LOGGER.exception("Falló una acción del bot")
                         self.answer_callback(callback_id, "No pude completar la acción")
                         self.send_message(chat_id, f"No pude completar la acción: {exc}")
                     handled += 1
@@ -230,6 +238,18 @@ class TelegramClient:
             if not text:
                 self.send_message(chat_id, "Por ahora sólo entiendo comandos de texto. Usá /ayuda.")
                 continue
+            command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
+            navigation_action = {
+                "/start": "start",
+                "/resumen": "summary",
+                "/estado": "summary",
+                "/ayuda": "help",
+                "/help": "help",
+            }.get(command)
+            if navigation_action is not None:
+                self.deliver(chat_id, self.service.navigation(navigation_action, chat_id))
+                handled += 1
+                continue
             if self.invoice_bot is not None and self.invoice_bot.handles(text, chat_id):
                 reply = self.invoice_bot.handle_message(text, chat_id)
                 if reply is not None:
@@ -237,7 +257,6 @@ class TelegramClient:
                     handled += 1
                     continue
             response = self.service.dispatch(text, chat_id)
-            command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
             keyboard = ()
             if command == "/configurar_arca":
                 setup_url = next(
@@ -254,15 +273,50 @@ class TelegramClient:
             handled += 1
         return handled
 
+    def run_monitor_once(self) -> int:
+        if self.notification_monitor is None:
+            return 0
+        sent = 0
+        for chat_id in sorted(self.allowed_chat_ids):
+            try:
+                batch = self.notification_monitor.check_chat(chat_id)
+                if batch is None:
+                    continue
+                self.send_message(chat_id, batch.text)
+                self.notification_monitor.mark_sent(chat_id, batch)
+                sent += 1
+            except Exception:
+                LOGGER.exception("Falló el resumen automático para chat_id=%s", chat_id)
+        return sent
+
+    def run_iibb_payment_notifications(self) -> int:
+        if self.iibb_payment_bot is None:
+            return 0
+        sent = 0
+        for chat_id, row_id, reply in self.iibb_payment_bot.pending_replies():
+            try:
+                self.deliver(chat_id, reply)
+                self.iibb_payment_bot.store.mark_notified(row_id)
+                sent += 1
+            except Exception:
+                LOGGER.exception("No pude entregar una novedad de pago de Ingresos Brutos")
+        return sent
+
     def run(self) -> None:
         try:
             self.set_commands()
         except Exception:
             LOGGER.exception("No pude actualizar el menú de comandos de Telegram")
+        self.run_monitor_once()
+        next_monitor = time.monotonic() + self.monitor_interval_seconds
         LOGGER.info("Bot multiusuario iniciado")
         while True:
             try:
-                self.poll_once()
+                self.poll_once(timeout=10 if self.iibb_payment_bot is not None else 30)
+                self.run_iibb_payment_notifications()
+                if time.monotonic() >= next_monitor:
+                    self.run_monitor_once()
+                    next_monitor = time.monotonic() + self.monitor_interval_seconds
             except KeyboardInterrupt:
                 raise
             except Exception:

@@ -1,409 +1,187 @@
-# Monitor tributario personal por Telegram
+# Bot tributario por Telegram
 
-> Este diseño personal quedó reemplazado como arquitectura de producto por
-> [ARQUITECTURA_OFICIAL_MULTIUSUARIO.md](ARQUITECTURA_OFICIAL_MULTIUSUARIO.md).
-> Se conserva únicamente como antecedente funcional y tributario.
+## Interfaz vigente
 
-## Estado y alcance
+El menú de Telegram muestra exactamente tres comandos:
 
-- Investigación actualizada al **04/08/2026**.
-- Titular: un único contribuyente de Santa Fe.
-- Alcance: monitoreo, alertas, proyecciones y acceso a trámites oficiales.
-- Fuera de alcance por ahora: emitir facturas, presentar recategorizaciones y ejecutar pagos.
-- Estado: especificación funcional y técnica; todavía no se creó el bot ni se agregaron dependencias.
-
-## Objetivo
-
-El bot debe responder, con fuente y fecha de actualización, estas seis preguntas:
-
-1. ¿Cuándo debo revisar la recategorización nacional y provincial?
-2. ¿Tengo mensajes nuevos en el Domicilio Fiscal Electrónico de ARCA?
-3. ¿Debo Monotributo y está bien imputado el débito automático?
-4. ¿Cuánto facturé en los últimos doce meses y hacia qué categoría voy?
-5. ¿Tengo alguna otra deuda registrada en ARCA?
-6. ¿Debo Ingresos Brutos de Santa Fe?
-
-La respuesta principal será `/estado`. El sistema será determinístico, sin modelo de lenguaje y sin consumo de tokens.
-
-## Resumen ejecutivo
-
-La solución es viable, pero no todas las fuentes ofrecen el mismo nivel de automatización:
-
-- **Bandeja ARCA:** automatización oficial mediante WSCCOMU. Se pueden consultar asuntos y estados sin abrir los mensajes.
-- **Categorías y vencimientos:** automatización total a partir de las tablas y calendarios oficiales.
-- **Facturación acumulada:** cálculo total una vez que se sincronizan los comprobantes emitidos; no se emitirán facturas.
-- **Deuda ARCA:** CCMA y, si aparecen otros impuestos, Sistema de Cuentas Tributarias mediante una sesión local autenticada. El sincronizador intentará primero repetir las solicitudes internas con las cookies y tokens temporales del navegador.
-- **Ingresos Brutos Santa Fe:** conciliación con VEPAI y los aplicativos provinciales usando el mismo mecanismo local. No se identificó una API pública soportada, pero sí pueden evaluarse sus solicitudes web internas.
-
-El bot no confundirá una estimación con un dato oficial. Cada resultado mostrará `fuente`, `observado_el` y `vigencia`.
-
-## Tablero `/estado`
-
-Ejemplo de respuesta:
-
-```text
-ESTADO TRIBUTARIO — actualizado 04/08/2026 18:30
-
-ARCA · Bandeja
-🟡 2 comunicaciones no leídas (sin abrir)
-Próxima notificación de oficio: lunes 10/08
-
-Monotributo
-🟢 Categoría F desde 08/2026
-🟡 Pago 08/2026 informado; falta confirmar imputación en CCMA
-Próxima revisión: 01–05/02/2027
-
-Facturación y categoría
-Últimos 12 meses: $XX.XXX.XXX
-Escenario con tabla vigente: E / F / G
-Margen al próximo límite: $X.XXX.XXX
-Calidad del dato: completa hasta 31/07/2026
-
-ARCA · Otras obligaciones
-🟢 Sin deuda observada en la última consulta
-Fuente: Sistema de Cuentas Tributarias, 04/08/2026
-
-Ingresos Brutos Santa Fe
-🟢 Régimen Simplificado · categoría 3
-🟡 Pago consolidado informado; falta confirmar imputación en VEPAI
-Próxima revisión: enero de 2027
-```
-
-El bot nunca responderá simplemente “estás al día”. Debe indicar qué se revisó, en qué organismo y cuándo.
-
-## 1. Recategorización
-
-### Monotributo ARCA
-
-- Se revisa dos veces por año: **febrero y agosto**.
-- El trámite vence el **día 5** de esos meses, salvo prórroga oficial.
-- En cada revisión se evalúan los **últimos doce meses de actividad**.
-- Si corresponde mantener la categoría, ARCA indica que no hace falta realizar una acción.
-- Si los parámetros son superiores o inferiores, corresponde recategorizarse.
-- ARCA puede notificar una recategorización de oficio en el Domicilio Fiscal Electrónico.
-
-El bot avisará 30, 15, 7, 3 y 1 día antes. Al publicarse una prórroga, la fecha original queda en el historial y se agrega la nueva vigencia.
-
-### Ingresos Brutos Santa Fe
-
-- La revisión es semestral, en **enero y julio**.
-- La Resolución General API 43/2024 establece como regla el **31 de enero** y el **31 de julio**.
-- La primera recategorización de 2026 fue prorrogada al **27/02/2026**.
-- Para julio se usa el 31/07 como fecha base, salvo prórroga publicada específicamente.
-- La segunda revisión no exige trámite si el contribuyente permanece en la misma categoría; la primera es obligatoria según la reglamentación provincial.
-- El parámetro es el ingreso bruto devengado gravado de los últimos doce meses, excluidos los exentos y gravados a tasa cero.
-
-El bot debe diferenciar `fecha_reglamentaria` de `fecha_prorrogada` y no reutilizar automáticamente la prórroga de un año anterior.
-
-## 2. Bandeja de ARCA sin marcar mensajes como leídos
-
-ARCA publica WSCCOMU para consultar el Domicilio Fiscal Electrónico.
-
-### Integración segura
-
-1. Autenticarse en WSAA con certificado y servicio `veconsumerws`.
-2. Llamar a `consultarComunicaciones` por ventanas de hasta 31 días.
-3. Guardar sólo el resumen: identificador, fecha de publicación, vencimiento, organismo, estado, asunto, prioridad y existencia de adjuntos.
-4. Alertar por Telegram cuando aparezca una comunicación no leída.
-5. No llamar automáticamente a `consumirComunicacion`.
-
-`consultarComunicaciones` no registra lectura. `consumirComunicacion` recupera el contenido completo y registra el evento de lectura. Por eso el bot podrá mostrar el asunto, pero sólo abrirá el mensaje después de una orden explícita del usuario.
-
-Consideraciones técnicas:
-
-- Historia consultable por el servicio: hasta 360 días.
-- Rango máximo por consulta: 31 días.
-- Página máxima: 500 resultados.
-- Estados relevantes: `1` no leído y `2` leído.
-- WSDL de producción: `https://infraestructura.afip.gob.ar/ve-ws/services/veconsumer?wsdl`.
-
-Consideración legal: ARCA informa que una comunicación se considera notificada al abrirla o el lunes posterior a su disponibilidad, lo que ocurra primero. No abrirla desde el bot no evita la notificación de oficio; sólo evita adelantar la lectura accidentalmente.
-
-Comandos:
-
-- `/bandeja`: lista resúmenes nuevos sin abrirlos.
-- `/mensaje <id>`: muestra metadatos y pide confirmación antes de recuperar el contenido.
-- `/abrir <id>`: acción explícita que registra lectura; debe requerir un segundo botón de confirmación.
-
-## 3. Deuda de Monotributo
-
-La fuente oficial es la **Cuenta Corriente de Monotributistas y Autónomos (CCMA)**. Debe verificarse por período:
-
-- capital;
-- intereses;
-- pago registrado;
-- fecha del pago;
-- imputación al período correcto;
-- saldo acreedor, si existe.
-
-No se identificó una API pública de autoservicio para consultar CCMA. El MVP usará una sincronización asistida desde una sesión iniciada por el contribuyente. El proceso local podrá reutilizar temporalmente las cookies y tokens de esa sesión para efectuar directamente las mismas solicitudes que hace la página. La clave fiscal, cookies y tokens no se enviarán a Telegram ni al servidor del bot.
-
-El débito automático no prueba por sí solo la cancelación. El estado será:
-
-1. `EXPECTED`: cuota esperada.
-2. `DEBIT_PENDING`: llegó la fecha, todavía dentro del plazo normal de procesamiento.
-3. `PAYMENT_REPORTED`: el banco o billetera informó el débito.
-4. `OFFICIALLY_POSTED`: CCMA lo imputó correctamente.
-5. `DISCREPANCY`: existe el pago, pero continúa la deuda o se imputó a otro período.
-
-Sólo `OFFICIALLY_POSTED` permite informar ese período como cancelado.
-
-## 4. Facturación acumulada y proyección de categoría
-
-El bot no emitirá facturas. Sólo consolidará comprobantes ya emitidos para calcular:
-
-- total por mes;
-- total móvil de los últimos doce meses;
-- notas de crédito y débito;
-- fecha de corte y meses incompletos;
-- categoría que correspondería con la tabla vigente;
-- margen en pesos y porcentaje hasta la categoría inmediata superior o inferior;
-- proyección a la próxima recategorización.
-
-### Fuente de comprobantes
-
-El usuario actualmente utiliza Comprobantes en Línea. No debe asumirse que `FECompConsultar` de WSFEv1 puede recuperar comprobantes de un punto de venta perteneciente a otro sistema: ARCA exige puntos de venta distintos para cada modalidad.
-
-Orden de preferencia para el MVP:
-
-1. Exportación o consulta asistida de comprobantes emitidos desde el servicio oficial.
-2. Importación de archivo oficial si el portal ofrece una descarga reutilizable.
-3. Carga manual del total mensual, marcada como `MANUAL_UNVERIFIED`, hasta la próxima sincronización.
-
-El cálculo debe usar importes efectivamente computables y descontar notas de crédito. No se mezclan presupuestos, transferencias ni pagos sin comprobante fiscal.
-
-### Estado actual y simulación
-
-Datos confirmados al 04/08/2026:
-
-- categoría nacional: **F**, servicios, desde 08/2026;
-- límite vigente de F: **$45.151.659,41**;
-- límite vigente de E: **$36.028.231,33**;
-- facturación futura informada: **$3.000.000 mensuales hasta diciembre de 2026**.
-
-Una actividad estable de $3.000.000 durante doce meses totaliza $36.000.000. Con la tabla nacional vigente al 01/08/2026, eso quedaría apenas dentro de E, con sólo $28.231,33 de margen. Es una **simulación**, no una recomendación de baja: faltan los comprobantes reales de los doce meses que correspondan a cada corte y las tablas pueden actualizarse antes de febrero de 2027.
-
-El semáforo propuesto:
-
-- 🟢 margen mayor al 10% del límite;
-- 🟡 margen entre 3% y 10%;
-- 🔴 margen menor al 3% o datos incompletos cerca del límite.
-
-Con $36.000.000 y la tabla actual, el resultado es rojo por proximidad al límite, aunque todavía encuadre en E.
-
-## 5. Otras deudas con ARCA
-
-Para el perfil actual, el control nacional tendrá dos capas:
-
-1. CCMA para Monotributo.
-2. Sistema de Cuentas Tributarias para cualquier otro impuesto u obligación que aparezca registrado.
-
-La bandeja DFE agrega alertas sobre intimaciones y diferencias, pero no sustituye la cuenta corriente. Tampoco se considerará prueba suficiente una constancia genérica de inscripción.
-
-No se identificó una API pública para consultar toda la deuda de un contribuyente. El servicio de deuda publicado por ARCA para terceros está restringido a entidades habilitadas. Esta parte seguirá siendo una consulta asistida y mostrará la fecha de la última sesión oficial.
-
-## 6. Deuda de Ingresos Brutos Santa Fe
-
-Fuentes oficiales:
-
-- **VEPAI:** pagos registrados por API Santa Fe.
-- **Régimen Simplificado:** categoría, cuotas y boletas/VEP.
-- **LDAE:** deuda de varios períodos y liquidación consolidada.
-- **IBINT:** intereses aislados a una fecha de pago.
-
-VEPAI muestra pagos, no garantiza por sí solo que no exista una cuota omitida. El bot debe construir los períodos esperados y conciliarlos con VEPAI:
-
-```text
-obligaciones esperadas − pagos imputados = períodos presuntamente adeudados
-```
-
-Si falta un período, el importe exacto de capital e intereses se confirmará en Régimen Simplificado, LDAE o IBINT antes de sugerir cualquier pago.
-
-Datos confirmados al 04/08/2026:
-
-- contribuyente local adherido al Régimen Simplificado;
-- categoría provincial **3**;
-- escala del segundo semestre 2026: de $24.670.494,32 a $36.028.231,33;
-- cuota mensual: **$42.882**;
-- liquidación consolidada informada como pagada el 04/08/2026: **$672.973,38**;
-- al último control, la imputación en VEPAI todavía estaba pendiente.
-
-Una facturación estable de $36.000.000 durante doce meses también quedaría apenas dentro de la categoría provincial 3 según la tabla actual, con $28.231,33 de margen. Debe usarse el total real gravado y la tabla vigente en cada revisión.
-
-## Comandos del MVP
-
-| Comando | Resultado |
+| Comando | Función |
 |---|---|
-| `/estado` | Los seis controles, semáforos, fuente y fecha de actualización |
-| `/bandeja` | Resúmenes no leídos del DFE sin abrir comunicaciones |
-| `/monotributo` | Categoría, cuota, períodos y conciliación CCMA |
-| `/facturacion` | Total mensual, últimos doce meses y calidad de los datos |
-| `/categoria` | Proyección nacional y provincial, márgenes y próximos cortes |
-| `/deuda_arca` | CCMA y demás obligaciones oficiales sincronizadas |
-| `/iibb` | Categoría, cuotas esperadas y conciliación VEPAI |
-| `/vencimientos` | Próximas revisiones y pagos mensuales |
-| `/sincronizar` | Inicia una consulta local asistida a los portales oficiales |
-| `/registrar_pago` | Adjunta evidencia sin afirmar imputación oficial |
+| `/resumen` | Explica qué requiere atención y qué hay que pagar |
+| `/facturas` | Lista facturas, permite descargar, repetir y emitir |
+| `/ayuda` | Explica el alcance y ofrece la configuración privada |
 
-No existirán `/facturar`, `/recategorizar` ni comandos que ejecuten pagos.
+`/start` abre el resumen cuando la cuenta ya está vinculada. Los comandos técnicos
+anteriores se mantienen ocultos para diagnóstico y compatibilidad.
 
-## Arquitectura
+## Resumen
 
-```text
-Telegram
-   |
-   v
-Bot determinístico -------> SQLite
-   |                         |-- obligaciones y pagos
-   |                         |-- comprobantes emitidos
-   |                         |-- comunicaciones resumidas
-   |                         `-- historial de reglas
-   |
-   |-- fuentes públicas: categorías, calendarios y prórrogas
-   |-- WSAA + WSCCOMU: resúmenes del DFE
-   `-- sincronizador local: CCMA, Cuentas Tributarias, RCEL y VEPAI
-```
+El resumen usa lenguaje cotidiano y no muestra nombres internos de los portales. Se
+limita a decisiones:
 
-### Uso de las URLs y sesiones observadas
+- próximo pago de Monotributo e Ingresos Brutos, cada uno con fecha e importe;
+- deuda vencida sin un pago confirmado que la explique;
+- pagos confirmados que todavía no terminaron de aparecer en la cuenta;
+- mensajes nuevos de ARCA;
+- riesgo de subir o posibilidad de bajar de categoría;
+- fuentes que llevan demasiado tiempo sin actualizarse.
 
-Para los portales sin API pública se probará este orden:
+Como todavía no se consultan todos los impuestos nacionales, dice “Con lo que hoy
+puedo revisar” y no afirma que la persona esté libre de cualquier deuda con ARCA.
 
-1. **Solicitud directa autenticada:** identificar la petición real de la página y repetirla dentro del perfil local que ya posee cookies, token anti-CSRF y demás datos temporales.
-2. **Navegación local automatizada:** si el servidor exige pasos previos, formularios encadenados o tokens rotativos, ejecutarlos en un navegador local persistente y extraer el resultado.
-3. **Lectura del DOM:** usar los datos visibles como último recurso cuando no exista una respuesta estructurada reutilizable.
+Botones del resumen:
 
-Las URLs anotadas sirven como punto de partida, pero una URL por sí sola no alcanza: CCMA contiene formularios ASP heredados y los aplicativos pueden validar cookie de sesión, encabezados, token anti-CSRF, origen y secuencia de navegación. Antes de implementar se capturará una sesión de red autorizada para documentar método, parámetros, respuesta, vencimiento y dependencia de cada token.
+- `Pagos y vencimientos`
+- `Categoría y facturación`
+- `Mensajes de ARCA`
+- `Facturas`
 
-Este acceso no se presentará como una API oficial. Es una integración web privada y puede cambiar sin aviso. Por seguridad, las solicitudes se ejecutarán en la computadora del contribuyente; el bot recibirá únicamente el resumen tributario resultante.
+La navegación edita el mismo mensaje para no llenar el chat y valida que cada callback
+pertenezca a un chat autorizado.
 
-### Modelo mínimo de datos
+## Pagos y vencimientos
 
-`tax_obligations`
+La pantalla unificada muestra:
 
-- jurisdicción, concepto, período y vencimiento;
-- importe esperado y oficial;
-- estado y referencia externa;
-- fuente y fecha de observación.
+- qué pagar, cuánto y qué día;
+- último pago confirmado de Monotributo;
+- último pago de Ingresos Brutos registrado por Santa Fe;
+- deuda vencida que realmente requiere atención;
+- pagos que todavía están terminando de reflejarse.
 
-`issued_receipts`
+Regla de conciliación:
 
-- fecha, tipo, punto de venta y número;
-- importe, moneda y ajustes;
-- origen del dato y fecha de sincronización;
-- hash único para evitar duplicados.
+- Si existe un pago confirmado relacionado con el saldo, ese saldo no se presenta
+  como una deuda nueva.
+- Durante los primeros siete días se informa que la cuenta todavía se actualiza y se
+  indica no repetir el pago.
+- Después de siete días se informa que el saldo requiere revisión, pero tampoco se
+  sugiere pagarlo de nuevo.
+- Una deuda sin pago confirmado relacionado sí se muestra como deuda vencida.
 
-`tax_messages`
+Los nombres técnicos de las fuentes sólo aparecen en comandos ocultos de auditoría.
 
-- identificador WSCCOMU;
-- fecha de publicación y vencimiento;
-- organismo, asunto, prioridad y estado;
-- indicador de adjuntos;
-- fecha en que el usuario ordenó abrirlo, si ocurrió.
+### Pagar Ingresos Brutos
 
-`tax_rules`
+`Pagos y vencimientos` ofrece `Pagar Ingresos Brutos` cuando Santa Fe informó una
+cuota pendiente. El flujo es:
 
-- jurisdicción y categoría;
-- límites desde/hasta, cuota y vigencia;
-- URL oficial y fecha de lectura.
+1. elegir Pago Mis Cuentas, Red Link o Interbanking;
+2. esperar la cotización oficial del capital y los intereses para la fecha actual;
+3. revisar período, vencimiento, capital, intereses, total y red;
+4. pulsar `Generar VEP` una sola vez;
+5. descargar el PDF oficial y abrir ARCA para completar el pago, incluido QR.
 
-`audit_log`
+Después de elegir la red, la revisión explica también el paso posterior con el nivel
+de precisión publicado por cada operador:
 
-- fecha, actor, acción, resultado y hash de solicitud.
+- `Santander / Pago Mis Cuentas`: indica el recorrido de la app, los CUIT solicitados,
+  la posible demora de tres horas y que el VEP puede requerir `Nuevo pago` aunque no
+  aparezca en el calendario. Fuente: [Centro de ayuda Santander](https://ayuda.santander.com.ar/3WR6AZDV3B-1/article/KFCQ44ND0R-que-es-vep-como-pagarlo/).
+- `Red Link`: indica ingresar al home banking adherido y buscar VEP/ARCA, aclarando
+  que el menú exacto depende del banco y evitando nombres de menú no verificados.
+  Fuente general: [guía de VEP de ARCA](https://serviciosweb.arca.gob.ar/genericos/guiasPasoPaso/VerGuia.aspx?id=66).
+- `Interbanking`: indica localizar y autorizar el VEP y advierte el corte de las
+  16:00 para procesamiento en el día. Fuente: [información operativa de Interbanking](https://prehome.interbanking.com.ar/nuevo-horario).
 
-## Seguridad y límites operativos
+Una vez generado, el mensaje conserva esas instrucciones, enlaza la fuente oficial y
+ofrece por separado abrir ARCA para pagar con QR. La guía oficial de [E-Pagos de
+ARCA](https://serviciosweb.arca.gob.ar/genericos/guiasPasoPaso/VerGuia.aspx?id=479)
+confirma que el VEP debe existir previamente y que luego se selecciona `Pago con QR`.
 
-1. La clave fiscal no se almacena ni se envía por Telegram.
-2. Las consultas automáticas oficiales usarán certificado limitado al servicio necesario.
-3. El bot acepta un único `chat_id` autorizado.
-4. El webhook valida el secreto de Telegram.
-5. El token y las claves privadas permanecen fuera de Git y cifrados en reposo.
-6. El bot no abre mensajes DFE automáticamente.
-7. El bot no presenta recategorizaciones ni ejecuta pagos.
-8. Una deuda estimada nunca se muestra como deuda oficial.
-9. Un pago bancario no se muestra como imputado hasta verlo en CCMA o VEPAI.
-10. Toda respuesta sensible incluye fuente y antigüedad del dato.
+La generación se ejecuta en `portal-worker`, donde está la clave fiscal cifrada. El
+bot de Telegram sólo intercambia trabajos por la base compartida y nunca recibe esa
+clave. Una caída o timeout después de enviar la solicitud deja el resultado como
+incierto y bloquea reintentos automáticos. Si el interés cambia entre la revisión y la
+confirmación, el bot muestra la nueva cotización y exige otra confirmación.
 
-## Fases recomendadas
+El bot no considera pagado un VEP por haberlo generado ni por haber abierto ARCA. El
+estado cambia a pagado únicamente cuando la consulta posterior de Santa Fe registra
+el período. No se almacenan datos bancarios.
 
-### Fase 1 — tablero y calendario
+## Categoría y facturación
 
-- Crear bot para un único usuario.
-- Cargar reglas vigentes y fechas de recategorización.
-- Implementar `/estado`, `/vencimientos`, `/categoria` y registro de pagos.
-- Importar el historial ya documentado en este proyecto.
+Combina la categoría oficial actual con:
 
-### Fase 2 — bandeja ARCA
+- total facturado en los últimos doce meses disponible en el historial;
+- promedio mensual;
+- categoría proyectada con la tabla vigente obtenida desde ARCA;
+- próxima fecha de revisión.
 
-- Crear certificado y asociación a `veconsumerws`.
-- Consultar únicamente resúmenes mediante `consultarComunicaciones`.
-- Alertar mensajes nuevos sin marcarlos como leídos.
-- Implementar apertura con doble confirmación.
+La conclusión distingue tres casos: seguir en la misma categoría, bajar o subir. Las
+descripciones largas de ARCA se normalizan a la letra antes de comparar, por lo que no
+puede decir “bajar de F a F”.
 
-### Fase 3 — facturación acumulada
+El historial inicial conserva la factura manual importada. Toda factura emitida por el
+bot se incorpora automáticamente al historial y a los cálculos. Las facturas de puntos
+de venta externos sólo se incorporan cuando WSFE permite consultarlas individualmente
+o se importan; WSFE no ofrece un endpoint de listado completo.
 
-- Sincronizar comprobantes emitidos en Comprobantes en Línea.
-- Calcular ventanas móviles de doce meses.
-- Proyectar categoría nacional y provincial con reglas versionadas.
-- Alertar datos faltantes y proximidad a límites.
+## Mensajes de ARCA
 
-### Fase 4 — conciliación de deuda
+Consulta el Domicilio Fiscal Electrónico mediante el servicio oficial delegado. El bot
+muestra resúmenes no leídos sin abrir la comunicación ni alterar su estado.
 
-- Crear sincronizador local para sesiones iniciadas por el contribuyente.
-- Capturar y documentar las solicitudes de CCMA, Cuentas Tributarias y VEPAI.
-- Reutilizar cookies y tokens sólo dentro del proceso local y durante su vigencia.
-- Priorizar peticiones HTTP directas; usar navegación automatizada como respaldo.
-- Consultar CCMA, Sistema de Cuentas Tributarias y VEPAI.
-- Comparar obligaciones esperadas, pagos informados e imputaciones oficiales.
-- Conservar evidencia sin guardar cookies ni credenciales.
+## Facturas
 
-## Criterios de aceptación
+`/facturas` lista de a tres comprobantes y permite:
 
-1. `/estado` cubre los seis controles solicitados.
-2. Cada importe muestra fuente y fecha de lectura.
-3. El total de doce meses identifica meses incompletos o datos manuales.
-4. La categoría proyectada distingue resultado real de simulación.
-5. Ninguna consulta automática marca un mensaje DFE como leído.
-6. El bot nunca afirma “sin deuda” con una fuente oficial vencida.
-7. Los recordatorios de recategorización respetan prórrogas versionadas.
-8. No se guardan clave fiscal, cookies, datos bancarios ni tokens en logs.
-9. Un pago no se repite mientras su imputación esté pendiente.
-10. No existe capacidad de emitir facturas, presentar declaraciones ni pagar.
+- ver el detalle;
+- descargar el PDF Original;
+- repetir una factura como borrador editable;
+- crear una Factura C nueva.
 
-## Tecnología propuesta, pendiente de aprobación
+Repetir nunca emite directamente. El usuario puede editar descripción, importe,
+período y vencimiento, ve un resumen completo y debe pulsar una única acción
+irreversible: `Emitir Factura C`.
 
-- Backend: Node.js con TypeScript.
-- Persistencia inicial: SQLite con backup.
-- Planificador: cron.
-- Telegram: webhook HTTPS.
-- Sincronizador asistido: proceso local en la computadora del contribuyente.
-- Despliegue: contenedor pequeño en infraestructura propia.
+La emisión usa WSFEv1, punto de venta `00002`, tipo `011`, control del último número,
+CAE, vencimiento y recuperación ante timeouts. El punto manual `00001` no se modifica.
+El PDF A4 incluye los datos autorizados, CAE y QR de la RG 4892. Si falla el PDF, se
+regenera sin volver a emitir.
 
-No se agregará ninguna dependencia sin aprobación previa.
+## Avisos automáticos
 
-## Fuentes oficiales
+El monitor se ejecuta al iniciar el bot y luego cada cinco minutos. No vuelve a
+consultar todos los sitios cada cinco minutos: evalúa la información almacenada y
+actualiza las APIs oficiales como máximo cada seis horas.
 
-### ARCA
+`portal-worker` actualiza Monotributo, pagos e Ingresos Brutos cada seis horas. Los
+valores por defecto son:
 
-- [Recategorización del Monotributo](https://www.arca.gob.ar/monotributo/ayuda/recategorizacion.asp)
-- [Categorías vigentes](https://arca.gob.ar/monotributo/categorias.asp)
-- [Domicilio Fiscal Electrónico y efectos de las notificaciones](https://arca.gob.ar/DomicilioFiscalElectronico/notificaciones/default.asp)
-- [Catálogo de web services](https://www.arca.gob.ar/ws/documentacion/catalogo.asp)
-- [Manual WSCCOMU 1.4.0](https://www.arca.gob.ar/ws/WSCComu/vecuwsconcomunicaciones.pdf)
-- [WSAA y certificados](https://arca.gob.ar/ws/documentacion/wsaa.asp)
-- [Pagos y consulta mediante CCMA](https://www.arca.gob.ar/monotributo/ayuda/pagos.asp)
-- [Modalidades de facturación del Monotributo](https://arca.gob.ar/facturacion/monotributo/modalidades.asp)
-- [Puntos de venta y autorización electrónica](https://www.arca.gob.ar/fe/emision-autorizacion/solicitud-autorizacion.asp)
+| Proceso | Intervalo |
+|---|---:|
+| Evaluación de alertas | 300 segundos |
+| APIs oficiales | 21.600 segundos |
+| Portales ARCA/Santa Fe | 21.600 segundos |
 
-### Santa Fe
+Se recuerdan vencimientos a 14, 7, 3, 1 y 0 días. Una fuente se considera atrasada a
+las 12 horas para cuentas y pagos, o a las 30 horas para perfil, mensajes y facturas.
 
-- [Régimen Simplificado y escala del segundo semestre 2026](https://www.santafe.gob.ar/index.php/web/content/view/full/211373)
-- [Preguntas frecuentes](https://www.santafe.gob.ar/index.php/web/content/view/full/224945/%28subtema%29/)
-- [Resolución General API 43/2024](https://www.santafe.gob.ar/boletinoficial/ver.php?seccion=2025%2F2025-01-21avisos.html)
-- [VEPAI](https://www.santafe.gob.ar/index.php/tramites/modul1/index?id=97354&m=descripcion)
-- [LDAE](https://www.santafe.gob.ar/index.php/tramites/modul1/index?id=97267&m=descripcion)
-- [IBINT](https://www.santafe.gov.ar/e-ibint/index.php)
+Cada evento se guarda con una clave y una huella. El mismo aviso no se envía dos veces
+mientras su contenido no cambie. Las notificaciones usan las mismas reglas de
+conciliación que `/resumen` y nunca muestran simultáneamente “deuda vencida” y “no
+vuelvas a pagar” para el mismo pago.
 
-### Telegram
+## Alta de credenciales
 
-- [Telegram Bot API](https://core.telegram.org/bots/api)
-- [Webhooks](https://core.telegram.org/bots/webhooks)
+Desde `/ayuda` se genera un botón clickeable con un enlace privado. El enlace:
+
+- vence a los diez minutos;
+- puede usarse una sola vez;
+- muestra el CUIT parcialmente oculto;
+- envía la clave directamente a `portal-worker`;
+- verifica el ingreso contra ARCA antes de guardar;
+- cifra la clave con Fernet en el volumen de estado.
+
+En producción, el formulario usa HTTP exclusivamente dentro del tailnet de Tailscale.
+No se publica con un dominio o proxy de Internet. Tailscale cifra el transporte entre
+el dispositivo y la VPS.
+
+## Límites actuales
+
+- Es una instalación personal con una lista cerrada de chats.
+- Genera el VEP de la cuota corriente del Régimen Simplificado de Santa Fe. No pulsa
+  la confirmación bancaria ni opera planes de pago o liquidaciones consolidadas.
+- No presenta declaraciones juradas ni recategorizaciones.
+- No consulta todavía todas las obligaciones nacionales fuera de Monotributo.
+- No emite notas de crédito/débito ni facturas con múltiples ítems.

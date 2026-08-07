@@ -1,0 +1,19 @@
+services:
+  bot:
+    env_file:
+      - .env
+    volumes:
+      - type: bind
+        source: ./secrets
+        target: /run/local-secrets
+        read_only: true
+
+  portal-worker:
+    profiles: ["portal"]
+    env_file:
+      - .env
+    volumes:
+      - type: bind
+        source: ./secrets
+        target: /run/local-secrets
+        read_only: true

@@ -28,6 +28,14 @@ ROWS = (
     ("", "", "08/2026", "", "", "", "Saldo", "05/08/2026", "", "", "(29,386.76)"),
     ("", "", "08/2026", "024", "019", "019", "Obligacion Mensual Obra Social", "20/08/2026", "42,824.25", "", ""),
     ("", "", "08/2026", "", "", "", "Saldo", "05/08/2026", "", "", "(42,824.25)"),
+    ("", "", "03/2026", "020", "019", "019", "Pago Obligacion Mensual", "04/08/2026", "", "10,060.00", ""),
+    ("", "", "03/2026", "021", "019", "019", "Pago Obligacion Mensual", "04/08/2026", "", "2,868.28", ""),
+    ("", "", "03/2026", "020", "019", "051", "Pago Intereses", "04/08/2026", "", "1,244.93", ""),
+    ("", "", "03/2026", "024", "019", "051", "Pago Intereses", "04/08/2026", "", "354.95", ""),
+    ("", "", "02/2026", "020", "019", "019", "Pago Obligacion Mensual", "04/08/2026", "", "10,060.00", ""),
+    ("", "", "02/2026", "021", "019", "019", "Pago Obligacion Mensual", "04/08/2026", "", "2,868.28", ""),
+    ("", "", "02/2026", "020", "019", "051", "Pago Intereses", "04/08/2026", "", "1,521.58", ""),
+    ("", "", "02/2026", "024", "019", "051", "Pago Intereses", "04/08/2026", "", "433.83", ""),
     ("", "", "03/2026", "020", "019", "051", "Intereses", "05/08/2026", "62,008.08", "", ""),
     ("", "", "03/2026", "", "", "", "Saldo", "05/08/2026", "", "", "(62,008.08)"),
     ("", "", "03/2026", "021", "019", "051", "Intereses", "05/08/2026", "11,314.15", "", ""),
@@ -72,6 +80,9 @@ class CcmaParserTest(TestCase):
             Decimal("150784.21"),
         )
         self.assertEqual(result["credits"][0]["period"], "2024-06")
+        self.assertEqual(result["latest_payment_date"], "2026-08-04")
+        self.assertEqual(Decimal(result["latest_payment_total"]), Decimal("29411.85"))
+        self.assertEqual(result["payment_reconciliation"], "PARTIAL")
 
     def test_rejects_a_summary_that_does_not_match_the_detail(self):
         with self.assertRaisesRegex(CcmaError, "no coincide"):

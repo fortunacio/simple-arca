@@ -800,3 +800,18 @@ class Database:
                 """,
                 (chat_id,),
             ).fetchall()
+
+    def get_stored_invoices_between(
+        self, chat_id: int, window_from: date, window_to: date
+    ):
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT invoice_type, point_of_sale, number, issue_date,
+                       total, currency, exchange_rate, cae
+                FROM invoices
+                WHERE chat_id = ? AND issue_date BETWEEN ? AND ?
+                ORDER BY issue_date, point_of_sale, number
+                """,
+                (chat_id, window_from.isoformat(), window_to.isoformat()),
+            ).fetchall()

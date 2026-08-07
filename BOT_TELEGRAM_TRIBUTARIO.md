@@ -102,10 +102,14 @@ el período. No se almacenan datos bancarios.
 
 Combina la categoría oficial actual con:
 
-- total facturado en los últimos doce meses disponible en el historial;
-- promedio mensual;
+- total registrado en los últimos doce meses, combinando la importación inicial, las
+  facturas guardadas por el bot y las consultas individuales de WSFE sin duplicarlas;
+- promedio mensual únicamente cuando el historial está completo;
 - categoría proyectada con la tabla vigente obtenida desde ARCA;
 - próxima fecha de revisión.
+
+Si falta parte del historial de otro punto de venta, muestra el total conocido como
+`facturación registrada` y no proyecta una categoría con datos parciales.
 
 La conclusión distingue tres casos: seguir en la misma categoría, bajar o subir. Las
 descripciones largas de ARCA se normalizan a la letra antes de comparar, por lo que no

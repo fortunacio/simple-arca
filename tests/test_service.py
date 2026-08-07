@@ -727,6 +727,7 @@ class ServiceTest(TestCase):
                                 "window_to": "2026-07-31",
                                 "total_pesos": str(monthly * 12),
                                 "invoice_count": 12,
+                                "manual_history_complete": True,
                                 "invoices": [
                                     {
                                         "issued_at": f"2026-{month:02d}-15",
@@ -759,6 +760,53 @@ class ServiceTest(TestCase):
 
                     self.assertIn(expected, output)
                     self.assertNotIn("WSFE", output)
+
+    def test_category_overview_does_not_treat_partial_history_as_zero_billing(self):
+        self._verified_user()
+        self._snapshot(
+            1001,
+            "ARCA_PROFILE",
+            "taxpayer_profile",
+            {"categories": [{"description": "F", "status": "ACTIVO"}]},
+        )
+        self._snapshot(
+            1001,
+            "ARCA_INVOICES",
+            "issued_invoices",
+            {
+                "window_from": "2025-08-01",
+                "window_to": "2026-07-31",
+                "total_pesos": "3000000.00",
+                "invoice_count": 1,
+                "manual_history_complete": False,
+                "invoices": [
+                    {
+                        "issued_at": "2026-07-08",
+                        "net_total_pesos": "3000000.00",
+                    }
+                ],
+            },
+        )
+        service = TaxMonitorService(
+            self.db,
+            today=date(2026, 8, 7),
+            live_synchronizers={
+                "ARCA_PROFILE": lambda _chat_id: None,
+                "ARCA_INVOICES": lambda _chat_id: None,
+            },
+            category_limits_provider=lambda _today: TEST_CATEGORY_LIMITS,
+        )
+
+        output = service.category_overview(1001)
+
+        self.assertIn("Categoría proyectada: Todavía no disponible", output)
+        self.assertIn(
+            "Facturación registrada en los últimos 12 meses: $3.000.000,00",
+            output,
+        )
+        self.assertIn("Comprobantes incluidos: 1", output)
+        self.assertIn("historial de facturas anterior todavía no está completo", output)
+        self.assertNotIn("WSFE", output)
 
     def test_navigation_contains_only_clear_user_actions(self):
         self._verified_user()

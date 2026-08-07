@@ -214,6 +214,64 @@ class ArcaSyncTest(TestCase):
         self.assertEqual(payload["invoice_count"], 3)
         self.assertEqual(payload["wsfe_invoice_count"], 2)
         self.assertEqual(payload["history_invoice_count"], 2)
+        self.assertEqual(payload["stored_invoice_count"], 0)
+        self.assertTrue(payload["manual_history_complete"])
         self.assertEqual(payload["total_pesos"], "3900000")
         duplicate = next(item for item in payload["invoices"] if item["number"] == 10)
         self.assertEqual(duplicate["total"], "3000000")
+
+    def test_invoice_sync_includes_the_invoice_stored_by_the_bot(self):
+        self.db.set_pending_tax_identity(1001, "20383717419", "production")
+        self.db.mark_tax_identity_verified(1001)
+        InvoiceStore(self.db).seed_concept_history(1001)
+        synchronizer = ArcaInvoicesSynchronizer(
+            self.db,
+            FakeWsaa(),
+            FakeWsfe(),
+            snapshot_ttl=timedelta(minutes=15),
+        )
+
+        synchronizer.sync_chat(1001)
+
+        snapshot = self.db.get_live_snapshot(1001, "ARCA_INVOICES", "issued_invoices")
+        payload = json.loads(snapshot["payload_json"])
+        self.assertEqual(payload["invoice_count"], 3)
+        self.assertEqual(payload["stored_invoice_count"], 1)
+        self.assertEqual(payload["total_pesos"], "5900000.00")
+        stored = next(item for item in payload["invoices"] if item["number"] == 73)
+        self.assertEqual(stored["total"], "3000000.00")
+        self.assertFalse(payload["manual_history_complete"])
+
+    def test_invoice_sync_deduplicates_a_stored_invoice_returned_by_wsfe(self):
+        class SameInvoiceWsfe:
+            def invoices_between(self, ticket, represented_cuit, date_from, date_to):
+                return (
+                    IssuedInvoice(
+                        11,
+                        1,
+                        73,
+                        "2026-07-08",
+                        Decimal("3000000"),
+                        "PES",
+                        Decimal("1"),
+                    ),
+                )
+
+        self.db.set_pending_tax_identity(1001, "20383717419", "production")
+        self.db.mark_tax_identity_verified(1001)
+        InvoiceStore(self.db).seed_concept_history(1001)
+        synchronizer = ArcaInvoicesSynchronizer(
+            self.db,
+            FakeWsaa(),
+            SameInvoiceWsfe(),
+            snapshot_ttl=timedelta(minutes=15),
+        )
+
+        synchronizer.sync_chat(1001)
+
+        snapshot = self.db.get_live_snapshot(1001, "ARCA_INVOICES", "issued_invoices")
+        payload = json.loads(snapshot["payload_json"])
+        self.assertEqual(payload["invoice_count"], 1)
+        self.assertEqual(payload["stored_invoice_count"], 1)
+        self.assertEqual(payload["wsfe_invoice_count"], 1)
+        self.assertEqual(payload["total_pesos"], "3000000")

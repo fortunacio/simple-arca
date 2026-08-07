@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -180,10 +180,29 @@ class ArcaInvoicesSynchronizer:
             )
             for row in self.db.get_invoice_history_between(chat_id, date_from, date_to)
         )
+        stored_invoices = tuple(
+            IssuedInvoice(
+                invoice_type=int(row["invoice_type"]),
+                point_of_sale=int(row["point_of_sale"]),
+                number=int(row["number"]),
+                issued_at=row["issue_date"],
+                total=Decimal(row["total"]),
+                currency=row["currency"],
+                exchange_rate=Decimal(row["exchange_rate"]),
+                authorization_code=row["cae"],
+            )
+            for row in self.db.get_stored_invoices_between(chat_id, date_from, date_to)
+        )
         merged = {
             (invoice.invoice_type, invoice.point_of_sale, invoice.number): invoice
             for invoice in history_invoices
         }
+        merged.update(
+            {
+                (invoice.invoice_type, invoice.point_of_sale, invoice.number): invoice
+                for invoice in stored_invoices
+            }
+        )
         merged.update(
             {
                 (invoice.invoice_type, invoice.point_of_sale, invoice.number): invoice
@@ -205,6 +224,13 @@ class ArcaInvoicesSynchronizer:
         total_pesos = sum(
             (invoice.net_total_pesos for invoice in invoices), Decimal("0")
         )
+        history_coverage = list(self.db.get_invoice_history_coverage(chat_id))
+        manual_history_complete = any(
+            int(row["point_of_sale"]) == 1
+            and date.fromisoformat(row["window_from"]) <= date_from
+            and date.fromisoformat(row["window_to"]) >= date_to
+            for row in history_coverage
+        )
         payload = {
             "window_from": date_from.isoformat(),
             "window_to": date_to.isoformat(),
@@ -212,6 +238,8 @@ class ArcaInvoicesSynchronizer:
             "invoice_count": len(invoices),
             "wsfe_invoice_count": len(wsfe_invoices),
             "history_invoice_count": len(history_invoices),
+            "stored_invoice_count": len(stored_invoices),
+            "manual_history_complete": manual_history_complete,
             "invoices": [invoice.to_payload() for invoice in invoices],
             "history_coverage": [
                 {
@@ -222,7 +250,7 @@ class ArcaInvoicesSynchronizer:
                     "record_count": row["record_count"],
                     "imported_at": row["imported_at"],
                 }
-                for row in self.db.get_invoice_history_coverage(chat_id)
+                for row in history_coverage
             ],
         }
         self.db.upsert_live_snapshot(

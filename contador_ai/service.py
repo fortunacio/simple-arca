@@ -352,10 +352,15 @@ class TaxMonitorService:
 
     def projection_lines(self, snapshot: dict) -> list[str]:
         invoices = snapshot.get("invoices", [])
+        if snapshot.get("manual_history_complete") is False:
+            return [
+                "Categoría proyectada para recategorización",
+                "El historial de facturas anterior todavía no está completo; no voy a estimar una categoría con datos parciales.",
+            ]
         if not invoices:
             return [
                 "Categoría proyectada para recategorización",
-                "No puedo calcularla porque WSFE no devolvió comprobantes.",
+                "Todavía no hay facturas registradas en el período analizado.",
             ]
 
         recategorization = next_recategorization(self.today)
@@ -1230,11 +1235,18 @@ class TaxMonitorService:
         current = category_letter(current_description)
         current_display = format_category(current_description)
         total = Decimal(str(invoices.get("total_pesos", "0")))
-        average = total / 12
+        history_complete = invoices.get("manual_history_complete") is True
         projection = self.projection_lines(invoices)
-        projected = projection[1].split(" — ", 1)[0] if len(projection) > 1 else "sin dato"
-        if len(projected) != 1:
-            conclusion = "Todavía no puedo determinar tu próxima categoría."
+        projection_detail = projection[1] if len(projection) > 1 else ""
+        projected_candidate = projection_detail.split(" — ", 1)[0]
+        projected = (
+            projected_candidate
+            if projected_candidate
+            in {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"}
+            else "Todavía no disponible"
+        )
+        if projected == "Todavía no disponible":
+            conclusion = projection_detail or "Todavía no puedo determinar tu próxima categoría."
         elif not current:
             conclusion = "Todavía no puedo determinar tu categoría actual."
         elif projected == current:
@@ -1243,6 +1255,19 @@ class TaxMonitorService:
             conclusion = f"Si mantenés este ritmo, podrías subir de {current} a {projected}."
         else:
             conclusion = f"Si mantenés este ritmo, podrías bajar de {current} a {projected}."
+        billing_lines = [
+            (
+                f"Facturación de los últimos 12 meses: {format_money(total)}"
+                if history_complete
+                else f"Facturación registrada en los últimos 12 meses: {format_money(total)}"
+            ),
+            (
+                f"Promedio mensual: {format_money(total / 12)}"
+                if history_complete
+                else "Promedio mensual: todavía no disponible"
+            ),
+            f"Comprobantes incluidos: {int(invoices.get('invoice_count', 0))}",
+        ]
         return "\n".join(
             [
                 "Categoría y facturación",
@@ -1250,9 +1275,7 @@ class TaxMonitorService:
                 f"Categoría actual: {current_display}",
                 f"Categoría proyectada: {projected}",
                 "",
-                f"Facturación de los últimos 12 meses: {format_money(total)}",
-                f"Promedio mensual: {format_money(average)}",
-                f"Comprobantes incluidos: {int(invoices.get('invoice_count', 0))}",
+                *billing_lines,
                 "",
                 conclusion,
                 f"Próxima revisión: {format_date(next_recategorization(self.today).isoformat())}",

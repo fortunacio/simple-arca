@@ -761,7 +761,7 @@ class ServiceTest(TestCase):
                     self.assertIn(expected, output)
                     self.assertNotIn("WSFE", output)
 
-    def test_category_overview_projects_from_the_registered_months(self):
+    def test_category_overview_labels_a_partial_projection_as_a_scenario(self):
         self._verified_user()
         self._snapshot(
             1001,
@@ -799,7 +799,7 @@ class ServiceTest(TestCase):
 
         output = service.category_overview(1001)
 
-        self.assertIn("Categoría proyectada: E", output)
+        self.assertIn("Categoría proyectada: Todavía no disponible", output)
         self.assertIn(
             "Facturación registrada en los últimos 12 meses: $3.000.000,00",
             output,
@@ -809,7 +809,13 @@ class ServiceTest(TestCase):
             output,
         )
         self.assertIn("Comprobantes incluidos: 1", output)
-        self.assertIn("podrías bajar de F a E", output)
+        self.assertIn("faltan datos de 6 meses ya cerrados", output)
+        self.assertIn(
+            "el escenario sería E ($36.000.000,00)",
+            output,
+        )
+        self.assertIn("enero de 2026–diciembre de 2026", output)
+        self.assertIn("quedan 5 meses por cerrar", output)
         self.assertNotIn("WSFE", output)
 
     def test_navigation_contains_only_clear_user_actions(self):

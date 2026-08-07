@@ -110,8 +110,10 @@ Combina la categoría oficial actual con:
 - próxima fecha de revisión.
 
 Si falta parte del historial de otro punto de venta, muestra el total conocido como
-`facturación registrada` y proyecta el ritmo anual desde los meses disponibles sin
-presentarlos como doce meses completos.
+`facturación registrada`. Si faltan meses ya cerrados dentro del período que evaluará
+la próxima recategorización, el resultado se presenta únicamente como un escenario
+condicionado e indica por separado cuántos meses faltan incorporar y cuántos quedan
+por transcurrir.
 
 La conclusión distingue tres casos: seguir en la misma categoría, bajar o subir. Las
 descripciones largas de ARCA se normalizan a la letra antes de comparar, por lo que no

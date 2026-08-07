@@ -388,11 +388,14 @@ class TaxMonitorService:
                 month = issued_at.strftime("%Y-%m")
                 monthly_totals[month] = monthly_totals.get(month, Decimal("0")) + amount
         history_complete = snapshot.get("manual_history_complete") is not False
-        if history_complete:
-            average = sum(monthly_totals.values(), Decimal("0")) / months
+        registered_months = len(monthly_totals)
+        missing_completed_months = max(0, months - registered_months)
+        projection_is_complete = history_complete or missing_completed_months == 0
+        if projection_is_complete:
+            accumulated = sum(monthly_totals.values(), Decimal("0"))
+            average = accumulated / months
             average_description = f"promedio mensual de {format_money(average)}"
         elif monthly_totals:
-            registered_months = len(monthly_totals)
             average = sum(monthly_totals.values(), Decimal("0")) / registered_months
             noun = "mes registrado" if registered_months == 1 else "meses registrados"
             average_description = (
@@ -403,7 +406,9 @@ class TaxMonitorService:
                 "Categoría proyectada para recategorización",
                 "Todavía no hay meses facturados para proyectar la próxima categoría.",
             ]
-        annual_projection = average * 12
+        target_months = completed_months_between(target_from, target_to)
+        remaining_months = max(0, target_months - months)
+        annual_projection = average * target_months
         if self.category_limits_provider is None:
             return [
                 "Categoría proyectada para recategorización",
@@ -421,6 +426,30 @@ class TaxMonitorService:
             ]
         category = projected_category(annual_projection, category_limits)
         projected = category or "supera el tope del monotributo"
+        if not projection_is_complete:
+            missing_noun = (
+                "mes ya cerrado"
+                if missing_completed_months == 1
+                else "meses ya cerrados"
+            )
+            remaining_noun = "mes" if remaining_months == 1 else "meses"
+            return [
+                "Categoría proyectada para recategorización",
+                (
+                    "Todavía no puedo determinarla: faltan datos de "
+                    f"{missing_completed_months} {missing_noun}."
+                ),
+                (
+                    f"Si el promedio de {format_money(average)} se repitiera durante "
+                    f"los {target_months} meses, el escenario sería {projected} "
+                    f"({format_money(annual_projection)})."
+                ),
+                (
+                    f"La revisión de {format_month_year(recategorization)} toma "
+                    f"{format_month_year(target_from)}–{format_month_year(target_to)}; "
+                    f"quedan {remaining_months} {remaining_noun} por cerrar."
+                ),
+            ]
         lines = [
             "Categoría proyectada para recategorización",
             f"{projected} — {average_description}",
@@ -1265,14 +1294,19 @@ class TaxMonitorService:
         )
         if projected == "Todavía no disponible":
             conclusion = projection_detail or "Todavía no puedo determinar tu próxima categoría."
+            projection_context = projection[2:4]
         elif not current:
             conclusion = "Todavía no puedo determinar tu categoría actual."
+            projection_context = []
         elif projected == current:
             conclusion = f"Si mantenés este ritmo, seguirías en la categoría {current}."
+            projection_context = []
         elif projected > current:
             conclusion = f"Si mantenés este ritmo, podrías subir de {current} a {projected}."
+            projection_context = []
         else:
             conclusion = f"Si mantenés este ritmo, podrías bajar de {current} a {projected}."
+            projection_context = []
         billing_lines = [
             (
                 f"Facturación de los últimos 12 meses: {format_money(total)}"
@@ -1301,6 +1335,7 @@ class TaxMonitorService:
                 *billing_lines,
                 "",
                 conclusion,
+                *projection_context,
                 f"Próxima revisión: {format_date(next_recategorization(self.today).isoformat())}",
             ]
         )

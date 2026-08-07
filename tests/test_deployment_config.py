@@ -50,3 +50,12 @@ class EnrollmentBaseUrlTest(TestCase):
                 "http://tributario.example.com:8090",
                 allow_tailscale_http=True,
             )
+
+    def test_accepts_the_verified_winston_enrollment_url(self):
+        self.assertEqual(
+            self.resolve(
+                "http://winston.tail98a73b.ts.net:8091",
+                allow_tailscale_http=True,
+            ),
+            "http://winston.tail98a73b.ts.net:8091",
+        )

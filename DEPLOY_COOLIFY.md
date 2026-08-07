@@ -5,8 +5,8 @@
 Coolify construye y mantiene dos servicios desde [compose.yaml](compose.yaml):
 
 - `bot`, sin puertos publicados;
-- `portal-worker`, con los puertos `8090` y `6080` ligados únicamente a la IP de
-  Tailscale de la VPS.
+- `portal-worker`, con los puertos de host `8091` y `6080` ligados únicamente a la
+  IP de Tailscale de `winston`. Dentro del contenedor, el formulario conserva `8090`.
 
 No agregar dominios públicos a ninguno de los dos servicios. El formulario de CUIT y
 clave fiscal se abre mediante una URL HTTP del tailnet. Tailscale aporta el túnel
@@ -21,6 +21,23 @@ cifrado entre el dispositivo y la VPS.
 - Clave Fernet estable para cifrar credenciales y tickets.
 
 El certificado actual vence el 04/08/2028. Programar su renovación con anticipación.
+
+## Winston verificado
+
+Inspección de sólo lectura realizada el 06/08/2026:
+
+- host: `winston.tail98a73b.ts.net`;
+- IP de Tailscale: `100.75.19.73`;
+- Coolify: `4.1.2`;
+- Docker: `29.6.1`; Docker Compose: `5.3.1`;
+- arquitectura: `x86_64`;
+- puertos libres para el proyecto: `6080` y `8091`;
+- `8090` está ocupado por Beszel en todas las interfaces y no debe utilizarse;
+- Tailscale Serve y Funnel: sin configuración;
+- capacidad disponible: 424 GB de disco y 12 GB de memoria al momento del control.
+
+La publicación `IP:host:contenedor` está soportada por Compose en Coolify. No asignar
+dominios a ninguno de los dos servicios ni activar `Connect to Predefined Network`.
 
 ## Compose en Coolify
 
@@ -60,6 +77,9 @@ No pegar esos valores en el repositorio, logs, Telegram ni documentación. Duran
 arranque se escriben en `/run/contador-secrets`, que es memoria temporal, con modo
 `0600`. El entrypoint elimina las variables del entorno antes de ejecutar Python.
 
+En Coolify, marcar los cuatro valores como `Secret`, habilitar `Runtime` y deshabilitar
+`Build Variable`: la imagen no los necesita para construirse.
+
 ## Variables obligatorias
 
 | Variable | Valor esperado |
@@ -73,8 +93,10 @@ arranque se escriben en `/run/contador-secrets`, que es memoria temporal, con mo
 | `ARCA_CERTIFICATE_ALIAS` | Alias registrado en ARCA |
 | `ARCA_WSFE_POINT_OF_SALE` | `2` |
 | `INVOICE_ISSUER_IIBB` | Número de Ingresos Brutos del emisor |
-| `TAILSCALE_BIND_IP` | IP `100.x` asignada a la VPS |
-| `ARCA_ENROLLMENT_BASE_URL` | `http://IP_TAILSCALE:8090` o `http://host.tailnet.ts.net:8090` |
+| `TAILSCALE_BIND_IP` | `100.75.19.73` |
+| `ARCA_ENROLLMENT_HOST_PORT` | `8091` |
+| `CCMA_NOVNC_HOST_PORT` | `6080` |
+| `ARCA_ENROLLMENT_BASE_URL` | `http://winston.tail98a73b.ts.net:8091` |
 | `ARCA_ENROLLMENT_ALLOW_TAILSCALE_HTTP` | `true` |
 
 La aplicación rechaza HTTP si la URL no es localhost, una IP del rango de Tailscale o
@@ -99,14 +121,16 @@ AUTOMATIC_MONITOR_ENABLED=true
 AUTOMATIC_MONITOR_CHECK_SECONDS=300
 AUTOMATIC_SYNC_INTERVAL_SECONDS=21600
 ARCA_ENROLLMENT_ENABLED=true
-ARCA_ENROLLMENT_HOST_PORT=8090
+ARCA_ENROLLMENT_HOST_PORT=8091
 CCMA_NOVNC_HOST_PORT=6080
 LOG_LEVEL=INFO
 ```
 
-`CCMA_LOGIN_URL` puede apuntar a
-`http://IP_TAILSCALE:6080/vnc.html?autoconnect=true&resize=scale` para diagnóstico
-manual. No es necesario para el alta normal.
+Para el acceso de emergencia configurar:
+
+```env
+CCMA_LOGIN_URL=http://winston.tail98a73b.ts.net:6080/vnc.html?autoconnect=true&resize=scale
+```
 
 No definir `TAX_MONITOR_DB`, `CCMA_SESSION_DIR`, `ARCA_ENROLLMENT_BIND` ni
 `ARCA_ENROLLMENT_PORT` en Coolify: el Compose fija sus rutas y puertos internos.
@@ -131,8 +155,8 @@ SQLite mientras el bot está escribiendo.
 
 El host publica:
 
-- `TAILSCALE_BIND_IP:8090` → formulario privado;
-- `TAILSCALE_BIND_IP:6080` → noVNC de diagnóstico.
+- `100.75.19.73:8091` → formulario privado, contenedor `8090`;
+- `100.75.19.73:6080` → noVNC de diagnóstico.
 
 No abrir esos puertos en la interfaz pública, no usar Tailscale Funnel y no asignarles
 un dominio de Coolify. El contenedor escucha en `0.0.0.0`, pero Docker sólo publica en
@@ -142,19 +166,57 @@ La URL que llega por Telegram contiene un token aleatorio de un solo uso, no la 
 El CUIT y la clave fiscal se envían desde el navegador directamente al worker a través
 del tailnet.
 
+Antes de abrir el enlace desde el iPhone, confirmar que la aplicación Tailscale esté
+conectada. Durante la inspección del 06/08/2026 ese dispositivo figuraba desconectado.
+
+## Guía rápida de variables
+
+La plantilla [config.coolify-winston.env.example](config.coolify-winston.env.example)
+contiene exactamente las variables de este host. En Coolify:
+
+1. copiar sus variables en `Environment Variables`;
+2. reemplazar `CHAT_ID` por el mismo chat configurado localmente;
+3. reemplazar los cuatro valores `REEMPLAZAR_*`;
+4. marcar únicamente esos cuatro como secretos y sólo de ejecución;
+5. guardar y volver a renderizar el Compose antes de desplegar.
+
+No cargar en Coolify `TAX_MONITOR_DB`, `CCMA_SESSION_DIR`,
+`SESSION_ENCRYPTION_KEY_FILE`, `ARCA_CERTIFICATE_PATH`, `ARCA_PRIVATE_KEY_PATH`,
+`ARCA_ENROLLMENT_BIND`, `ARCA_ENROLLMENT_PORT` ni `DISPLAY`: sus valores internos ya
+están fijados por el Compose y las imágenes.
+
 ## Primer despliegue
 
-1. Crear la aplicación Docker Compose en Coolify.
-2. Cargar todas las variables y marcar los cuatro secretos.
-3. Confirmar que no se agregó ningún dominio público.
-4. Desplegar ambos servicios.
-5. Esperar que `bot` y `portal-worker` estén `healthy`.
-6. En Telegram ejecutar `/resumen` y `/facturas`.
-7. Desde `/ayuda`, generar el enlace privado y verificar que abra por Tailscale.
-8. Confirmar que el alta termine en “Acceso guardado”.
-9. Verificar que la siguiente sincronización actualice Monotributo e Ingresos Brutos.
-10. Abrir `Pagos y vencimientos` y comprobar que el botón de pago sólo aparece en el
+1. Confirmar que esta versión esté confirmada y publicada en la rama que leerá
+   Coolify.
+2. Detener la instalación local antes de iniciar la de la VPS. Dos procesos usando el
+   mismo token de Telegram producen conflictos de `getUpdates` y podrían repartir los
+   mensajes entre instalaciones:
+
+   ```bash
+   docker compose -f compose.yaml -f compose.local.yaml --profile portal stop bot portal-worker
+   ```
+
+3. Crear la aplicación Docker Compose en Coolify.
+4. Elegir el repositorio y la rama que contengan esta versión, usando únicamente
+   `compose.yaml`.
+5. Cargar las variables de la plantilla y marcar los cuatro secretos.
+6. Confirmar que no se agregó ningún dominio y que `Connect to Predefined Network`
+   permanezca desactivado.
+7. Desplegar ambos servicios.
+8. Esperar que `bot` y `portal-worker` estén `healthy`.
+9. En una instalación nueva, ejecutar `/conectar 20383717419` y luego
+   `/configurar_arca` para guardar la clave mediante Tailscale.
+10. Confirmar que el alta termine en “Acceso guardado”.
+11. Ejecutar `/resumen` y `/facturas` y verificar la actualización de Monotributo e
+   Ingresos Brutos.
+12. Abrir `Pagos y vencimientos` y comprobar que el botón de pago sólo aparece en el
     chat autorizado. No confirmar la generación durante una prueba de despliegue.
+
+Una instalación nueva no copia automáticamente la base SQLite ni las credenciales
+cifradas del Mac. No migrarlas durante el primer despliegue: volver a vincular la
+cuenta es más seguro. Si luego se necesita conservar auditoría local, realizar una
+migración separada con ambos servicios detenidos y la misma clave Fernet.
 
 ## Verificaciones
 

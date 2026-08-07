@@ -291,13 +291,15 @@ La facturación prepara un borrador editable y exige confirmación explícita an
 solicitar CAE por WSFEv1. La aplicación conserva número, CAE, respuesta y auditoría para
 resolver timeouts sin duplicar comprobantes.
 
-El bot no genera VEP ni ejecuta pagos. Cuando detecta un pago confirmado que todavía
-no terminó de reflejarse en la cuenta, informa que no debe repetirse y suprime la alerta
-contradictoria de deuda para ese saldo.
+El bot puede cotizar y generar el VEP de la cuota corriente del Régimen Simplificado
+de Santa Fe después de una confirmación explícita. No opera cuentas bancarias ni
+confirma el débito: esa autorización continúa en ARCA, la billetera o el banco. Cuando
+detecta un pago confirmado que todavía no terminó de reflejarse en la cuenta, informa
+que no debe repetirse y suprime la alerta contradictoria de deuda para ese saldo.
 
 Controles implementados:
 
-- lista cerrada de chats y una lista más restrictiva para emitir;
+- lista cerrada de chats y listas más restrictivas para emitir facturas o generar VEP;
 - certificados y claves fuera del repositorio;
 - cifrado de credenciales y tickets;
 - registro de auditoría sin tokens ni datos bancarios;

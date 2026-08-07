@@ -24,6 +24,7 @@ facturación e Ingresos Brutos.
 | Cuenta de Monotributo | Portal de ARCA | CUIT + clave cifrada |
 | Pagos nacionales | Portal de pagos de ARCA | CUIT + clave cifrada |
 | Régimen Simplificado Santa Fe | Portal provincial con SSO ARCA | CUIT + clave cifrada |
+| Cotización y VEP corriente de Santa Fe | Formulario 5426 provincial | CUIT + clave cifrada y confirmación humana |
 | Topes de categoría | Publicación oficial de ARCA | HTTP público + respaldo local |
 
 WSFE permite consultar el último número y un comprobante determinado, pero no ofrece
@@ -49,6 +50,7 @@ individuales disponibles.
 - verificación de CUIT y clave fiscal;
 - renovación automática de sesiones;
 - consultas de cuenta, pagos e Ingresos Brutos;
+- cotización y generación idempotente del VEP provincial;
 - servidor HTTP privado de alta;
 - Chromium aislado para los pasos que todavía lo requieren;
 - noVNC exclusivamente como diagnóstico.
@@ -88,6 +90,18 @@ existir dominio, proxy público ni Funnel.
 La unicidad por CUIT, tipo, punto y número, junto con los estados explícitos del
 borrador, evita dobles emisiones por concurrencia o doble pulsación.
 
+## Flujo de un VEP provincial
+
+1. El bot toma la próxima cuota informada por Santa Fe.
+2. El usuario elige la red de pago.
+3. `portal-worker` cotiza capital e intereses y guarda el resultado.
+4. Telegram muestra el total y exige confirmación explícita.
+5. El worker vuelve a cotizar; si cambió, pide otra confirmación.
+6. Envía una sola solicitud, conserva número y PDF y nunca reintenta un resultado
+   incierto.
+7. El usuario autoriza el débito fuera del bot, en ARCA, su banco o billetera.
+8. El bot considera el período pagado sólo cuando Santa Fe lo registra.
+
 ## Flujo de avisos
 
 El worker escribe snapshots cada seis horas. El bot evalúa cambios cada cinco minutos.
@@ -99,6 +113,7 @@ suprime la alerta contradictoria de deuda para ese mismo saldo.
 
 - Chats no autorizados se descartan antes de consultar o escribir datos.
 - Facturación tiene una lista de chats más restrictiva.
+- La generación de VEP tiene su propia lista restrictiva de chats.
 - Certificado, clave privada y clave Fernet son secretos de despliegue.
 - La clave fiscal nunca pasa por Telegram ni se registra en logs.
 - Los tokens del formulario son de un solo uso y se almacenan por hash.
@@ -110,7 +125,8 @@ suprime la alerta contradictoria de deuda para ese mismo saldo.
 ## Límites
 
 - No se ejecutan pagos ni se operan cuentas bancarias.
-- No se generan VEP.
+- Sólo se genera el VEP corriente de Ingresos Brutos de Santa Fe; no se generan planes
+  ni liquidaciones consolidadas.
 - No se presentan declaraciones juradas ni recategorizaciones.
 - No se cubren todas las obligaciones nacionales fuera de Monotributo.
 - Los portales pueden cambiar sin aviso; el bot detecta fuentes atrasadas y avisa.

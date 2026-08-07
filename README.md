@@ -98,12 +98,16 @@ tailnet. La aplicación sólo admite este modo si:
 - `ARCA_ENROLLMENT_ALLOW_TAILSCALE_HTTP=true`; y
 - la URL usa una IP `100.64.0.0/10` o un nombre completo terminado en `.ts.net`.
 
-No se debe asignar un dominio público de Coolify a los puertos `8090` o `6080`.
+En `winston`, el formulario se publica en `100.75.19.73:8091` porque `8090` ya está
+ocupado por Beszel; noVNC usa `100.75.19.73:6080`. No se debe asignar un dominio
+público de Coolify a ninguno de esos puertos.
 
 ## Producción en Coolify
 
 El procedimiento completo, variables, secretos, persistencia, verificaciones y
 rollback está en [DEPLOY_COOLIFY.md](DEPLOY_COOLIFY.md).
+La plantilla lista para copiar en Winston es
+[config.coolify-winston.env.example](config.coolify-winston.env.example).
 
 La configuración de producción es [compose.yaml](compose.yaml). El archivo
 [compose.local.yaml](compose.local.yaml) existe solamente para desarrollo y nunca se

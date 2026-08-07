@@ -4,12 +4,13 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 production_json=$(mktemp)
 local_json=$(mktemp)
+winston_json=$(mktemp)
 local_env_file="$project_dir/.env"
 if [ ! -f "$local_env_file" ]; then
     local_env_file="$project_dir/config.example.env"
 fi
 cleanup() {
-    rm -f "$production_json" "$local_json"
+    rm -f "$production_json" "$local_json" "$winston_json"
 }
 trap cleanup EXIT INT TERM
 
@@ -18,8 +19,10 @@ cd "$project_dir"
 docker compose --env-file /dev/null -f compose.yaml config --format json >"$production_json"
 docker compose --env-file "$local_env_file" -f compose.yaml -f compose.local.yaml \
     --profile portal config --format json >"$local_json"
+docker compose --env-file config.coolify-winston.env.example -f compose.yaml \
+    config --format json >"$winston_json"
 
-python3 - "$production_json" "$local_json" "$project_dir" <<'PY'
+python3 - "$production_json" "$local_json" "$winston_json" "$project_dir" <<'PY'
 import ipaddress
 import json
 import sys
@@ -27,7 +30,8 @@ from pathlib import Path
 
 production = json.loads(Path(sys.argv[1]).read_text())
 local = json.loads(Path(sys.argv[2]).read_text())
-project = Path(sys.argv[3]).resolve()
+winston = json.loads(Path(sys.argv[3]).read_text())
+project = Path(sys.argv[4]).resolve()
 errors = []
 
 services = production.get("services", {})
@@ -78,6 +82,17 @@ for name, service in local.get("services", {}).items():
         if source != project / "secrets" or not volume.get("read_only"):
             errors.append(f"{name}: el bind local debe ser secrets/ en sólo lectura")
 
+winston_ports = {
+    (str(port.get("host_ip", "")), int(port.get("published", 0)), int(port.get("target", 0)))
+    for port in winston.get("services", {}).get("portal-worker", {}).get("ports", [])
+}
+expected_winston_ports = {
+    ("100.75.19.73", 8091, 8090),
+    ("100.75.19.73", 6080, 6080),
+}
+if winston_ports != expected_winston_ports:
+    errors.append(f"winston: puertos renderizados inesperados: {sorted(winston_ports)}")
+
 for dockerfile in (project / "Dockerfile", project / "Dockerfile.portal"):
     users = [
         line.split(maxsplit=1)[1].strip()
@@ -103,6 +118,7 @@ if errors:
     raise SystemExit(1)
 
 print("Compose de producción y local: OK")
+print("Render de winston sobre Tailscale: OK")
 print("Persistencia, secretos, healthchecks, red y usuario final: OK")
 PY
 

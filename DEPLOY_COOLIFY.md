@@ -144,6 +144,8 @@ IIBB_PAYMENT_CHAT_IDS=CHAT_PERSONAL
 AUTOMATIC_MONITOR_ENABLED=true
 AUTOMATIC_MONITOR_CHECK_SECONDS=300
 AUTOMATIC_SYNC_INTERVAL_SECONDS=21600
+ARCA_OFFICIAL_SNAPSHOT_TTL_SECONDS=129600
+ARCA_CATEGORY_LIMITS_REFRESH_SECONDS=86400
 ARCA_ENROLLMENT_ENABLED=true
 ARCA_ENROLLMENT_HOST_PORT=8091
 CCMA_NOVNC_HOST_PORT=6080
@@ -161,8 +163,9 @@ No definir `TAX_MONITOR_DB`, `CCMA_SESSION_DIR`, `ARCA_ENROLLMENT_BIND` ni
 
 ## Persistencia y copias de seguridad
 
-`tax_data` contiene `/data/tax_monitor.sqlite3`: identidad, snapshots, facturas,
-VEP provinciales, sus PDFs oficiales, auditoría, notificaciones y tickets cifrados.
+`tax_data` contiene `/data/tax_monitor.sqlite3`: identidad, snapshots, historial
+mensual verificado, facturas, VEP provinciales, sus PDFs oficiales, auditoría,
+notificaciones y tickets cifrados.
 
 `portal_state` contiene las credenciales cifradas y el estado renovable de los
 navegadores. Para restaurar el acceso sin repetir el alta se necesitan conjuntamente:
@@ -175,23 +178,57 @@ Configurar backups de ambos volúmenes desde Coolify. Antes de migrar datos, det
 los dos servicios para obtener una copia consistente. No copiar únicamente el archivo
 SQLite mientras el bot está escribiendo.
 
-### Primer arranque y seed
+### Primer arranque
 
 En un volumen `tax_data` vacío, ambos servicios ejecutan una inicialización
 idempotente que crea `/data/tax_monitor.sqlite3` y todas sus tablas. La base no se
-versiona ni se descarga desde Git.
-
-El único seed de datos personales incorpora de manera idempotente el cliente Concept,
-la plantilla `Concept mensual` y la factura histórica `00001-00000073`. Por seguridad,
-sólo se ejecuta cuando ARCA termina de verificar el CUIT `20383717419`. En una
-instalación nueva, `/conectar CUIT` realiza esa verificación y aplica el seed inmediatamente,
-sin reiniciar el servicio. Si la plantilla ya fue editada, una verificación posterior no
-la vuelve a sus valores iniciales.
+versiona ni se descarga desde Git. La inicialización no crea clientes, plantillas,
+facturas, CUIT ni importes personales.
 
 No se precargan credenciales, sesiones, snapshots tributarios, mensajes, pagos, VEP,
 borradores ni auditoría del Mac. Las consultas oficiales vuelven a obtener el estado
 actual; `/conectar CUIT` entrega el formulario para guardar nuevamente la clave fiscal
 en el volumen `portal_state`.
+
+### Importación inicial del historial
+
+WSFE no lista las facturas anteriores de otros puntos de venta. Para que la proyección
+de categoría sea completa, se importan una sola vez los totales mensuales verificados.
+El archivo es privado, no se copia a la imagen ni se guarda en Git. Formato:
+
+```json
+{
+  "source": "ARCA_COMPROBANTES_VERIFICADOS_YYYY-MM-DD",
+  "months": [
+    {"period": "2026-01", "total": "0.00"},
+    {"period": "2026-02", "total": "123456.78"}
+  ]
+}
+```
+
+Hay que incluir también los meses cerrados sin facturación con total `0`. La importación
+rechaza el mes en curso o meses futuros y valida períodos, duplicados, importes no
+negativos y precisión de centavos; repetirla actualiza los mismos meses y nunca los
+suma dos veces.
+
+Después de `/conectar CUIT`, colocar temporalmente el JSON dentro del volumen
+`tax_data` como `/data/monthly-billing-history.json` y ejecutar desde la terminal del
+servicio `bot`:
+
+```bash
+python -m contador_ai --chat-id CHAT_ID \
+  --import-monthly-billing /data/monthly-billing-history.json
+```
+
+Debe responder `Meses importados: N`. Borrar luego ese JSON temporal y ejecutar
+`/categoria`; la fuente de verdad queda en SQLite. Las facturas que emita el bot se
+incorporan solas y los totales mensuales importados prevalecen para su mismo mes, por
+lo que no hay doble conteo.
+
+El último mes importado es el corte entre el historial manual y el seguimiento por
+WSFE. Desde el mes siguiente, el sistema también registra como completos los meses sin
+facturas. No volver a emitir por el punto manual después de ese corte: esas facturas no
+aparecen en WSFE y harían incompleta la proyección.
 
 ## Red y formulario privado
 
@@ -218,7 +255,8 @@ contiene exactamente las variables de este host. En Coolify:
 
 1. copiar sus variables en `Environment Variables`;
 2. reemplazar `CHAT_ID` por el mismo chat configurado localmente;
-3. reemplazar los cuatro valores `REEMPLAZAR_*`;
+3. reemplazar los cuatro secretos y también `REEMPLAZAR_CUIT` y
+   `REEMPLAZAR_NUMERO_IIBB`;
 4. dejar todas las variables sólo en `Available at Runtime` y, después del primer
    despliegue correcto, usar `Lock` únicamente en los cuatro secretos;
 5. guardar y volver a renderizar el Compose antes de desplegar.
@@ -259,14 +297,16 @@ cargan ambas fuentes, el healthcheck del bot falla con el mensaje
    permanezca desactivado.
 7. Desplegar ambos servicios.
 8. Esperar que `bot` y `portal-worker` estén `healthy`.
-9. En una instalación nueva, ejecutar `/conectar 20383717419`. El bot debe verificar
+9. En una instalación nueva, ejecutar `/conectar CUIT`. El bot debe verificar
    el CUIT automáticamente y mostrar `Completar conexión` en la misma respuesta.
 10. Abrir ese botón mediante Tailscale y confirmar que el alta termine en “Acceso
     guardado”. El worker debe actualizar las fuentes inmediatamente y Telegram debe
     avisar que la cuenta quedó lista.
-11. Ejecutar `/resumen` y `/facturas` y verificar la actualización de Monotributo e
-   Ingresos Brutos.
-12. Abrir `Pagos y vencimientos` y comprobar que el botón de pago sólo aparece en el
+11. Si se necesita la proyección histórica, realizar la importación mensual privada
+    explicada arriba.
+12. Ejecutar `/resumen`, `/categoria` y `/facturas`; verificar Monotributo, Ingresos
+    Brutos y que la proyección indique el número esperado de meses cubiertos.
+13. Abrir `Pagos y vencimientos` y comprobar que el botón de pago sólo aparece en el
     chat autorizado. No confirmar la generación durante una prueba de despliegue.
 
 Una instalación nueva no copia automáticamente la base SQLite ni las credenciales

@@ -244,14 +244,17 @@ class ServiceTest(TestCase):
         output = service.projection_lines(
             {
                 "window_to": "2026-07-31",
+                "history_complete": True,
                 "invoices": invoices,
             }
         )
         text = "\n".join(output)
         self.assertIn("Categoría proyectada para recategorización", text)
         self.assertIn("F — promedio mensual de $3.325.000,00", text)
-        self.assertIn("Facturación anual proyectada: $39.900.000,00", text)
-        self.assertIn("Topes de ARCA vigentes desde 01/08/2026", text)
+        self.assertIn("Facturación proyectada al cierre: $39.900.000,00", text)
+        self.assertIn("7 meses cerrados y 5 por cerrar", text)
+        self.assertIn("topes vigentes desde 01/08/2026", text)
+        self.assertIn("ARCA puede actualizarlos", text)
 
     def test_projection_fails_closed_without_verified_limits(self):
         service = TaxMonitorService(self.db, today=date(2026, 8, 5))
@@ -260,6 +263,7 @@ class ServiceTest(TestCase):
             service.projection_lines(
                 {
                     "window_to": "2026-07-31",
+                    "history_complete": True,
                     "invoices": [
                         {"issued_at": "2026-07-15", "net_total_pesos": "3000000"}
                     ],
@@ -808,15 +812,71 @@ class ServiceTest(TestCase):
             "Promedio mensual registrado (1 mes): $3.000.000,00",
             output,
         )
-        self.assertIn("Comprobantes incluidos: 1", output)
+        self.assertIn("Meses con datos: 1 de 12", output)
         self.assertIn("faltan datos de 6 meses ya cerrados", output)
-        self.assertIn(
-            "el escenario sería E ($36.000.000,00)",
-            output,
-        )
         self.assertIn("enero de 2026–diciembre de 2026", output)
         self.assertIn("quedan 5 meses por cerrar", output)
+        self.assertNotIn("escenario", output)
         self.assertNotIn("WSFE", output)
+
+    def test_category_overview_uses_complete_months_and_forecasts_remaining_time(self):
+        self._verified_user()
+        self._snapshot(
+            1001,
+            "ARCA_PROFILE",
+            "taxpayer_profile",
+            {"categories": [{"description": "F", "status": "ACTIVO"}]},
+        )
+        amounts = {
+            "2025-08": "3375000",
+            "2025-09": "3375000",
+            "2025-10": "2940000",
+            "2025-11": "2920000",
+            "2025-12": "5800000",
+            "2026-01": "6000000",
+            "2026-02": "4455000",
+            "2026-03": "1820000",
+            "2026-04": "2000000",
+            "2026-05": "3000000",
+            "2026-06": "3000000",
+            "2026-07": "3000000",
+        }
+        self._snapshot(
+            1001,
+            "ARCA_INVOICES",
+            "issued_invoices",
+            {
+                "window_from": "2025-08-01",
+                "window_to": "2026-07-31",
+                "total_pesos": "41685000",
+                "invoice_count": 1,
+                "history_complete": True,
+                "complete_months": list(amounts),
+                "monthly_totals": [
+                    {"period": period, "total": amount, "source": "TEST"}
+                    for period, amount in amounts.items()
+                ],
+                "invoices": [],
+            },
+        )
+        service = TaxMonitorService(
+            self.db,
+            today=date(2026, 8, 7),
+            live_synchronizers={
+                "ARCA_PROFILE": lambda _chat_id: None,
+                "ARCA_INVOICES": lambda _chat_id: None,
+            },
+            category_limits_provider=lambda _today: TEST_CATEGORY_LIMITS,
+        )
+
+        output = service.category_overview(1001)
+
+        self.assertIn("Categoría proyectada: F", output)
+        self.assertIn("Facturación de los últimos 12 meses: $41.685.000,00", output)
+        self.assertIn("Meses con datos: 12 de 12", output)
+        self.assertIn("Facturación proyectada al cierre: $39.900.000,00", output)
+        self.assertIn("7 meses cerrados y 5 por cerrar", output)
+        self.assertIn("seguirías en la categoría F", output)
 
     def test_navigation_contains_only_clear_user_actions(self):
         self._verified_user()

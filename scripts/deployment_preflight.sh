@@ -74,6 +74,35 @@ for name, service in services.items():
         if not safe:
             errors.append(f"{name}: puerto publicado fuera de loopback/Tailscale: {host}")
 
+bot_environment = services.get("bot", {}).get("environment") or {}
+portal_environment = services.get("portal-worker", {}).get("environment") or {}
+try:
+    monitor_check = int(bot_environment["AUTOMATIC_MONITOR_CHECK_SECONDS"])
+    official_refresh = int(bot_environment["AUTOMATIC_SYNC_INTERVAL_SECONDS"])
+    official_ttl = int(bot_environment["ARCA_OFFICIAL_SNAPSHOT_TTL_SECONDS"])
+    limits_refresh = int(bot_environment["ARCA_CATEGORY_LIMITS_REFRESH_SECONDS"])
+    portal_refresh = int(portal_environment["CCMA_SYNC_INTERVAL_SECONDS"])
+    portal_ttls = (
+        int(portal_environment["CCMA_SNAPSHOT_TTL_SECONDS"]),
+        int(portal_environment["ARCA_SETI_SNAPSHOT_TTL_SECONDS"]),
+        int(portal_environment["SANTA_FE_IIBB_SNAPSHOT_TTL_SECONDS"]),
+    )
+except (KeyError, TypeError, ValueError) as exc:
+    errors.append(f"intervalos de actualización inválidos o incompletos: {exc}")
+else:
+    if monitor_check <= 0 or official_refresh <= 0 or portal_refresh <= 0:
+        errors.append("los intervalos de actualización deben ser positivos")
+    if monitor_check >= official_refresh:
+        errors.append("la evaluación de alertas debe ser más frecuente que las consultas")
+    if official_ttl < official_refresh:
+        errors.append("el TTL de APIs oficiales no puede vencer antes de su próxima consulta")
+    if official_ttl < 108000:
+        errors.append("el TTL de APIs oficiales debe cubrir el aviso de atraso de 30 horas")
+    if limits_refresh < official_refresh:
+        errors.append("los topes no pueden revisarse menos de una vez por ciclo oficial")
+    if any(ttl < portal_refresh for ttl in portal_ttls):
+        errors.append("un snapshot de portales vence antes de la próxima sincronización")
+
 for name, service in local.get("services", {}).items():
     for volume in service.get("volumes", []):
         if volume.get("type") != "bind":

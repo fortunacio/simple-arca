@@ -43,6 +43,47 @@ class FakeWsfe:
         )
 
 
+def store_test_invoice(db: Database, chat_id: int) -> None:
+    InvoiceStore(db).insert_invoice(
+        {
+            "chat_id": chat_id,
+            "source": "TEST_FIXTURE",
+            "emitter_cuit": "20383717419",
+            "emitter_name": "EMISOR DE PRUEBA",
+            "emitter_address": "Domicilio emisor",
+            "emitter_iibb": "20383717419",
+            "emitter_activity_start": "2019-07-01",
+            "emitter_iva_condition": "Responsable Monotributo",
+            "emitter_activity_id": None,
+            "emitter_activity": "",
+            "receiver_cuit": "30709625043",
+            "receiver_name": "CLIENTE DE PRUEBA S.A.",
+            "receiver_iva_condition_id": 1,
+            "receiver_iva_condition": "IVA Responsable Inscripto",
+            "receiver_address": "Domicilio receptor",
+            "invoice_type": 11,
+            "point_of_sale": 1,
+            "number": 73,
+            "issue_date": "2026-07-08",
+            "service_from": "2026-07-01",
+            "service_to": "2026-07-31",
+            "due_date": "2026-07-15",
+            "description": "Servicio de prueba",
+            "quantity": "1",
+            "unit_description": "otras unidades",
+            "unit_price": "3000000",
+            "total": "3000000.00",
+            "currency": "PES",
+            "exchange_rate": "1",
+            "sale_condition": "Transferencia bancaria",
+            "cae": "86273007521761",
+            "cae_expiry": "2026-07-18",
+            "observations": "",
+            "raw_response": "",
+        }
+    )
+
+
 class ArcaSyncTest(TestCase):
     def setUp(self):
         self.tempdir = TemporaryDirectory()
@@ -86,20 +127,19 @@ class ArcaSyncTest(TestCase):
         self.assertEqual(verified, [])
         self.assertEqual(self.db.get_connections(1001)[0]["status"], "ERROR")
 
-    def test_verification_can_seed_personal_invoice_history_immediately(self):
+    def test_verification_does_not_inject_personal_invoice_history(self):
         self.db.set_pending_tax_identity(1001, "20383717419", "production")
         store = InvoiceStore(self.db)
         synchronizer = ArcaProfileSynchronizer(
             self.db,
             FakeWsaa(),
             FakePadron("20383717419"),
-            on_verified=lambda chat_id, _cuit: store.seed_concept_history(chat_id),
         )
 
         synchronizer.sync_chat(1001)
 
-        self.assertEqual(store.invoice_count(1001), 1)
-        self.assertEqual(store.list_templates(1001)[0]["name"], "Concept mensual")
+        self.assertEqual(store.invoice_count(1001), 0)
+        self.assertEqual(store.list_templates(1001), [])
 
     def test_a_failed_refresh_does_not_disconnect_a_verified_identity(self):
         self.db.mark_tax_identity_verified(1001)
@@ -168,6 +208,38 @@ class ArcaSyncTest(TestCase):
         self.assertEqual(len(coverage), 1)
         self.assertEqual(coverage[0]["record_count"], 1)
 
+    def test_monthly_billing_history_is_validated_and_idempotent(self):
+        rows = [
+            {"period": "2026-01", "total": "6000000"},
+            {"period": "2026-02", "total": "4455000"},
+        ]
+
+        for _ in range(2):
+            imported = self.db.import_monthly_billing_history(
+                1001,
+                rows,
+                source="ARCA_VERIFIED_EXPORT",
+            )
+            self.assertEqual(imported, 2)
+
+        stored = self.db.get_monthly_billing_history_between(
+            1001, date(2026, 1, 1), date(2026, 2, 28)
+        )
+        self.assertEqual([(row["period"], row["total"]) for row in stored], [
+            ("2026-01", "6000000"),
+            ("2026-02", "4455000"),
+        ])
+        with self.assertRaisesRegex(ValueError, "Período mensual inválido"):
+            self.db.import_monthly_billing_history(
+                1001,
+                [{"period": "2026-13", "total": "1"}],
+                source="TEST",
+            )
+        self.assertEqual(
+            self.db.get_monthly_billing_history_cutoff(1001),
+            "2026-02",
+        )
+
     def test_invoice_sync_merges_history_and_prefers_wsfe_on_duplicates(self):
         self.db.mark_tax_identity_verified(1001)
         history = (
@@ -223,7 +295,7 @@ class ArcaSyncTest(TestCase):
     def test_invoice_sync_includes_the_invoice_stored_by_the_bot(self):
         self.db.set_pending_tax_identity(1001, "20383717419", "production")
         self.db.mark_tax_identity_verified(1001)
-        InvoiceStore(self.db).seed_concept_history(1001)
+        store_test_invoice(self.db, 1001)
         synchronizer = ArcaInvoicesSynchronizer(
             self.db,
             FakeWsaa(),
@@ -259,7 +331,7 @@ class ArcaSyncTest(TestCase):
 
         self.db.set_pending_tax_identity(1001, "20383717419", "production")
         self.db.mark_tax_identity_verified(1001)
-        InvoiceStore(self.db).seed_concept_history(1001)
+        store_test_invoice(self.db, 1001)
         synchronizer = ArcaInvoicesSynchronizer(
             self.db,
             FakeWsaa(),
@@ -275,3 +347,57 @@ class ArcaSyncTest(TestCase):
         self.assertEqual(payload["stored_invoice_count"], 1)
         self.assertEqual(payload["wsfe_invoice_count"], 1)
         self.assertEqual(payload["total_pesos"], "3000000")
+
+    def test_verified_monthly_total_overrides_incomplete_individual_records(self):
+        self.db.mark_tax_identity_verified(1001)
+        self.db.import_monthly_billing_history(
+            1001,
+            [{"period": "2026-07", "total": "3000000"}],
+            source="ARCA_VERIFIED_EXPORT",
+        )
+        synchronizer = ArcaInvoicesSynchronizer(
+            self.db,
+            FakeWsaa(),
+            FakeWsfe(),
+            snapshot_ttl=timedelta(minutes=15),
+        )
+
+        synchronizer.sync_chat(1001)
+
+        snapshot = self.db.get_live_snapshot(1001, "ARCA_INVOICES", "issued_invoices")
+        payload = json.loads(snapshot["payload_json"])
+        self.assertEqual(payload["total_pesos"], "3000000")
+        july = next(item for item in payload["monthly_totals"] if item["period"] == "2026-07")
+        self.assertEqual(july["total"], "3000000")
+        self.assertEqual(july["source"], "ARCA_VERIFIED_EXPORT")
+        self.assertIn("2026-07", payload["complete_months"])
+
+    def test_closed_months_after_the_import_cutoff_are_covered_by_wsfe(self):
+        self.db.mark_tax_identity_verified(1001)
+        self.db.import_monthly_billing_history(
+            1001,
+            [{"period": "2025-12", "total": "1000000"}],
+            source="ARCA_VERIFIED_EXPORT",
+        )
+        synchronizer = ArcaInvoicesSynchronizer(
+            self.db,
+            FakeWsaa(),
+            FakeWsfe(),
+            snapshot_ttl=timedelta(minutes=15),
+        )
+
+        synchronizer.sync_chat(1001)
+
+        snapshot = self.db.get_live_snapshot(1001, "ARCA_INVOICES", "issued_invoices")
+        payload = json.loads(snapshot["payload_json"])
+        self.assertEqual(payload["monthly_history_cutoff"], "2025-12")
+        self.assertTrue(
+            set(f"2026-{month:02d}" for month in range(1, 8)).issubset(
+                payload["complete_months"]
+            )
+        )
+        january = next(
+            item for item in payload["monthly_totals"] if item["period"] == "2026-01"
+        )
+        self.assertEqual(january["total"], "0")
+        self.assertEqual(january["source"], "OFFICIAL_WSFE")

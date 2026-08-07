@@ -21,6 +21,7 @@ facturación e Ingresos Brutos.
 | Situación registral y categoría | Servicio oficial de ARCA | WSAA + certificado |
 | Domicilio Fiscal Electrónico | Servicio oficial delegado | WSAA + certificado |
 | Factura C y consulta por número | WSFEv1 | WSAA + certificado |
+| Historial mensual anterior | Importación privada verificada | Acceso administrativo a la instalación |
 | Cuenta de Monotributo | Portal de ARCA | CUIT + clave cifrada |
 | Pagos nacionales | Portal de pagos de ARCA | CUIT + clave cifrada |
 | Régimen Simplificado Santa Fe | Portal provincial con SSO ARCA | CUIT + clave cifrada |
@@ -29,8 +30,13 @@ facturación e Ingresos Brutos.
 
 WSFE permite consultar el último número y un comprobante determinado, pero no ofrece
 un listado completo de todas las facturas emitidas en otros puntos de venta. Por eso el
-historial combina una importación inicial, las nuevas facturas del bot y las consultas
-individuales disponibles.
+historial combina totales mensuales verificados, las nuevas facturas del bot y las
+consultas individuales disponibles. Los totales importados reemplazan el subtotal del
+mismo mes para evitar duplicarlo; no se suman encima de las facturas individuales.
+El último mes importado establece el corte de migración: los meses cerrados posteriores
+se consideran cubiertos por el barrido completo de WSFE, incluso cuando no hubo
+facturación. Volver a emitir manualmente fuera de WSFE después de ese corte rompería
+esa cobertura y no está soportado.
 
 ## Componentes
 
@@ -60,6 +66,11 @@ individuales disponibles.
 `tax_data` guarda SQLite. `portal_state` guarda credenciales cifradas y estados de
 navegador. Ambos sobreviven al reemplazo de imágenes. Los secretos criptográficos no
 se guardan en esos volúmenes como texto plano.
+
+Una base nueva sólo recibe el esquema. No existen seeds personales en la aplicación.
+El historial anterior se carga con una operación administrativa idempotente y queda
+asociado al chat verificado; los archivos usados para importarlo no entran en Git ni en
+la imagen.
 
 ## Flujo del enlace privado
 
@@ -108,6 +119,12 @@ El worker escribe snapshots cada seis horas. El bot evalúa cambios cada cinco m
 Los eventos se deduplican en SQLite mediante clave y huella. La regla de conciliación
 de pagos se aplica antes de generar deuda: un pago confirmado pendiente de reflejarse
 suprime la alerta contradictoria de deuda para ese mismo saldo.
+
+La evaluación frecuente trabaja sobre datos locales. Como máximo cada seis horas
+dispara la actualización de perfil, mensajes y facturación por API oficial. Los
+portales tienen su ciclo independiente de seis horas. La página pública de topes de
+Monotributo se verifica una vez por día y conserva la última tabla oficial válida si
+la fuente no responde.
 
 ## Fronteras de seguridad
 

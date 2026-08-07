@@ -5,6 +5,7 @@ from unittest import TestCase
 from contador_ai.monotributo import (
     ArcaCategoryLimitsProvider,
     CATEGORY_LIMITS_CACHE_KEY,
+    CATEGORY_LIMITS_LAST_ATTEMPT_KEY,
     CategoryLimitsError,
     expected_limits_effective_from,
     next_recategorization,
@@ -90,6 +91,7 @@ class MonotributoProjectionTest(TestCase):
         self.assertEqual(result.effective_from, date(2026, 8, 1))
         self.assertFalse(result.verification_pending)
         self.assertIn(CATEGORY_LIMITS_CACHE_KEY, cache.values)
+        self.assertIn(CATEGORY_LIMITS_LAST_ATTEMPT_KEY, cache.values)
 
     def test_provider_uses_current_cache_and_marks_failed_refresh(self):
         cache = MemoryCache()
@@ -121,6 +123,31 @@ class MonotributoProjectionTest(TestCase):
 
         with self.assertRaisesRegex(CategoryLimitsError, "semestre vigente"):
             provider.current(date(2026, 8, 5))
+
+    def test_provider_does_not_retry_a_failed_refresh_on_every_alert_check(self):
+        cache = MemoryCache()
+        first_check = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+        ArcaCategoryLimitsProvider(
+            cache,
+            fetch_html=lambda _url: arca_html(),
+            now=lambda: first_check,
+        ).current(date(2026, 8, 5))
+        attempts = 0
+
+        def fail(_url):
+            nonlocal attempts
+            attempts += 1
+            raise CategoryLimitsError("ARCA no disponible")
+
+        failed_at = first_check + timedelta(days=2)
+        provider = ArcaCategoryLimitsProvider(
+            cache,
+            fetch_html=fail,
+            now=lambda: failed_at,
+        )
+        self.assertTrue(provider.current(date(2026, 8, 7)).verification_pending)
+        self.assertTrue(provider.current(date(2026, 8, 7)).verification_pending)
+        self.assertEqual(attempts, 1)
 
     def test_expected_table_changes_in_february_and_august(self):
         self.assertEqual(expected_limits_effective_from(date(2026, 1, 31)), date(2025, 8, 1))

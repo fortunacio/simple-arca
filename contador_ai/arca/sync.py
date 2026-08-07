@@ -21,12 +21,24 @@ from .wsaa import WsaaClient
 LOGGER = logging.getLogger(__name__)
 
 
+def _month_keys(window_from: date, window_to: date) -> tuple[str, ...]:
+    current = window_from.replace(day=1)
+    result: list[str] = []
+    while current <= window_to:
+        result.append(current.strftime("%Y-%m"))
+        if current.month == 12:
+            current = date(current.year + 1, 1, 1)
+        else:
+            current = date(current.year, current.month + 1, 1)
+    return tuple(result)
+
+
 @dataclass
 class ArcaProfileSynchronizer:
     db: Database
     wsaa: WsaaClient
     padron: ConstanciaInscripcionClient
-    snapshot_ttl: timedelta = timedelta(minutes=15)
+    snapshot_ttl: timedelta = timedelta(hours=36)
     on_verified: Callable[[int, str], None] | None = None
 
     def sync_chat(self, chat_id: int) -> None:
@@ -85,7 +97,7 @@ class ArcaDfeSynchronizer:
     db: Database
     wsaa: WsaaClient
     dfe: DfeClient
-    snapshot_ttl: timedelta = timedelta(minutes=5)
+    snapshot_ttl: timedelta = timedelta(hours=36)
 
     def sync_chat(self, chat_id: int) -> None:
         identity = self.db.get_tax_identity(chat_id)
@@ -141,7 +153,7 @@ class ArcaInvoicesSynchronizer:
     db: Database
     wsaa: WsaaClient
     wsfe: WsfeClient
-    snapshot_ttl: timedelta = timedelta(minutes=15)
+    snapshot_ttl: timedelta = timedelta(hours=36)
 
     def sync_chat(self, chat_id: int) -> None:
         identity = self.db.get_tax_identity(chat_id)
@@ -221,16 +233,51 @@ class ArcaInvoicesSynchronizer:
         )
 
         fetched_at = datetime.now(timezone.utc)
-        total_pesos = sum(
-            (invoice.net_total_pesos for invoice in invoices), Decimal("0")
+        individual_monthly_totals: dict[str, Decimal] = {}
+        for invoice in invoices:
+            period = invoice.issued_at[:7]
+            individual_monthly_totals[period] = (
+                individual_monthly_totals.get(period, Decimal("0"))
+                + invoice.net_total_pesos
+            )
+
+        monthly_history = list(
+            self.db.get_monthly_billing_history_between(chat_id, date_from, date_to)
         )
+        monthly_totals = dict(individual_monthly_totals)
+        monthly_sources = {period: "INVOICE_RECORDS" for period in monthly_totals}
+        for row in monthly_history:
+            period = str(row["period"])
+            monthly_totals[period] = Decimal(str(row["total"]))
+            monthly_sources[period] = str(row["source"])
+
+        total_pesos = sum(monthly_totals.values(), Decimal("0"))
         history_coverage = list(self.db.get_invoice_history_coverage(chat_id))
-        manual_history_complete = any(
+        invoice_history_complete = any(
             int(row["point_of_sale"]) == 1
             and date.fromisoformat(row["window_from"]) <= date_from
             and date.fromisoformat(row["window_to"]) >= date_to
             for row in history_coverage
         )
+        expected_months = set(_month_keys(date_from, date_to))
+        complete_months = {str(row["period"]) for row in monthly_history}
+        complete_months.update(invoice.issued_at[:7] for invoice in stored_invoices)
+        complete_months.update(invoice.issued_at[:7] for invoice in wsfe_invoices)
+        monthly_history_cutoff = self.db.get_monthly_billing_history_cutoff(chat_id)
+        if monthly_history_cutoff:
+            wsfe_only_months = {
+                period for period in expected_months if period > monthly_history_cutoff
+            }
+            complete_months.update(wsfe_only_months)
+            for period in wsfe_only_months:
+                monthly_totals.setdefault(period, Decimal("0"))
+                monthly_sources.setdefault(period, "OFFICIAL_WSFE")
+        if invoice_history_complete:
+            complete_months.update(expected_months)
+            for period in expected_months:
+                monthly_totals.setdefault(period, Decimal("0"))
+                monthly_sources.setdefault(period, "VERIFIED_INVOICE_HISTORY")
+        history_complete = expected_months.issubset(complete_months)
         payload = {
             "window_from": date_from.isoformat(),
             "window_to": date_to.isoformat(),
@@ -239,7 +286,19 @@ class ArcaInvoicesSynchronizer:
             "wsfe_invoice_count": len(wsfe_invoices),
             "history_invoice_count": len(history_invoices),
             "stored_invoice_count": len(stored_invoices),
-            "manual_history_complete": manual_history_complete,
+            "monthly_history_count": len(monthly_history),
+            "monthly_history_cutoff": monthly_history_cutoff,
+            "history_complete": history_complete,
+            "manual_history_complete": history_complete,
+            "complete_months": sorted(complete_months & expected_months),
+            "monthly_totals": [
+                {
+                    "period": period,
+                    "total": str(monthly_totals[period]),
+                    "source": monthly_sources[period],
+                }
+                for period in sorted(monthly_totals)
+            ],
             "invoices": [invoice.to_payload() for invoice in invoices],
             "history_coverage": [
                 {

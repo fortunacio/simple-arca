@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping
 
@@ -252,6 +253,16 @@ CREATE TABLE IF NOT EXISTS invoice_history_coverage (
     FOREIGN KEY (chat_id) REFERENCES users(chat_id)
 );
 
+CREATE TABLE IF NOT EXISTS monthly_billing_history (
+    chat_id INTEGER NOT NULL,
+    period TEXT NOT NULL,
+    total TEXT NOT NULL,
+    source TEXT NOT NULL,
+    verified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, period),
+    FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS iibb_payment_drafts (
     id TEXT PRIMARY KEY,
     chat_id INTEGER NOT NULL,
@@ -299,6 +310,9 @@ ON invoice_drafts(chat_id, status, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_invoice_history_chat_date
 ON invoice_history(chat_id, issued_at, point_of_sale, number);
+
+CREATE INDEX IF NOT EXISTS idx_monthly_billing_history_chat_period
+ON monthly_billing_history(chat_id, period);
 
 CREATE INDEX IF NOT EXISTS idx_iibb_payment_jobs
 ON iibb_payment_drafts(status, updated_at);
@@ -800,6 +814,83 @@ class Database:
                 """,
                 (chat_id,),
             ).fetchall()
+
+    def import_monthly_billing_history(
+        self,
+        chat_id: int,
+        months: Iterable[Mapping[str, object]],
+        *,
+        source: str,
+    ) -> int:
+        source = source.strip()
+        if not source:
+            raise ValueError("El origen del historial mensual es obligatorio")
+        if len(source) > 120:
+            raise ValueError("El origen del historial mensual es demasiado largo")
+
+        normalized: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        current_month = date.today().replace(day=1)
+        for item in months:
+            period = str(item.get("period", "")).strip()
+            try:
+                parsed_period = date.fromisoformat(f"{period}-01")
+            except ValueError as exc:
+                raise ValueError(f"Período mensual inválido: {period!r}") from exc
+            if parsed_period.strftime("%Y-%m") != period or period in seen:
+                raise ValueError(f"Período mensual inválido o duplicado: {period!r}")
+            if parsed_period >= current_month:
+                raise ValueError(f"El período {period} todavía no es un mes cerrado")
+            try:
+                total = Decimal(str(item.get("total", "")))
+            except InvalidOperation as exc:
+                raise ValueError(f"Importe mensual inválido para {period}") from exc
+            if not total.is_finite() or total < 0 or total.as_tuple().exponent < -2:
+                raise ValueError(f"Importe mensual inválido para {period}")
+            seen.add(period)
+            normalized.append((period, str(total)))
+
+        self.ensure_user(chat_id)
+        with self.connect() as connection:
+            for period, total in normalized:
+                connection.execute(
+                    """
+                    INSERT INTO monthly_billing_history(chat_id, period, total, source)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(chat_id, period) DO UPDATE SET
+                        total = excluded.total,
+                        source = excluded.source,
+                        verified_at = CURRENT_TIMESTAMP
+                    """,
+                    (chat_id, period, total, source),
+                )
+        return len(normalized)
+
+    def get_monthly_billing_history_between(
+        self, chat_id: int, window_from: date, window_to: date
+    ):
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT period, total, source, verified_at
+                FROM monthly_billing_history
+                WHERE chat_id = ? AND period BETWEEN ? AND ?
+                ORDER BY period
+                """,
+                (
+                    chat_id,
+                    window_from.strftime("%Y-%m"),
+                    window_to.strftime("%Y-%m"),
+                ),
+            ).fetchall()
+
+    def get_monthly_billing_history_cutoff(self, chat_id: int) -> str | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT MAX(period) AS period FROM monthly_billing_history WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        return str(row["period"]) if row and row["period"] else None
 
     def get_stored_invoices_between(
         self, chat_id: int, window_from: date, window_to: date

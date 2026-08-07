@@ -68,6 +68,18 @@ WEEKDAYS = (
 LOGGER = logging.getLogger(__name__)
 
 
+def month_keys_between(window_from: date, window_to: date) -> tuple[str, ...]:
+    current = window_from.replace(day=1)
+    result: list[str] = []
+    while current <= window_to:
+        result.append(current.strftime("%Y-%m"))
+        if current.month == 12:
+            current = date(current.year + 1, 1, 1)
+        else:
+            current = date(current.year, current.month + 1, 1)
+    return tuple(result)
+
+
 def format_datetime_argentina(value: str | None) -> str:
     if not value:
         return "sin actualizar"
@@ -352,7 +364,8 @@ class TaxMonitorService:
 
     def projection_lines(self, snapshot: dict) -> list[str]:
         invoices = snapshot.get("invoices", [])
-        if not invoices:
+        snapshot_monthly_totals = snapshot.get("monthly_totals", [])
+        if not invoices and not snapshot_monthly_totals:
             return [
                 "Categoría proyectada para recategorización",
                 "Todavía no hay facturas registradas en el período analizado.",
@@ -378,25 +391,50 @@ class TaxMonitorService:
             ]
 
         monthly_totals: dict[str, Decimal] = {}
-        for invoice in invoices:
+        for item in snapshot_monthly_totals:
+            period = str(item.get("period", ""))
             try:
-                issued_at = date.fromisoformat(invoice.get("issued_at", ""))
-                amount = Decimal(str(invoice.get("net_total_pesos", "0")))
+                amount = Decimal(str(item.get("total", "0")))
+                issued_at = date.fromisoformat(f"{period}-01")
             except (InvalidOperation, ValueError):
                 continue
             if target_from <= issued_at <= completed_to:
-                month = issued_at.strftime("%Y-%m")
-                monthly_totals[month] = monthly_totals.get(month, Decimal("0")) + amount
-        history_complete = snapshot.get("manual_history_complete") is not False
-        registered_months = len(monthly_totals)
-        missing_completed_months = max(0, months - registered_months)
-        projection_is_complete = history_complete or missing_completed_months == 0
+                monthly_totals[period] = amount
+        if not snapshot_monthly_totals:
+            for invoice in invoices:
+                try:
+                    issued_at = date.fromisoformat(invoice.get("issued_at", ""))
+                    amount = Decimal(str(invoice.get("net_total_pesos", "0")))
+                except (InvalidOperation, ValueError):
+                    continue
+                if target_from <= issued_at <= completed_to:
+                    month = issued_at.strftime("%Y-%m")
+                    monthly_totals[month] = monthly_totals.get(
+                        month, Decimal("0")
+                    ) + amount
+
+        expected_completed_months = set(month_keys_between(target_from, completed_to))
+        complete_months = {
+            str(period) for period in snapshot.get("complete_months", [])
+        }
+        history_complete = snapshot.get(
+            "history_complete",
+            snapshot.get("manual_history_complete", False),
+        )
+        if history_complete:
+            complete_months.update(expected_completed_months)
+        missing_months = expected_completed_months - complete_months
+        if not snapshot.get("complete_months") and not history_complete:
+            missing_months = expected_completed_months - set(monthly_totals)
+        missing_completed_months = len(missing_months)
+        projection_is_complete = missing_completed_months == 0
+        registered_months = len(expected_completed_months & set(monthly_totals))
+        accumulated = sum(monthly_totals.values(), Decimal("0"))
         if projection_is_complete:
-            accumulated = sum(monthly_totals.values(), Decimal("0"))
             average = accumulated / months
             average_description = f"promedio mensual de {format_money(average)}"
         elif monthly_totals:
-            average = sum(monthly_totals.values(), Decimal("0")) / registered_months
+            average = accumulated / registered_months
             noun = "mes registrado" if registered_months == 1 else "meses registrados"
             average_description = (
                 f"promedio de {format_money(average)} sobre {registered_months} {noun}"
@@ -408,7 +446,26 @@ class TaxMonitorService:
             ]
         target_months = completed_months_between(target_from, target_to)
         remaining_months = max(0, target_months - months)
-        annual_projection = average * target_months
+        if not projection_is_complete:
+            missing_noun = (
+                "mes ya cerrado"
+                if missing_completed_months == 1
+                else "meses ya cerrados"
+            )
+            remaining_noun = "mes" if remaining_months == 1 else "meses"
+            return [
+                "Categoría proyectada para recategorización",
+                (
+                    "Todavía no puedo determinarla: faltan datos de "
+                    f"{missing_completed_months} {missing_noun}."
+                ),
+                (
+                    f"La revisión de {format_month_year(recategorization)} toma "
+                    f"{format_month_year(target_from)}–{format_month_year(target_to)}; "
+                    f"quedan {remaining_months} {remaining_noun} por cerrar."
+                ),
+            ]
+        annual_projection = accumulated + average * remaining_months
         if self.category_limits_provider is None:
             return [
                 "Categoría proyectada para recategorización",
@@ -426,36 +483,20 @@ class TaxMonitorService:
             ]
         category = projected_category(annual_projection, category_limits)
         projected = category or "supera el tope del monotributo"
-        if not projection_is_complete:
-            missing_noun = (
-                "mes ya cerrado"
-                if missing_completed_months == 1
-                else "meses ya cerrados"
-            )
-            remaining_noun = "mes" if remaining_months == 1 else "meses"
-            return [
-                "Categoría proyectada para recategorización",
-                (
-                    "Todavía no puedo determinarla: faltan datos de "
-                    f"{missing_completed_months} {missing_noun}."
-                ),
-                (
-                    f"Si el promedio de {format_money(average)} se repitiera durante "
-                    f"los {target_months} meses, el escenario sería {projected} "
-                    f"({format_money(annual_projection)})."
-                ),
-                (
-                    f"La revisión de {format_month_year(recategorization)} toma "
-                    f"{format_month_year(target_from)}–{format_month_year(target_to)}; "
-                    f"quedan {remaining_months} {remaining_noun} por cerrar."
-                ),
-            ]
         lines = [
             "Categoría proyectada para recategorización",
             f"{projected} — {average_description}",
-            f"Facturación anual proyectada: {format_money(annual_projection)}",
+            f"Facturación proyectada al cierre: {format_money(annual_projection)}",
+            (
+                f"Período {format_month_year(target_from)}–{format_month_year(target_to)}: "
+                f"{months} meses cerrados y {remaining_months} por cerrar."
+            ),
+            (
+                "Resultado calculado con los topes vigentes desde "
+                f"{format_date(category_limits.effective_from.isoformat())}; "
+                "ARCA puede actualizarlos antes de la próxima recategorización."
+            ),
             f"Próxima recategorización: {format_month_year(recategorization)}",
-            f"Topes de ARCA vigentes desde {format_date(category_limits.effective_from.isoformat())}.",
             "Esta proyección usa la facturación; ARCA también evalúa los demás parámetros del régimen.",
         ]
         if category_limits.verification_pending:
@@ -516,17 +557,32 @@ class TaxMonitorService:
         if snapshot is None:
             return self.source_command(chat_id, "ARCA_INVOICES")
         count = int(snapshot.get("invoice_count", 0))
-        if count == 0:
-            return "ARCA no devolvió comprobantes en WSFE. Todavía no puedo calcular tu facturación."
+        monthly_count = len(snapshot.get("monthly_totals", []))
+        if count == 0 and monthly_count == 0:
+            return "Todavía no hay facturación registrada para el período consultado."
         total = Decimal(str(snapshot.get("total_pesos", "0")))
-        average = total / 12
+        history_complete = snapshot.get(
+            "history_complete",
+            snapshot.get("manual_history_complete", False),
+        ) is True
+        divisor = 12 if history_complete else monthly_count
+        average = total / divisor if divisor else None
         return "\n".join(
             [
                 "Facturación",
                 "",
-                f"Últimos 12 meses completos: {format_money(total)}",
-                f"Promedio mensual: {format_money(average)}",
-                f"Comprobantes: {count}",
+                (
+                    f"Últimos 12 meses completos: {format_money(total)}"
+                    if history_complete
+                    else f"Facturación registrada: {format_money(total)}"
+                ),
+                (
+                    f"Promedio mensual: {format_money(average)}"
+                    if average is not None
+                    else "Promedio mensual: todavía no disponible"
+                ),
+                f"Meses con datos: {monthly_count} de 12",
+                f"Facturas individuales registradas: {count}",
                 f"Período: {format_date(snapshot.get('window_from'))} al {format_date(snapshot.get('window_to'))}",
                 f"Actualizado: {format_datetime_argentina(snapshot.get('fetched_at'))}",
             ]
@@ -1274,18 +1330,43 @@ class TaxMonitorService:
         )
         current = category_letter(current_description)
         current_display = format_category(current_description)
-        total = Decimal(str(invoices.get("total_pesos", "0")))
-        history_complete = invoices.get("manual_history_complete") is True
-        registered_months = {
-            str(invoice.get("issued_at", ""))[:7]
-            for invoice in invoices.get("invoices", [])
-            if len(str(invoice.get("issued_at", ""))) >= 7
-        }
-        average_divisor = 12 if history_complete else len(registered_months)
+        try:
+            total = Decimal(str(invoices.get("total_pesos", "0")))
+        except InvalidOperation:
+            total = Decimal("0")
+        history_complete = invoices.get(
+            "history_complete",
+            invoices.get("manual_history_complete", False),
+        ) is True
+        monthly_totals: dict[str, Decimal] = {}
+        for item in invoices.get("monthly_totals", []):
+            period = str(item.get("period", ""))
+            if not period:
+                continue
+            try:
+                monthly_totals[period] = Decimal(str(item.get("total", "0")))
+            except InvalidOperation:
+                continue
+        if not monthly_totals:
+            for invoice in invoices.get("invoices", []):
+                period = str(invoice.get("issued_at", ""))[:7]
+                if len(period) != 7:
+                    continue
+                try:
+                    amount = Decimal(str(invoice.get("net_total_pesos", "0")))
+                except InvalidOperation:
+                    continue
+                monthly_totals[period] = monthly_totals.get(period, Decimal("0")) + amount
+        average_divisor = 12 if history_complete else len(monthly_totals)
         average = total / average_divisor if average_divisor else None
         projection = self.projection_lines(invoices)
         projection_detail = projection[1] if len(projection) > 1 else ""
         projected_candidate = projection_detail.split(" — ", 1)[0]
+        pace_detail = (
+            projection_detail.split(" — ", 1)[1]
+            if " — " in projection_detail
+            else ""
+        )
         projected = (
             projected_candidate
             if projected_candidate
@@ -1297,16 +1378,25 @@ class TaxMonitorService:
             projection_context = projection[2:4]
         elif not current:
             conclusion = "Todavía no puedo determinar tu categoría actual."
-            projection_context = []
+            projection_context = projection[2:4]
         elif projected == current:
-            conclusion = f"Si mantenés este ritmo, seguirías en la categoría {current}."
-            projection_context = []
+            conclusion = (
+                f"Si mantenés este ritmo, con los topes actuales seguirías en la "
+                f"categoría {current}."
+            )
+            projection_context = ([pace_detail.capitalize()] if pace_detail else []) + projection[2:5]
         elif projected > current:
-            conclusion = f"Si mantenés este ritmo, podrías subir de {current} a {projected}."
-            projection_context = []
+            conclusion = (
+                f"Si mantenés este ritmo, con los topes actuales podrías subir de "
+                f"{current} a {projected}."
+            )
+            projection_context = ([pace_detail.capitalize()] if pace_detail else []) + projection[2:5]
         else:
-            conclusion = f"Si mantenés este ritmo, podrías bajar de {current} a {projected}."
-            projection_context = []
+            conclusion = (
+                f"Si mantenés este ritmo, con los topes actuales podrías bajar de "
+                f"{current} a {projected}."
+            )
+            projection_context = ([pace_detail.capitalize()] if pace_detail else []) + projection[2:5]
         billing_lines = [
             (
                 f"Facturación de los últimos 12 meses: {format_money(total)}"
@@ -1323,14 +1413,18 @@ class TaxMonitorService:
                     else "Promedio mensual registrado: todavía no disponible"
                 )
             ),
-            f"Comprobantes incluidos: {int(invoices.get('invoice_count', 0))}",
+            f"Meses con datos: {len(monthly_totals)} de 12",
         ]
         return "\n".join(
             [
                 "Categoría y facturación",
                 "",
                 f"Categoría actual: {current_display}",
-                f"Categoría proyectada: {projected}",
+                (
+                    f"Categoría proyectada: {projected} (con topes actuales)"
+                    if len(projected) == 1
+                    else f"Categoría proyectada: {projected}"
+                ),
                 "",
                 *billing_lines,
                 "",

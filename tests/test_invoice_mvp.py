@@ -146,7 +146,58 @@ class InvoiceMvpTest(TestCase):
         self.db.ensure_user(self.chat_id)
         self.db.set_pending_tax_identity(self.chat_id, "20383717419", "production")
         self.db.mark_tax_identity_verified(self.chat_id)
-        self.store.seed_concept_history(self.chat_id)
+        client = self.store.upsert_client(
+            self.chat_id,
+            "30709625043",
+            "CLIENTE DE PRUEBA S.A.",
+            "IVA Responsable Inscripto",
+            "Domicilio de prueba",
+            iva_condition_id=1,
+        )
+        self.store.create_template(
+            self.chat_id,
+            client["id"],
+            "Servicio mensual",
+            "Servicios informáticos",
+            "3000000",
+        )
+        self.invoice_values = {
+            "chat_id": self.chat_id,
+            "source": "TEST_FIXTURE",
+            "emitter_cuit": "20383717419",
+            "emitter_name": "EMISOR DE PRUEBA",
+            "emitter_address": "Domicilio emisor",
+            "emitter_iibb": "20383717419",
+            "emitter_activity_start": "2019-07-01",
+            "emitter_iva_condition": "Responsable Monotributo",
+            "emitter_activity_id": None,
+            "emitter_activity": "",
+            "receiver_cuit": "30709625043",
+            "receiver_name": "CLIENTE DE PRUEBA S.A.",
+            "receiver_iva_condition_id": 1,
+            "receiver_iva_condition": "IVA Responsable Inscripto",
+            "receiver_address": "Domicilio de prueba",
+            "invoice_type": 11,
+            "point_of_sale": 1,
+            "number": 73,
+            "issue_date": "2026-07-08",
+            "service_from": "2026-07-01",
+            "service_to": "2026-07-31",
+            "due_date": "2026-07-15",
+            "description": "Servicios informáticos",
+            "quantity": "1.00",
+            "unit_description": "otras unidades",
+            "unit_price": "3000000.00",
+            "total": "3000000.00",
+            "currency": "PES",
+            "exchange_rate": "1",
+            "sale_condition": "Transferencia Bancaria",
+            "cae": "86273007521761",
+            "cae_expiry": "2026-07-18",
+            "observations": "",
+            "raw_response": "",
+        }
+        self.store.insert_invoice(self.invoice_values)
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -172,24 +223,22 @@ class InvoiceMvpTest(TestCase):
             self.chat_id, draft["id"], manual_duplicate_confirmed=1
         )
 
-    def test_seed_is_idempotent_and_isolated(self):
-        self.store.seed_concept_history(self.chat_id)
+    def test_imported_invoice_is_idempotent_and_isolated(self):
+        self.store.insert_invoice(self.invoice_values)
         self.assertEqual(self.store.invoice_count(self.chat_id), 1)
         self.assertEqual(len(self.store.list_templates(self.chat_id)), 1)
         self.db.ensure_user(2002)
         self.assertEqual(self.store.invoice_count(2002), 0)
 
-    def test_seed_does_not_overwrite_an_edited_template(self):
+    def test_template_can_be_edited(self):
         template = self.store.list_templates(self.chat_id)[0]
         self.store.create_template(
             self.chat_id,
             template["client_id"],
-            "Concept mensual",
+            "Servicio mensual",
             "Servicio editado por el usuario",
             "3500000",
         )
-
-        self.store.seed_concept_history(self.chat_id)
 
         preserved = self.store.list_templates(self.chat_id)[0]
         self.assertEqual(preserved["description"], "Servicio editado por el usuario")

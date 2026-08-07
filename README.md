@@ -17,6 +17,7 @@ pero no aparecen en el menú de Telegram.
 - Situación registral y categoría de Monotributo mediante servicios oficiales de ARCA.
 - Domicilio Fiscal Electrónico sin abrir comunicaciones.
 - Facturas emitidas por WSFE y las nuevas facturas generadas por el bot.
+- Historial mensual verificado de puntos de venta que WSFE no puede listar.
 - Cuenta corriente de Monotributo y pagos confirmados en los portales de ARCA.
 - Régimen Simplificado de Ingresos Brutos de Santa Fe y pagos registrados.
 - Topes vigentes de Monotributo publicados por ARCA, con respaldo local de la última
@@ -30,6 +31,7 @@ oficiales con un worker aislado para los portales que requieren CUIT y clave fis
 - Actualización de APIs oficiales cada seis horas.
 - Actualización de Monotributo, pagos e Ingresos Brutos cada seis horas.
 - Evaluación de alertas cada cinco minutos, con deduplicación persistente.
+- Verificación diaria de la tabla oficial de topes de Monotributo.
 - Recordatorios de vencimiento a 14, 7, 3, 1 y 0 días.
 - Avisos si una fuente deja de actualizarse.
 - Conciliación de pagos: si un pago está confirmado pero la cuenta aún no terminó de
@@ -56,6 +58,11 @@ imagen ni en la base.
 En producción, Coolify entrega los secretos como variables protegidas. El entrypoint
 los escribe con modo `0600` dentro de un `tmpfs`, elimina sus valores del entorno y
 recién después inicia la aplicación.
+
+La base se crea vacía: el código no contiene clientes, facturas, importes ni CUIT
+personales precargados. El historial anterior se incorpora una sola vez mediante una
+importación privada a SQLite; desde entonces, cada factura nueva emitida por el bot se
+agrega automáticamente.
 
 ## Configuración local
 
@@ -84,6 +91,9 @@ Para ejecutar comandos o pruebas sin Docker:
 .venv/bin/python -m contador_ai --command /resumen --chat-id CHAT_ID
 .venv/bin/python -m unittest discover -s tests
 ```
+
+La importación mensual y su formato están documentados en
+[DEPLOY_COOLIFY.md](DEPLOY_COOLIFY.md#importación-inicial-del-historial).
 
 ## Alta privada de CUIT y clave fiscal
 

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import logging
 import os
+import sys
 import urllib.parse
 from datetime import timedelta
 from pathlib import Path
@@ -55,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--command",
         help="ejecuta localmente un comando del bot, por ejemplo /estado",
+    )
+    parser.add_argument(
+        "--import-monthly-billing",
+        metavar="JSON",
+        help="importa totales mensuales verificados desde un archivo JSON o '-'",
     )
     return parser
 
@@ -166,23 +173,26 @@ def build_live_synchronizers(db: Database):
     else:
         environment = build_arca_environment()
         tickets = build_ticket_provider(db, environment, certificate, private_key)
+        snapshot_ttl = timedelta(
+            seconds=int(os.environ.get("ARCA_OFFICIAL_SNAPSHOT_TTL_SECONDS", "129600"))
+        )
         profile = ArcaProfileSynchronizer(
             db=db,
             wsaa=tickets,
             padron=ConstanciaInscripcionClient(environment),
-            on_verified=lambda chat_id, _represented_cuit: InvoiceStore(
-                db
-            ).seed_concept_history(chat_id),
+            snapshot_ttl=snapshot_ttl,
         )
         dfe = ArcaDfeSynchronizer(
             db=db,
             wsaa=tickets,
             dfe=DfeClient(environment),
+            snapshot_ttl=snapshot_ttl,
         )
         invoices = ArcaInvoicesSynchronizer(
             db=db,
             wsaa=tickets,
             wsfe=WsfeClient(environment),
+            snapshot_ttl=snapshot_ttl,
         )
         synchronizers = {
             "ARCA_PROFILE": profile.sync_chat,
@@ -260,10 +270,6 @@ def build_invoice_bot(db: Database) -> InvoiceBotService | None:
         "INVOICE_EMISSION_CHAT_IDS",
     )
     store = InvoiceStore(db)
-    for chat_id in allowed_chat_ids:
-        identity = db.get_tax_identity(chat_id)
-        if identity is not None and identity["represented_cuit"] == "20383717419":
-            store.seed_concept_history(chat_id)
     gateway = InvoiceGateway(
         store=store,
         tickets=tickets,
@@ -304,7 +310,14 @@ def main() -> None:
         certificate_alias=os.environ.get("ARCA_CERTIFICATE_ALIAS", ""),
         arca_environment=arca_environment.value,
         live_synchronizers=build_live_synchronizers(db),
-        category_limits_provider=ArcaCategoryLimitsProvider(db).current,
+        category_limits_provider=ArcaCategoryLimitsProvider(
+            db,
+            refresh_after=timedelta(
+                seconds=int(
+                    os.environ.get("ARCA_CATEGORY_LIMITS_REFRESH_SECONDS", "86400")
+                )
+            ),
+        ).current,
         ccma_login_url=os.environ.get("CCMA_LOGIN_URL", ""),
         arca_enrollment_base_url=arca_enrollment_base_url(),
     )
@@ -314,6 +327,29 @@ def main() -> None:
         return
     if args.healthcheck:
         print("ok")
+        return
+    if args.import_monthly_billing:
+        identity = db.get_tax_identity(args.chat_id)
+        if identity is None or identity["status"] != "VERIFIED":
+            raise SystemExit("El chat debe tener un CUIT verificado antes de importar")
+        try:
+            if args.import_monthly_billing == "-":
+                payload = json.load(sys.stdin)
+            else:
+                with Path(args.import_monthly_billing).open(encoding="utf-8") as stream:
+                    payload = json.load(stream)
+            source = str(payload["source"])
+            months = payload["months"]
+            if not isinstance(months, list):
+                raise ValueError("months debe ser una lista")
+            imported = db.import_monthly_billing_history(
+                args.chat_id,
+                months,
+                source=source,
+            )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"No pude importar el historial mensual: {exc}") from exc
+        print(f"Meses importados: {imported}")
         return
     if args.print_status:
         print(service.status(args.chat_id))

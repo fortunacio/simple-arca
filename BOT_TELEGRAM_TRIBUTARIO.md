@@ -102,27 +102,49 @@ el período. No se almacenan datos bancarios.
 
 Combina la categoría oficial actual con:
 
-- total registrado en los últimos doce meses, combinando la importación inicial, las
-  facturas guardadas por el bot y las consultas individuales de WSFE sin duplicarlas;
+- total registrado en los últimos doce meses, combinando un historial mensual
+  verificado, las facturas guardadas por el bot y las consultas individuales de WSFE
+  sin duplicarlas;
 - promedio mensual de los meses registrados, indicando cuántos meses respaldan el
   cálculo cuando el historial todavía es parcial;
 - categoría proyectada con la tabla vigente obtenida desde ARCA;
 - próxima fecha de revisión.
 
 Si falta parte del historial de otro punto de venta, muestra el total conocido como
-`facturación registrada`. Si faltan meses ya cerrados dentro del período que evaluará
-la próxima recategorización, el resultado se presenta únicamente como un escenario
-condicionado e indica por separado cuántos meses faltan incorporar y cuántos quedan
-por transcurrir.
+`facturación registrada`. Si falta siquiera un mes ya cerrado dentro del período que
+evaluará la próxima recategorización, no asigna una categoría proyectada: indica qué
+meses faltan y cuántos quedan por transcurrir.
+
+Cuando todos los meses cerrados están cubiertos, la proyección se calcula como:
+
+`facturación acumulada + promedio real de los meses cerrados × meses por cerrar`.
+
+El promedio sale únicamente de facturación ya registrada. El sistema no guarda
+importes futuros, presupuestos ni una facturación mensual “prevista”. La comparación
+usa la última tabla oficial de ARCA disponible y aclara que ARCA puede publicar otros
+topes antes de la recategorización.
+
+La regla de los últimos doce meses y las revisiones semestrales proviene de la
+[guía oficial de recategorización](https://www.arca.gob.ar/monotributo/ayuda/recategorizacion.asp).
+Los importes se descargan de la
+[tabla oficial de categorías](https://www.arca.gob.ar/monotributo/categorias.asp),
+se validan y se guardan como respaldo; no están hardcodeados en Python.
 
 La conclusión distingue tres casos: seguir en la misma categoría, bajar o subir. Las
 descripciones largas de ARCA se normalizan a la letra antes de comparar, por lo que no
 puede decir “bajar de F a F”.
 
-El historial inicial conserva la factura manual importada. Toda factura emitida por el
-bot se incorpora automáticamente al historial y a los cálculos. Las facturas de puntos
-de venta externos sólo se incorporan cuando WSFE permite consultarlas individualmente
-o se importan; WSFE no ofrece un endpoint de listado completo.
+Toda factura emitida por el bot se incorpora automáticamente al historial y a los
+cálculos. Las facturas de puntos de venta externos sólo se incorporan cuando WSFE
+permite consultarlas individualmente o mediante una importación privada; WSFE no
+ofrece un endpoint de listado completo. No hay datos personales ni importes de ejemplo
+precargados en el código.
+
+El último mes importado funciona como corte. Desde el mes siguiente, cada mes cerrado
+queda cubierto por la consulta completa de WSFE, incluso si el total es cero. Para que
+esa continuidad sea válida, después del corte las facturas nuevas deben emitirse por
+el punto Web Services del bot; una factura manual posterior no sería visible por esta
+integración.
 
 ## Mensajes de ARCA
 
@@ -161,6 +183,14 @@ valores por defecto son:
 | Evaluación de alertas | 300 segundos |
 | APIs oficiales | 21.600 segundos |
 | Portales ARCA/Santa Fe | 21.600 segundos |
+| Tabla oficial de topes | 86.400 segundos |
+
+Los snapshots de APIs oficiales duran treinta y seis horas y los de portales
+veinticuatro horas. El bot avisa a las treinta horas si una API oficial sigue sin
+actualizarse y a las doce si falla un portal, antes de que venza el dato guardado. La
+evaluación de cinco minutos normalmente sólo lee SQLite; abre las APIs oficiales
+únicamente cuando ya transcurrió el intervalo de seis horas. Los portales los actualiza
+exclusivamente el worker en su propio ciclo.
 
 Se recuerdan vencimientos a 14, 7, 3, 1 y 0 días. Una fuente se considera atrasada a
 las 12 horas para cuentas y pagos, o a las 30 horas para perfil, mensajes y facturas.

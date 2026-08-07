@@ -267,7 +267,7 @@ class InvoiceBotService:
             return self.draft_detail(draft, replace=True)
         if action in {"amount", "desc", "period", "due"}:
             prompts = {
-                "amount": "Enviame el nuevo importe. Ejemplo: 3000000",
+                "amount": "Enviame el nuevo importe. Ejemplo: 125000",
                 "desc": "Enviame la nueva descripción del servicio.",
                 "period": "Enviame el período como DD/MM/AAAA - DD/MM/AAAA.",
                 "due": "Enviame el vencimiento con formato DD/MM/AAAA.",
@@ -378,7 +378,7 @@ class InvoiceBotService:
                 "NEW_TEMPLATE_AMOUNT",
                 {"client_id": payload["client_id"], "description": text},
             )
-            return BotReply("Enviame el importe habitual. Ejemplo: 3000000")
+            return BotReply("Enviame el importe habitual. Ejemplo: 125000")
         if action == "NEW_TEMPLATE_AMOUNT":
             amount = _parse_amount(text)
             with self.store.db.connect() as connection:

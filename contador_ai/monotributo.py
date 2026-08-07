@@ -13,6 +13,7 @@ import httpx
 
 CATEGORY_LIMITS_SOURCE = "https://www.arca.gob.ar/monotributo/categorias.asp"
 CATEGORY_LIMITS_CACHE_KEY = "monotributo_category_limits_v1"
+CATEGORY_LIMITS_LAST_ATTEMPT_KEY = "monotributo_category_limits_last_attempt_v1"
 CATEGORIES = tuple("ABCDEFGHIJK")
 
 
@@ -220,6 +221,17 @@ class ArcaCategoryLimitsProvider:
         ):
             return cached
 
+        last_attempt = self._load_last_attempt()
+        if (
+            cached is not None
+            and cached.effective_from == expected
+            and last_attempt is not None
+            and last_attempt <= now
+            and now - last_attempt <= self.refresh_after
+        ):
+            return replace(cached, verification_pending=True)
+
+        self.cache.set_bot_state(CATEGORY_LIMITS_LAST_ATTEMPT_KEY, now.isoformat())
         try:
             downloaded = parse_arca_category_limits(
                 self.fetch_html(CATEGORY_LIMITS_SOURCE),
@@ -236,6 +248,16 @@ class ArcaCategoryLimitsProvider:
 
         self.cache.set_bot_state(CATEGORY_LIMITS_CACHE_KEY, downloaded.to_json())
         return downloaded
+
+    def _load_last_attempt(self) -> datetime | None:
+        payload = self.cache.get_bot_state(CATEGORY_LIMITS_LAST_ATTEMPT_KEY)
+        if not payload:
+            return None
+        try:
+            parsed = datetime.fromisoformat(payload)
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
     def _load_cached(self) -> CategoryLimits | None:
         payload = self.cache.get_bot_state(CATEGORY_LIMITS_CACHE_KEY)

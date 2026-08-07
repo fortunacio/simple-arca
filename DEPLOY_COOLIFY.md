@@ -259,8 +259,10 @@ cargan ambas fuentes, el healthcheck del bot falla con el mensaje
    permanezca desactivado.
 7. Desplegar ambos servicios.
 8. Esperar que `bot` y `portal-worker` estén `healthy`.
-9. En una instalación nueva, ejecutar `/conectar 20383717419` y luego
-   `/configurar_arca` para guardar la clave mediante Tailscale.
+9. En una instalación nueva, ejecutar `/conectar 20383717419`. El bot debe verificar
+   el CUIT automáticamente con el certificado ya autorizado y responder que quedó
+   conectado. Luego ejecutar `/configurar_arca` para guardar la clave mediante
+   Tailscale.
 10. Confirmar que el alta termine en “Acceso guardado”.
 11. Ejecutar `/resumen` y `/facturas` y verificar la actualización de Monotributo e
    Ingresos Brutos.

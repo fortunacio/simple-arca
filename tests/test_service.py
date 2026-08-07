@@ -112,14 +112,50 @@ class ServiceTest(TestCase):
         self.assertEqual(self.db.get_connections(1001), [])
         self.assertEqual(len(self.db.get_connections(2002)), 1)
 
-    def test_connect_only_creates_pending_identity(self):
+    def test_connect_keeps_identity_pending_without_an_official_connector(self):
         output = self.service.dispatch("/conectar", 1001)
         self.assertIn("seguido de tu CUIT", output)
         output = self.service.dispatch("/conectar 20-12345678-6", 1001)
-        self.assertIn("Ahora falta autorizar", output)
+        self.assertIn("todavía no tiene configurada la conexión oficial", output)
         identity = self.db.get_tax_identity(1001)
         self.assertEqual(identity["represented_cuit"], "20123456786")
         self.assertEqual(identity["status"], "PENDING")
+
+    def test_connect_verifies_identity_automatically(self):
+        def verify(chat_id):
+            self.db.mark_tax_identity_verified(chat_id)
+
+        service = TaxMonitorService(
+            self.db,
+            live_synchronizers={"ARCA_PROFILE": verify},
+        )
+
+        output = service.dispatch("/conectar 20-12345678-6", 1001)
+
+        self.assertEqual(output, "Listo, conecté el CUIT 20-******78-6 con ARCA.")
+        self.assertEqual(self.db.get_tax_identity(1001)["status"], "VERIFIED")
+
+    def test_connect_can_retry_a_temporary_verification_failure(self):
+        attempts = 0
+
+        def verify(chat_id):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("ARCA no respondió")
+            self.db.mark_tax_identity_verified(chat_id)
+
+        service = TaxMonitorService(
+            self.db,
+            live_synchronizers={"ARCA_PROFILE": verify},
+        )
+
+        first = service.dispatch("/conectar 20-12345678-6", 1001)
+        second = service.dispatch("/conectar 20-12345678-6", 1001)
+
+        self.assertIn("Volvé a enviar el mismo comando", first)
+        self.assertIn("Listo, conecté", second)
+        self.assertEqual(attempts, 2)
 
     def test_connect_does_not_reset_a_verified_identity(self):
         self.db.ensure_user(1001)

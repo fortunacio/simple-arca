@@ -264,7 +264,7 @@ class TaxMonitorService:
             if identity["represented_cuit"] == cuit:
                 if identity["status"] == "VERIFIED":
                     return "Tu cuenta de ARCA ya está conectada."
-                return "Ese CUIT ya está cargado y la conexión sigue pendiente."
+                return self.verify_pending_identity(chat_id, cuit)
             return "Ya hay otro CUIT vinculado. Usá /desconectar antes de cambiarlo."
         try:
             self.db.set_pending_tax_identity(chat_id, cuit, self.arca_environment)
@@ -272,12 +272,30 @@ class TaxMonitorService:
             if "UNIQUE constraint failed" in str(exc):
                 return "Ese CUIT ya está vinculado a otro chat. Primero debe revocarse esa vinculación."
             raise
+        return self.verify_pending_identity(chat_id, cuit)
 
-        operator = mask_cuit(self.operator_cuit) if self.operator_cuit else "pendiente de configurar"
-        alias = self.certificate_alias or "pendiente de configurar"
-        return f"""Listo, guardé el CUIT {mask_cuit(cuit)}.
-
-Ahora falta autorizar el certificado {alias} en ARCA. La cuenta operadora es {operator}."""
+    def verify_pending_identity(self, chat_id: int, cuit: str) -> str:
+        synchronizer = self.live_synchronizers.get("ARCA_PROFILE")
+        if synchronizer is None:
+            return (
+                f"Guardé el CUIT {mask_cuit(cuit)}, pero este servidor todavía no "
+                "tiene configurada la conexión oficial con ARCA."
+            )
+        try:
+            synchronizer(chat_id)
+        except Exception:
+            LOGGER.exception("No se pudo verificar el CUIT con ARCA")
+            return (
+                f"Guardé el CUIT {mask_cuit(cuit)}, pero no pude verificarlo con "
+                "ARCA ahora. Volvé a enviar el mismo comando para reintentar."
+            )
+        identity = self.db.get_tax_identity(chat_id)
+        if identity is None or identity["status"] != "VERIFIED":
+            return (
+                f"Guardé el CUIT {mask_cuit(cuit)}, pero ARCA todavía no confirmó "
+                "la conexión. Volvé a enviar el mismo comando para reintentar."
+            )
+        return f"Listo, conecté el CUIT {mask_cuit(cuit)} con ARCA."
 
     def valid_snapshot(self, chat_id: int, provider: str, kind: str) -> dict | None:
         row = self.db.get_live_snapshot(chat_id, provider, kind)

@@ -761,7 +761,7 @@ class ServiceTest(TestCase):
                     self.assertIn(expected, output)
                     self.assertNotIn("WSFE", output)
 
-    def test_category_overview_does_not_treat_partial_history_as_zero_billing(self):
+    def test_category_overview_projects_from_the_registered_months(self):
         self._verified_user()
         self._snapshot(
             1001,
@@ -799,13 +799,17 @@ class ServiceTest(TestCase):
 
         output = service.category_overview(1001)
 
-        self.assertIn("Categoría proyectada: Todavía no disponible", output)
+        self.assertIn("Categoría proyectada: E", output)
         self.assertIn(
             "Facturación registrada en los últimos 12 meses: $3.000.000,00",
             output,
         )
+        self.assertIn(
+            "Promedio mensual registrado (1 mes): $3.000.000,00",
+            output,
+        )
         self.assertIn("Comprobantes incluidos: 1", output)
-        self.assertIn("historial de facturas anterior todavía no está completo", output)
+        self.assertIn("podrías bajar de F a E", output)
         self.assertNotIn("WSFE", output)
 
     def test_navigation_contains_only_clear_user_actions(self):

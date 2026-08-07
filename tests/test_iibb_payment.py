@@ -236,6 +236,14 @@ class IibbPaymentTest(TestCase):
         reply = self.bot.start(999)
         self.assertIn("no está habilitado", reply.text)
 
+    def test_disconnected_chat_cannot_continue_an_old_payment_callback(self):
+        with self.db.connect() as connection:
+            connection.execute("DELETE FROM tax_identities WHERE chat_id = 1001")
+
+        reply = self.bot.handle_callback("iibbpay:network:1002", 1001)
+
+        self.assertIn("cuenta está desconectada", reply.text)
+
     def test_worker_rejects_a_job_injected_for_an_unauthorized_chat(self):
         row = self.request()
         processor = IibbPaymentProcessor(

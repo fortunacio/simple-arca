@@ -497,7 +497,7 @@ class IibbPaymentBotService:
             return BotReply("El pago de Ingresos Brutos no está habilitado para este chat.", replace_message=replace)
         identity = self.store.db.get_tax_identity(chat_id)
         snapshot = self.store.db.get_live_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
-        if identity is None or snapshot is None:
+        if identity is None or identity["status"] != "VERIFIED" or snapshot is None:
             return BotReply("Primero necesito actualizar tu cuenta de Ingresos Brutos.", replace_message=replace)
         payload = json.loads(snapshot["payload_json"])
         obligation = payload.get("next_obligation")
@@ -535,6 +535,12 @@ class IibbPaymentBotService:
     def handle_callback(self, data: str, chat_id: int) -> BotReply:
         if not self._authorized(chat_id):
             return BotReply("El pago de Ingresos Brutos no está habilitado para este chat.")
+        identity = self.store.db.get_tax_identity(chat_id)
+        if identity is None or identity["status"] != "VERIFIED":
+            return BotReply(
+                "Tu cuenta está desconectada. Usá /conectar seguido de tu CUIT.",
+                replace_message=True,
+            )
         parts = data.split(":")
         if data == "iibbpay:start":
             return self.start(chat_id, replace=True)
@@ -564,7 +570,7 @@ class IibbPaymentBotService:
     def _choose_network(self, chat_id: int, network_id: str) -> BotReply:
         identity = self.store.db.get_tax_identity(chat_id)
         snapshot = self.store.db.get_live_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
-        if identity is None or snapshot is None:
+        if identity is None or identity["status"] != "VERIFIED" or snapshot is None:
             return BotReply("Primero necesito actualizar tu cuenta de Ingresos Brutos.", replace_message=True)
         payload = json.loads(snapshot["payload_json"])
         obligation = payload.get("next_obligation")

@@ -87,9 +87,21 @@ Para ejecutar comandos o pruebas sin Docker:
 
 ## Alta privada de CUIT y clave fiscal
 
-`/ayuda` permite generar un enlace de un solo uso y diez minutos de duración. El
+La conexión tiene dos partes distintas, pero sólo una requiere cargar la clave:
+
+- `/conectar CUIT` verifica automáticamente la identidad mediante el certificado ya
+  autorizado en ARCA. No requiere volver a autorizarlo en cada instalación.
+- `/configurar_arca` genera un enlace de un solo uso para guardar la clave fiscal. Esa
+  clave compartida permite consultar tanto Monotributo como Ingresos Brutos y se carga
+  una sola vez por instalación persistente.
+
+`/configurar_arca` genera un enlace de un solo uso y diez minutos de duración. El
 formulario manda el CUIT y la clave directamente a `portal-worker`; esos datos no
 pasan por Telegram. La clave se valida contra ARCA y sólo se conserva cifrada.
+
+`/desconectar` deja de consultar y mostrar la cuenta inmediatamente. Las facturas
+emitidas y la clave cifrada se conservan para permitir una reconexión sin repetir toda
+la configuración, pero no quedan accesibles mientras el CUIT está desvinculado.
 
 En la VPS el enlace usa HTTP sobre Tailscale. El cifrado del transporte lo aporta el
 túnel WireGuard de Tailscale y Docker publica los puertos exclusivamente en la IP del

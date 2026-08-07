@@ -184,7 +184,7 @@ versiona ni se descarga desde Git.
 El único seed de datos personales incorpora de manera idempotente el cliente Concept,
 la plantilla `Concept mensual` y la factura histórica `00001-00000073`. Por seguridad,
 sólo se ejecuta cuando ARCA termina de verificar el CUIT `20383717419`. En una
-instalación nueva, `/categoria` realiza esa verificación y aplica el seed inmediatamente,
+instalación nueva, `/conectar CUIT` realiza esa verificación y aplica el seed inmediatamente,
 sin reiniciar el servicio. Si la plantilla ya fue editada, una verificación posterior no
 la vuelve a sus valores iniciales.
 
@@ -261,7 +261,7 @@ cargan ambas fuentes, el healthcheck del bot falla con el mensaje
 8. Esperar que `bot` y `portal-worker` estén `healthy`.
 9. En una instalación nueva, ejecutar `/conectar 20383717419`. El bot debe verificar
    el CUIT automáticamente con el certificado ya autorizado y responder que quedó
-   conectado. Luego ejecutar `/configurar_arca` para guardar la clave mediante
+   verificado. Luego ejecutar `/configurar_arca` para guardar la clave mediante
    Tailscale.
 10. Confirmar que el alta termine en “Acceso guardado”.
 11. Ejecutar `/resumen` y `/facturas` y verificar la actualización de Monotributo e

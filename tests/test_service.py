@@ -108,9 +108,13 @@ class ServiceTest(TestCase):
                     "INSERT INTO connections(chat_id, provider, status) VALUES (?, 'ARCA_DFE', 'CONNECTED')",
                     (chat_id,),
                 )
-        self.service.dispatch("/desconectar", 1001)
+        output = self.service.dispatch("/desconectar", 1001)
         self.assertEqual(self.db.get_connections(1001), [])
         self.assertEqual(len(self.db.get_connections(2002)), 1)
+        self.assertIn("dejé de consultar y mostrar", output)
+        reply = self.service.navigation("payments", 1001)
+        self.assertIn("cuenta está desconectada", reply.text)
+        self.assertEqual(reply.keyboard, ())
 
     def test_connect_keeps_identity_pending_without_an_official_connector(self):
         output = self.service.dispatch("/conectar", 1001)
@@ -132,7 +136,7 @@ class ServiceTest(TestCase):
 
         output = service.dispatch("/conectar 20-12345678-6", 1001)
 
-        self.assertEqual(output, "Listo, conecté el CUIT 20-******78-6 con ARCA.")
+        self.assertEqual(output, "Listo, verifiqué el CUIT 20-******78-6 en ARCA.")
         self.assertEqual(self.db.get_tax_identity(1001)["status"], "VERIFIED")
 
     def test_connect_can_retry_a_temporary_verification_failure(self):
@@ -154,7 +158,7 @@ class ServiceTest(TestCase):
         second = service.dispatch("/conectar 20-12345678-6", 1001)
 
         self.assertIn("Volvé a enviar el mismo comando", first)
-        self.assertIn("Listo, conecté", second)
+        self.assertIn("Listo, verifiqué", second)
         self.assertEqual(attempts, 2)
 
     def test_connect_does_not_reset_a_verified_identity(self):
@@ -164,7 +168,7 @@ class ServiceTest(TestCase):
 
         output = self.service.dispatch("/conectar 20-12345678-6", 1001)
 
-        self.assertEqual(output, "Tu cuenta de ARCA ya está conectada.")
+        self.assertEqual(output, "Tu CUIT ya está verificado en ARCA.")
         self.assertEqual(self.db.get_tax_identity(1001)["status"], "VERIFIED")
 
     def test_connect_rejects_invalid_cuit(self):
@@ -727,6 +731,46 @@ class ServiceTest(TestCase):
                 "Facturas",
             ],
         )
+
+    def test_summary_groups_the_single_missing_portal_access(self):
+        self._verified_user()
+        self.db.upsert_connection(1001, "ARCA_CCMA", "LOGIN_REQUIRED")
+        self.db.upsert_connection(1001, "SANTA_FE_IIBB", "LOGIN_REQUIRED")
+        service = TaxMonitorService(
+            self.db,
+            live_synchronizers={
+                "ARCA_CCMA": lambda _chat_id: None,
+                "SANTA_FE_IIBB": lambda _chat_id: None,
+            },
+        )
+
+        reply = service.navigation("summary", 1001)
+
+        self.assertEqual(reply.text.count("falta guardar tu clave fiscal una sola vez"), 1)
+        self.assertNotIn("vuelvas a validar", reply.text)
+        self.assertIn(
+            ("Completar acceso", "tax:setup"),
+            [button for row in reply.keyboard for button in row],
+        )
+
+    def test_complete_access_button_creates_a_clickable_private_link(self):
+        self._verified_user()
+        service = TaxMonitorService(
+            self.db,
+            arca_enrollment_base_url="http://localhost:8090",
+        )
+
+        reply = service.navigation("setup", 1001)
+
+        buttons = [button for row in reply.keyboard for button in row]
+        self.assertEqual(buttons[0][0], "Abrir configuración de ARCA")
+        self.assertTrue(buttons[0][1].startswith("http://localhost:8090/arca/setup/"))
+
+    def test_disconnected_summary_has_no_private_navigation(self):
+        reply = self.service.navigation("summary", 1001)
+
+        self.assertIn("conectá y verificá", reply.text)
+        self.assertEqual(reply.keyboard, ())
 
     def test_summary_names_failed_sources_in_plain_language(self):
         self._verified_user()

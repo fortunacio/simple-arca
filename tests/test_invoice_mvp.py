@@ -304,3 +304,18 @@ class InvoiceMvpTest(TestCase):
             ("Volver al resumen", "tax:summary"),
             [button for row in reply.keyboard for button in row],
         )
+
+    def test_disconnected_account_cannot_view_saved_invoices(self):
+        bot = InvoiceBotService(
+            self.store, self.gateway(), today_provider=lambda: date(2026, 8, 5)
+        )
+        invoice = self.store.list_invoices(self.chat_id)[0]
+        with self.db.connect() as connection:
+            connection.execute("DELETE FROM tax_identities WHERE chat_id = ?", (self.chat_id,))
+
+        message_reply = bot.handle_message("/facturas", self.chat_id)
+        callback_reply = bot.handle_callback(f"inv:view:{invoice['id']}", self.chat_id)
+
+        self.assertIn("cuenta está desconectada", message_reply.text)
+        self.assertNotIn("00001-00000073", message_reply.text)
+        self.assertIn("cuenta está desconectada", callback_reply.text)

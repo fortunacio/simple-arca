@@ -72,7 +72,22 @@ class InvoiceBotService:
         command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower() if text.strip() else ""
         return command in self.COMMANDS or self.store.get_state(chat_id) is not None
 
+    def _connected(self, chat_id: int) -> bool:
+        identity = self.store.db.get_tax_identity(chat_id)
+        return identity is not None and identity["status"] == "VERIFIED"
+
+    @staticmethod
+    def _disconnected_reply(*, replace: bool = False) -> BotReply:
+        return BotReply(
+            "Tu cuenta está desconectada. Usá /conectar seguido de tu CUIT para "
+            "acceder a las facturas.",
+            replace_message=replace,
+        )
+
     def handle_message(self, text: str, chat_id: int) -> BotReply | None:
+        if not self._connected(chat_id):
+            self.store.clear_state(chat_id)
+            return self._disconnected_reply()
         stripped = text.strip()
         command = stripped.split(maxsplit=1)[0].split("@", 1)[0].lower() if stripped else ""
         if command == "/facturas":
@@ -94,6 +109,9 @@ class InvoiceBotService:
             return BotReply(f"No pude guardar ese dato: {exc}\n\nPodés cancelar con /cancelar.")
 
     def handle_callback(self, data: str, chat_id: int) -> BotReply:
+        if not self._connected(chat_id):
+            self.store.clear_state(chat_id)
+            return self._disconnected_reply(replace=True)
         parts = data.split(":")
         try:
             if parts[:2] == ["inv", "list"]:

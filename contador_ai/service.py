@@ -173,7 +173,7 @@ class TaxMonitorService:
                     "",
                     "Configuración",
                     "/configurar_arca — guardar o actualizar la clave fiscal",
-                    "/desconectar — desvincular la cuenta y borrar los datos guardados",
+                    "/desconectar — dejar de consultar y mostrar la cuenta",
                 ]
             )
         return "\n".join(lines)
@@ -252,7 +252,7 @@ class TaxMonitorService:
         identity = self.db.get_tax_identity(chat_id)
         if not argument:
             if identity and identity["status"] == "VERIFIED":
-                return "Tu cuenta de ARCA ya está conectada."
+                return "Tu CUIT ya está verificado en ARCA."
             if identity:
                 return "La conexión con ARCA todavía está pendiente."
             return "Enviá /conectar seguido de tu CUIT. Por ejemplo: /conectar 20123456786"
@@ -263,7 +263,7 @@ class TaxMonitorService:
         if identity:
             if identity["represented_cuit"] == cuit:
                 if identity["status"] == "VERIFIED":
-                    return "Tu cuenta de ARCA ya está conectada."
+                    return "Tu CUIT ya está verificado en ARCA."
                 return self.verify_pending_identity(chat_id, cuit)
             return "Ya hay otro CUIT vinculado. Usá /desconectar antes de cambiarlo."
         try:
@@ -295,7 +295,7 @@ class TaxMonitorService:
                 f"Guardé el CUIT {mask_cuit(cuit)}, pero ARCA todavía no confirmó "
                 "la conexión. Volvé a enviar el mismo comando para reintentar."
             )
-        return f"Listo, conecté el CUIT {mask_cuit(cuit)} con ARCA."
+        return f"Listo, verifiqué el CUIT {mask_cuit(cuit)} en ARCA."
 
     def valid_snapshot(self, chat_id: int, provider: str, kind: str) -> dict | None:
         row = self.db.get_live_snapshot(chat_id, provider, kind)
@@ -883,11 +883,32 @@ class TaxMonitorService:
         }
         now = datetime.now(timezone.utc)
         alerts: set[str] = set()
-        for row in self.db.get_connections(chat_id):
+        connections = list(self.db.get_connections(chat_id))
+        portal_providers = {"ARCA_CCMA", "ARCA_SETI", "SANTA_FE_IIBB"}
+        portal_needs_credentials = any(
+            str(row["provider"]) in portal_providers
+            and str(row["status"]) in {"LOGIN_REQUIRED", "CREDENTIALS_REQUIRED"}
+            for row in connections
+        )
+        if portal_needs_credentials:
+            had_portal_access = any(
+                str(row["provider"]) in portal_providers and row["last_success_at"]
+                for row in connections
+            )
+            alerts.add(
+                "El acceso guardado a Monotributo e Ingresos Brutos dejó de funcionar. "
+                "Volvé a guardar tu clave fiscal una vez."
+                if had_portal_access
+                else "Para revisar Monotributo e Ingresos Brutos, falta guardar tu "
+                "clave fiscal una sola vez."
+            )
+        for row in connections:
             provider = str(row["provider"])
             if provider not in self.live_synchronizers or provider not in labels:
                 continue
             status = str(row["status"])
+            if portal_needs_credentials and provider in portal_providers:
+                continue
             last_success = None
             try:
                 if row["last_success_at"]:
@@ -896,22 +917,27 @@ class TaxMonitorService:
                         last_success = last_success.replace(tzinfo=timezone.utc)
             except ValueError:
                 pass
-            if status in {"LOGIN_REQUIRED", "CREDENTIALS_REQUIRED"}:
-                alerts.add(f"{labels[provider]} necesita que vuelvas a validar el acceso.")
-            elif status != "CONNECTED":
+            if status != "CONNECTED":
                 alerts.add(f"No pude actualizar {labels[provider]}.")
             elif last_success is None or now - last_success > maximum_age[provider]:
                 alerts.add(f"{labels[provider]} lleva demasiado tiempo sin actualizarse.")
         return sorted(alerts)
 
-    @staticmethod
-    def _summary_keyboard() -> tuple[tuple[tuple[str, str], ...], ...]:
-        return (
+    def _summary_keyboard(self, chat_id: int) -> tuple[tuple[tuple[str, str], ...], ...]:
+        rows: list[tuple[tuple[str, str], ...]] = []
+        if any(
+            str(row["status"]) in {"LOGIN_REQUIRED", "CREDENTIALS_REQUIRED"}
+            for row in self.db.get_connections(chat_id)
+            if str(row["provider"]) in {"ARCA_CCMA", "ARCA_SETI", "SANTA_FE_IIBB"}
+        ):
+            rows.append((("Completar acceso", "tax:setup"),))
+        rows.extend((
             (("Pagos y vencimientos", "tax:payments"),),
             (("Categoría y facturación", "tax:category"),),
             (("Mensajes de ARCA", "tax:inbox"),),
             (("Facturas", "inv:list:0"),),
-        )
+        ))
+        return tuple(rows)
 
     @staticmethod
     def _back_keyboard() -> tuple[tuple[tuple[str, str], ...], ...]:
@@ -1195,10 +1221,11 @@ class TaxMonitorService:
         )
 
     def navigation(self, action: str, chat_id: int, *, replace: bool = False) -> BotReply:
+        identity = self.db.get_tax_identity(chat_id)
+        connected = identity is not None and identity["status"] == "VERIFIED"
         if action == "start":
-            identity = self.db.get_tax_identity(chat_id)
-            if identity is not None and identity["status"] == "VERIFIED":
-                return BotReply(self.summary(chat_id), self._summary_keyboard(), replace)
+            if connected:
+                return BotReply(self.summary(chat_id), self._summary_keyboard(chat_id), replace)
             return BotReply(self.help(chat_id), replace_message=replace)
         if action == "help":
             keyboard = (
@@ -1207,7 +1234,24 @@ class TaxMonitorService:
             )
             return BotReply(self.help(chat_id), keyboard, replace)
         if action == "summary":
-            return BotReply(self.summary(chat_id), self._summary_keyboard(), replace)
+            return BotReply(
+                self.summary(chat_id),
+                self._summary_keyboard(chat_id) if connected else (),
+                replace,
+            )
+        if not connected:
+            return BotReply(
+                "Tu cuenta está desconectada. Usá /conectar seguido de tu CUIT.",
+                replace_message=replace,
+            )
+        if action == "setup":
+            response = self.configure_arca(chat_id)
+            setup_url = next(
+                (line for line in response.splitlines() if line.startswith(("http://", "https://"))),
+                "",
+            )
+            keyboard = (("Abrir configuración de ARCA", setup_url),) if setup_url else ()
+            return BotReply(response, (keyboard,) if keyboard else (), replace)
         if action == "payments":
             keyboard = (
                 (("Pagar Ingresos Brutos", "iibbpay:start"),),
@@ -1412,8 +1456,14 @@ class TaxMonitorService:
             connection.execute("DELETE FROM notification_deliveries WHERE chat_id = ?", (chat_id,))
             connection.execute("DELETE FROM live_snapshots WHERE chat_id = ?", (chat_id,))
             connection.execute("DELETE FROM connections WHERE chat_id = ?", (chat_id,))
+            connection.execute("DELETE FROM onboarding_tokens WHERE chat_id = ?", (chat_id,))
+            connection.execute("DELETE FROM invoice_conversation_state WHERE chat_id = ?", (chat_id,))
             connection.execute("DELETE FROM tax_identities WHERE chat_id = ?", (chat_id,))
-        return "Listo. Desvinculé tu cuenta y borré los datos guardados."
+        return (
+            "Listo. Desvinculé tu cuenta y dejé de consultar y mostrar sus datos.\n\n"
+            "Conservé las facturas emitidas y el acceso cifrado para que puedas "
+            "reconectarla sin repetir toda la configuración."
+        )
 
     def dispatch(self, text: str, chat_id: int) -> str:
         self.db.ensure_user(chat_id)

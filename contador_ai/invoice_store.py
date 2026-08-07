@@ -473,6 +473,25 @@ class InvoiceStore:
             )
 
     def seed_concept_history(self, chat_id: int) -> None:
+        identity = self.db.get_tax_identity(chat_id)
+        if (
+            identity is None
+            or identity["status"] != "VERIFIED"
+            or identity["represented_cuit"] != "20383717419"
+        ):
+            return
+        with self.db.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT 1 FROM invoices
+                WHERE chat_id = ? AND emitter_cuit = '20383717419'
+                  AND invoice_type = 11 AND point_of_sale = 1 AND number = 73
+                LIMIT 1
+                """,
+                (chat_id,),
+            ).fetchone()
+        if existing is not None:
+            return
         self.db.ensure_user(chat_id)
         client = self.upsert_client(
             chat_id,

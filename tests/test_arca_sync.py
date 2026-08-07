@@ -8,6 +8,7 @@ from unittest import TestCase
 from contador_ai.arca.models import IssuedInvoice, TaxCategory, TaxpayerProfile
 from contador_ai.arca.sync import ArcaInvoicesSynchronizer, ArcaProfileSynchronizer
 from contador_ai.db import Database
+from contador_ai.invoice_store import InvoiceStore
 from contador_ai.service import TaxMonitorService
 
 
@@ -54,30 +55,51 @@ class ArcaSyncTest(TestCase):
         self.tempdir.cleanup()
 
     def test_successful_query_is_required_to_verify_identity(self):
+        verified = []
         synchronizer = ArcaProfileSynchronizer(
             self.db,
             FakeWsaa(),
             FakePadron("20123456786"),
             snapshot_ttl=timedelta(minutes=15),
+            on_verified=lambda chat_id, cuit: verified.append((chat_id, cuit)),
         )
         synchronizer.sync_chat(1001)
         identity = self.db.get_tax_identity(1001)
         self.assertEqual(identity["status"], "VERIFIED")
+        self.assertEqual(verified, [(1001, "20123456786")])
         response = TaxMonitorService(self.db).dispatch("/categoria", 1001)
         self.assertIn("Tu categoría de monotributo", response)
         self.assertIn("F\n  Vigente desde agosto de 2026", response)
 
     def test_mismatched_cuit_never_verifies_identity(self):
+        verified = []
         synchronizer = ArcaProfileSynchronizer(
             self.db,
             FakeWsaa(),
             FakePadron("20999999999"),
+            on_verified=lambda chat_id, cuit: verified.append((chat_id, cuit)),
         )
         with self.assertRaisesRegex(Exception, "CUIT distinto"):
             synchronizer.sync_chat(1001)
         identity = self.db.get_tax_identity(1001)
         self.assertEqual(identity["status"], "PENDING")
+        self.assertEqual(verified, [])
         self.assertEqual(self.db.get_connections(1001)[0]["status"], "ERROR")
+
+    def test_verification_can_seed_personal_invoice_history_immediately(self):
+        self.db.set_pending_tax_identity(1001, "20383717419", "production")
+        store = InvoiceStore(self.db)
+        synchronizer = ArcaProfileSynchronizer(
+            self.db,
+            FakeWsaa(),
+            FakePadron("20383717419"),
+            on_verified=lambda chat_id, _cuit: store.seed_concept_history(chat_id),
+        )
+
+        synchronizer.sync_chat(1001)
+
+        self.assertEqual(store.invoice_count(1001), 1)
+        self.assertEqual(store.list_templates(1001)[0]["name"], "Concept mensual")
 
     def test_a_failed_refresh_does_not_disconnect_a_verified_identity(self):
         self.db.mark_tax_identity_verified(1001)

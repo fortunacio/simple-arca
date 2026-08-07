@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from ..db import Database
@@ -16,12 +18,16 @@ from .wsfe import WSFE_SERVICE, WsfeClient
 from .wsaa import WsaaClient
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 @dataclass
 class ArcaProfileSynchronizer:
     db: Database
     wsaa: WsaaClient
     padron: ConstanciaInscripcionClient
     snapshot_ttl: timedelta = timedelta(minutes=15)
+    on_verified: Callable[[int, str], None] | None = None
 
     def sync_chat(self, chat_id: int) -> None:
         identity = self.db.get_tax_identity(chat_id)
@@ -64,6 +70,14 @@ class ArcaProfileSynchronizer:
             "CONNECTED",
             last_success_at=fetched_at.isoformat(),
         )
+        if self.on_verified is not None:
+            try:
+                self.on_verified(chat_id, represented_cuit)
+            except Exception:
+                LOGGER.exception(
+                    "Falló la inicialización posterior a verificar el CUIT para chat_id=%s",
+                    chat_id,
+                )
 
 
 @dataclass

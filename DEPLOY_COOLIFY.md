@@ -55,9 +55,9 @@ El Compose de producción:
 - incluye healthchecks para ambos servicios;
 - no declara redes personalizadas ni nombres fijos de contenedor.
 
-## Variables secretas
+## Variables sensibles y botón `Lock`
 
-Marcar como secretas en Coolify:
+Estas cuatro variables contienen secretos:
 
 | Variable | Contenido |
 |---|---|
@@ -66,19 +66,43 @@ Marcar como secretas en Coolify:
 | `ARCA_CERTIFICATE_B64` | Certificado de producción codificado en base64 |
 | `ARCA_PRIVATE_KEY_B64` | Clave privada de producción codificada en base64 |
 
-Para obtener los dos valores base64 localmente sin modificar los archivos:
+Para copiarlos desde macOS sin incluir accidentalmente el símbolo `%` del prompt de
+zsh, ejecutar cada comando por separado y pegar inmediatamente el portapapeles en la
+variable correspondiente de Coolify:
 
 ```bash
-base64 < secrets/simplearcaprod_7d17b50e91a73602.crt | tr -d '\n'
-base64 < secrets/simplearcaprod.key | tr -d '\n'
+base64 < secrets/simplearcaprod_7d17b50e91a73602.crt | tr -d '\n' | pbcopy
+base64 < secrets/simplearcaprod.key | tr -d '\n' | pbcopy
 ```
+
+El valor pegado debe contener únicamente caracteres base64. No debe terminar en `%`:
+ese carácter es el prompt de zsh, no forma parte del certificado ni de la clave.
 
 No pegar esos valores en el repositorio, logs, Telegram ni documentación. Durante el
 arranque se escriben en `/run/contador-secrets`, que es memoria temporal, con modo
 `0600`. El entrypoint elimina las variables del entorno antes de ejecutar Python.
 
-En Coolify, marcar los cuatro valores como `Secret`, habilitar `Runtime` y deshabilitar
-`Build Variable`: la imagen no los necesita para construirse.
+En la vista normal de Coolify, para cada una de las cuatro:
+
+1. pegar el valor únicamente en **Production Environment Variables**;
+2. desmarcar `Available at Buildtime`;
+3. dejar marcado `Available at Runtime`;
+4. dejar `Is Multiline?` e `Is Literal?` desmarcados;
+5. presionar `Update`;
+6. comprobar el valor y, cuando la primera instalación funcione, presionar `Lock`.
+
+`Lock` es irreversible desde la interfaz: si después hay que rotar o corregir el
+secreto, se elimina la variable y se vuelve a crear. El icono del ojo sólo oculta o
+muestra temporalmente el campo; no equivale a bloquearlo.
+
+No activar `Use Docker Build Secrets`. Esa opción es para secretos que necesita el
+proceso de construcción; esta aplicación sólo los necesita al ejecutarse. Las demás
+variables del proyecto tampoco necesitan `Available at Buildtime`: pueden quedar
+únicamente con `Available at Runtime`.
+
+No cargar valores en **Preview Deployments Environment Variables**: este proyecto no
+usa despliegues de preview y no debe existir una segunda instancia con el mismo token
+de Telegram.
 
 ## Variables obligatorias
 
@@ -151,6 +175,24 @@ Configurar backups de ambos volúmenes desde Coolify. Antes de migrar datos, det
 los dos servicios para obtener una copia consistente. No copiar únicamente el archivo
 SQLite mientras el bot está escribiendo.
 
+### Primer arranque y seed
+
+En un volumen `tax_data` vacío, ambos servicios ejecutan una inicialización
+idempotente que crea `/data/tax_monitor.sqlite3` y todas sus tablas. La base no se
+versiona ni se descarga desde Git.
+
+El único seed de datos personales incorpora de manera idempotente el cliente Concept,
+la plantilla `Concept mensual` y la factura histórica `00001-00000073`. Por seguridad,
+sólo se ejecuta cuando ARCA termina de verificar el CUIT `20383717419`. En una
+instalación nueva, `/categoria` realiza esa verificación y aplica el seed inmediatamente,
+sin reiniciar el servicio. Si la plantilla ya fue editada, una verificación posterior no
+la vuelve a sus valores iniciales.
+
+No se precargan credenciales, sesiones, snapshots tributarios, mensajes, pagos, VEP,
+borradores ni auditoría del Mac. Las consultas oficiales vuelven a obtener el estado
+actual; la clave fiscal se guarda nuevamente con `/configurar_arca` en el volumen
+`portal_state`.
+
 ## Red y formulario privado
 
 El host publica:
@@ -177,8 +219,15 @@ contiene exactamente las variables de este host. En Coolify:
 1. copiar sus variables en `Environment Variables`;
 2. reemplazar `CHAT_ID` por el mismo chat configurado localmente;
 3. reemplazar los cuatro valores `REEMPLAZAR_*`;
-4. marcar únicamente esos cuatro como secretos y sólo de ejecución;
+4. dejar todas las variables sólo en `Available at Runtime` y, después del primer
+   despliegue correcto, usar `Lock` únicamente en los cuatro secretos;
 5. guardar y volver a renderizar el Compose antes de desplegar.
+
+Coolify puede no crear automáticamente las variables que sólo aparecen en la sección
+`ports` del Compose. Si faltan `TAILSCALE_BIND_IP`,
+`ARCA_ENROLLMENT_HOST_PORT` o `CCMA_NOVNC_HOST_PORT`, agregarlas con `+ Add` o desde
+`Developer view` usando los valores de la plantilla. Deben existir en Production,
+únicamente en Runtime y no deben bloquearse con `Lock`.
 
 No cargar en Coolify `TAX_MONITOR_DB`, `CCMA_SESSION_DIR`,
 `SESSION_ENCRYPTION_KEY_FILE`, `ARCA_CERTIFICATE_PATH`, `ARCA_PRIVATE_KEY_PATH`,
@@ -230,6 +279,12 @@ Desde el repositorio, antes de desplegar:
 En la VPS, el healthcheck interno del portal consulta `http://127.0.0.1:8090/health`.
 El bot valida que la base SQLite pueda abrirse. Los endpoints de salud no contienen
 datos personales ni secretos.
+
+Si un build se cancela mientras Playwright descarga Chromium, esperar a que Coolify
+termine de cerrar el contenedor auxiliar antes de iniciar otro. Dos builds superpuestos
+pueden dejar a BuildKit rechazando la segunda sesión con `only one connection allowed`;
+cuando no queda ningún build activo y `docker buildx inspect default --bootstrap`
+informa `running`, un redeploy limpio puede reutilizar la caché y continuar.
 
 ## Actualización y rollback
 

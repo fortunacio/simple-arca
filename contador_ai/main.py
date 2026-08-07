@@ -170,6 +170,9 @@ def build_live_synchronizers(db: Database):
             db=db,
             wsaa=tickets,
             padron=ConstanciaInscripcionClient(environment),
+            on_verified=lambda chat_id, _represented_cuit: InvoiceStore(
+                db
+            ).seed_concept_history(chat_id),
         )
         dfe = ArcaDfeSynchronizer(
             db=db,

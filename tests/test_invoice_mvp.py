@@ -179,6 +179,22 @@ class InvoiceMvpTest(TestCase):
         self.db.ensure_user(2002)
         self.assertEqual(self.store.invoice_count(2002), 0)
 
+    def test_seed_does_not_overwrite_an_edited_template(self):
+        template = self.store.list_templates(self.chat_id)[0]
+        self.store.create_template(
+            self.chat_id,
+            template["client_id"],
+            "Concept mensual",
+            "Servicio editado por el usuario",
+            "3500000",
+        )
+
+        self.store.seed_concept_history(self.chat_id)
+
+        preserved = self.store.list_templates(self.chat_id)[0]
+        self.assertEqual(preserved["description"], "Servicio editado por el usuario")
+        self.assertEqual(preserved["unit_price"], "3500000.00")
+
     def test_monthly_due_rule(self):
         self.assertEqual(monthly_dates(date(2026, 8, 5))[2], date(2026, 8, 15))
         self.assertEqual(monthly_dates(date(2026, 8, 20))[2], date(2026, 8, 27))

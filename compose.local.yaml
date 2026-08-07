@@ -2,6 +2,8 @@ services:
   bot:
     env_file:
       - .env
+    environment:
+      SESSION_ENCRYPTION_KEY_FILE: "${SESSION_ENCRYPTION_KEY_FILE:-/run/local-secrets/session_encryption.key}"
     volumes:
       - type: bind
         source: ./secrets
@@ -12,6 +14,8 @@ services:
     profiles: ["portal"]
     env_file:
       - .env
+    environment:
+      SESSION_ENCRYPTION_KEY_FILE: "${SESSION_ENCRYPTION_KEY_FILE:-/run/local-secrets/session_encryption.key}"
     volumes:
       - type: bind
         source: ./secrets

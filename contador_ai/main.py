@@ -303,25 +303,6 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     db = build_database()
-    arca_environment = build_arca_environment()
-    service = TaxMonitorService(
-        db,
-        operator_cuit=os.environ.get("ARCA_OPERATOR_CUIT", ""),
-        certificate_alias=os.environ.get("ARCA_CERTIFICATE_ALIAS", ""),
-        arca_environment=arca_environment.value,
-        live_synchronizers=build_live_synchronizers(db),
-        category_limits_provider=ArcaCategoryLimitsProvider(
-            db,
-            refresh_after=timedelta(
-                seconds=int(
-                    os.environ.get("ARCA_CATEGORY_LIMITS_REFRESH_SECONDS", "86400")
-                )
-            ),
-        ).current,
-        ccma_login_url=os.environ.get("CCMA_LOGIN_URL", ""),
-        arca_enrollment_base_url=arca_enrollment_base_url(),
-    )
-
     if args.init_db:
         print(f"Base inicializada en {db.path}")
         return
@@ -351,6 +332,25 @@ def main() -> None:
             raise SystemExit(f"No pude importar el historial mensual: {exc}") from exc
         print(f"Meses importados: {imported}")
         return
+
+    arca_environment = build_arca_environment()
+    service = TaxMonitorService(
+        db,
+        operator_cuit=os.environ.get("ARCA_OPERATOR_CUIT", ""),
+        certificate_alias=os.environ.get("ARCA_CERTIFICATE_ALIAS", ""),
+        arca_environment=arca_environment.value,
+        live_synchronizers=build_live_synchronizers(db),
+        category_limits_provider=ArcaCategoryLimitsProvider(
+            db,
+            refresh_after=timedelta(
+                seconds=int(
+                    os.environ.get("ARCA_CATEGORY_LIMITS_REFRESH_SECONDS", "86400")
+                )
+            ),
+        ).current,
+        ccma_login_url=os.environ.get("CCMA_LOGIN_URL", ""),
+        arca_enrollment_base_url=arca_enrollment_base_url(),
+    )
     if args.print_status:
         print(service.status(args.chat_id))
         return

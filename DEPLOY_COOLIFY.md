@@ -276,6 +276,8 @@ El contenedor convierte `SESSION_ENCRYPTION_KEY` en un archivo temporal al arran
 Por eso `SESSION_ENCRYPTION_KEY_FILE` debe quedar sin configurar en Coolify. Si se
 cargan ambas fuentes, el healthcheck del bot falla con el mensaje
 `Configurar sólo SESSION_ENCRYPTION_KEY o SESSION_ENCRYPTION_KEY_FILE`.
+El Compose de producción ya no pasa la variable de archivo; el override local es el
+único que la configura para leer `secrets/session_encryption.key`.
 
 ## Primer despliegue
 

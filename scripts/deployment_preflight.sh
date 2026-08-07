@@ -125,6 +125,11 @@ if winston_ports != expected_winston_ports:
 for rendered_name, rendered in (("producción", production), ("winston", winston)):
     for service_name, service in rendered.get("services", {}).items():
         environment = service.get("environment") or {}
+        if "SESSION_ENCRYPTION_KEY_FILE" in environment:
+            errors.append(
+                f"{rendered_name}/{service_name}: producción no debe recibir "
+                "SESSION_ENCRYPTION_KEY_FILE"
+            )
         if environment.get("SESSION_ENCRYPTION_KEY") and environment.get(
             "SESSION_ENCRYPTION_KEY_FILE"
         ):

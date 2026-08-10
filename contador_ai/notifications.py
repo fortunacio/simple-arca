@@ -53,11 +53,13 @@ class TaxNotificationMonitor:
         *,
         now: Callable[[], datetime] | None = None,
         refresh_interval: timedelta = timedelta(hours=6),
+        broken_reminder_interval: timedelta = timedelta(hours=1),
     ):
         self.db = db
         self.service = service
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.refresh_interval = refresh_interval
+        self.broken_reminder_interval = broken_reminder_interval
 
     @staticmethod
     def _parse_datetime(value: str | None) -> datetime | None:
@@ -103,9 +105,23 @@ class TaxNotificationMonitor:
         sections: dict[str, list[str]] = {}
         deliveries: list[NotificationDelivery] = []
 
-        def add(section: str, event_key: str, fingerprint: str, line: str) -> None:
-            if self.db.notification_was_sent(chat_id, event_key, fingerprint):
-                return
+        def add(
+            section: str,
+            event_key: str,
+            fingerprint: str,
+            line: str,
+            *,
+            repeat_after: timedelta | None = None,
+        ) -> None:
+            if repeat_after is None:
+                if self.db.notification_was_sent(chat_id, event_key, fingerprint):
+                    return
+            else:
+                last_sent = self._parse_datetime(
+                    self.db.notification_sent_at(chat_id, event_key, fingerprint)
+                )
+                if last_sent is not None and now - last_sent < repeat_after:
+                    return
             sections.setdefault(section, []).append(line)
             deliveries.append(NotificationDelivery(event_key, fingerprint))
 
@@ -301,6 +317,7 @@ class TaxNotificationMonitor:
                 if had_portal_access
                 else "• Falta completar la conexión una sola vez para consultar "
                 "Monotributo e Ingresos Brutos.",
+                repeat_after=self.broken_reminder_interval,
             )
         for provider, maximum_age in STALE_AFTER.items():
             if provider not in self.service.live_synchronizers:
@@ -328,6 +345,7 @@ class TaxNotificationMonitor:
                 f"stale:{provider}",
                 fingerprint,
                 f"• {connection_labels.get(provider, PROVIDERS[provider])} {reason}.",
+                repeat_after=self.broken_reminder_interval,
             )
 
         if not deliveries:
@@ -338,9 +356,11 @@ class TaxNotificationMonitor:
         return NotificationBatch("\n".join(lines), tuple(deliveries))
 
     def mark_sent(self, chat_id: int, batch: NotificationBatch) -> None:
+        sent_at = self.now().isoformat()
         for delivery in batch.deliveries:
             self.db.mark_notification_sent(
                 chat_id,
                 delivery.event_key,
                 delivery.fingerprint,
+                sent_at,
             )

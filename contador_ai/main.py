@@ -398,6 +398,11 @@ def main() -> None:
                 refresh_interval=timedelta(
                     seconds=int(os.environ.get("AUTOMATIC_SYNC_INTERVAL_SECONDS", "21600"))
                 ),
+                broken_reminder_interval=timedelta(
+                    seconds=int(
+                        os.environ.get("AUTOMATIC_BROKEN_REMINDER_SECONDS", "3600")
+                    )
+                ),
             )
             if os.environ.get("AUTOMATIC_MONITOR_ENABLED", "true").strip().lower()
             in {"1", "true", "yes"}

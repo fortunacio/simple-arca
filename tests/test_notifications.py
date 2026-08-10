@@ -229,3 +229,79 @@ class NotificationMonitorTest(TestCase):
 
         self.assertEqual(batch.text.count("completar la conexión una sola vez"), 1)
         self.assertNotIn("volver a validar", batch.text)
+
+    def test_broken_access_is_reminded_hourly_until_it_recovers(self):
+        self.db.set_pending_tax_identity(1001, "20383717419", "production")
+        self.db.mark_tax_identity_verified(1001)
+        self.db.upsert_connection(1001, "ARCA_CCMA", "LOGIN_REQUIRED")
+        self.db.upsert_connection(1001, "SANTA_FE_IIBB", "LOGIN_REQUIRED")
+        current = [self.now]
+        monitor = TaxNotificationMonitor(
+            self.db,
+            self.service,
+            now=lambda: current[0],
+            broken_reminder_interval=timedelta(hours=1),
+        )
+
+        first = monitor.check_chat(1001)
+        self.assertIsNotNone(first)
+        monitor.mark_sent(1001, first)
+
+        current[0] += timedelta(minutes=59)
+        self.assertIsNone(monitor.check_chat(1001))
+
+        current[0] += timedelta(minutes=1)
+        reminder = monitor.check_chat(1001)
+        self.assertIsNotNone(reminder)
+        self.assertIn("Falta completar la conexión", reminder.text)
+        monitor.mark_sent(1001, reminder)
+
+        self.db.mark_portal_access_verified(
+            1001,
+            "20383717419",
+            current[0].isoformat(),
+        )
+        for provider in ("ARCA_CCMA", "SANTA_FE_IIBB"):
+            self.db.upsert_connection(
+                1001,
+                provider,
+                "CONNECTED",
+                current[0].isoformat(),
+            )
+        self.assertIsNone(monitor.check_chat(1001))
+
+    def test_stale_service_is_reminded_hourly_until_it_recovers(self):
+        stale_time = self.now - timedelta(hours=13)
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_CCMA",
+            "account_status",
+            stale_time.isoformat(),
+            (stale_time + timedelta(days=1)).isoformat(),
+            json.dumps({"debtor_total": "0", "overdue": [], "upcoming": []}),
+        )
+        self.db.upsert_connection(1001, "ARCA_CCMA", "ERROR")
+        current = [self.now]
+        monitor = TaxNotificationMonitor(
+            self.db,
+            self.service,
+            now=lambda: current[0],
+            broken_reminder_interval=timedelta(hours=1),
+        )
+
+        first = monitor.check_chat(1001)
+        self.assertIsNotNone(first)
+        monitor.mark_sent(1001, first)
+        current[0] += timedelta(hours=1)
+        reminder = monitor.check_chat(1001)
+        self.assertIsNotNone(reminder)
+        self.assertIn("Monotributo lleva demasiado tiempo sin actualizarse", reminder.text)
+        monitor.mark_sent(1001, reminder)
+
+        self.db.upsert_connection(
+            1001,
+            "ARCA_CCMA",
+            "CONNECTED",
+            current[0].isoformat(),
+        )
+        self.assertIsNone(monitor.check_chat(1001))

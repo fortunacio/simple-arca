@@ -382,6 +382,22 @@ class Database:
             ).fetchone()
         return row is not None
 
+    def notification_sent_at(
+        self,
+        chat_id: int,
+        event_key: str,
+        fingerprint: str,
+    ) -> str | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT sent_at FROM notification_deliveries
+                WHERE chat_id = ? AND event_key = ? AND fingerprint = ?
+                """,
+                (chat_id, event_key, fingerprint),
+            ).fetchone()
+        return str(row["sent_at"]) if row is not None else None
+
     def has_notification_event(self, chat_id: int, event_key: str) -> bool:
         with self.connect() as connection:
             row = connection.execute(
@@ -398,15 +414,18 @@ class Database:
         chat_id: int,
         event_key: str,
         fingerprint: str,
+        sent_at: str | None = None,
     ) -> None:
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT OR IGNORE INTO notification_deliveries(
-                    chat_id, event_key, fingerprint
-                ) VALUES (?, ?, ?)
+                INSERT INTO notification_deliveries(
+                    chat_id, event_key, fingerprint, sent_at
+                ) VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                ON CONFLICT(chat_id, event_key, fingerprint) DO UPDATE SET
+                    sent_at = excluded.sent_at
                 """,
-                (chat_id, event_key, fingerprint),
+                (chat_id, event_key, fingerprint, sent_at),
             )
 
     def ensure_user(self, chat_id: int) -> None:

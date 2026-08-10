@@ -181,6 +181,7 @@ valores por defecto son:
 | Proceso | Intervalo |
 |---|---:|
 | Evaluación de alertas | 300 segundos |
+| Recordatorio de servicios rotos | 3.600 segundos |
 | APIs oficiales | 21.600 segundos |
 | Portales ARCA/Santa Fe | 21.600 segundos |
 | Tabla oficial de topes | 86.400 segundos |
@@ -195,10 +196,14 @@ exclusivamente el worker en su propio ciclo.
 Se recuerdan vencimientos a 14, 7, 3, 1 y 0 días. Una fuente se considera atrasada a
 las 12 horas para cuentas y pagos, o a las 30 horas para perfil, mensajes y facturas.
 
-Cada evento se guarda con una clave y una huella. El mismo aviso no se envía dos veces
-mientras su contenido no cambie. Las notificaciones usan las mismas reglas de
-conciliación que `/resumen` y nunca muestran simultáneamente “deuda vencida” y “no
-vuelvas a pagar” para el mismo pago.
+Cada evento se guarda con una clave y una huella. Deudas, vencimientos, mensajes y
+cambios de categoría no se repiten mientras su contenido no cambie. Una pérdida de
+acceso o una fuente desactualizada sí se vuelve a enviar cada hora mientras el problema
+continúe; al recuperarse deja de generar recordatorios. El intervalo se configura con
+`AUTOMATIC_BROKEN_REMINDER_SECONDS` y por defecto es `3600`.
+
+Las notificaciones usan las mismas reglas de conciliación que `/resumen` y nunca
+muestran simultáneamente “deuda vencida” y “no vuelvas a pagar” para el mismo pago.
 
 ## Alta de credenciales
 

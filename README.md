@@ -30,7 +30,8 @@ oficiales con un worker aislado para los portales que requieren CUIT y clave fis
 
 - Actualización de APIs oficiales cada seis horas.
 - Actualización de Monotributo, pagos e Ingresos Brutos cada seis horas.
-- Evaluación de alertas cada cinco minutos, con deduplicación persistente.
+- Evaluación de alertas cada cinco minutos. Los servicios rotos se recuerdan cada
+  hora hasta recuperarse; el resto de los eventos conserva deduplicación persistente.
 - Verificación diaria de la tabla oficial de topes de Monotributo.
 - Recordatorios de vencimiento a 14, 7, 3, 1 y 0 días.
 - Avisos si una fuente deja de actualizarse.

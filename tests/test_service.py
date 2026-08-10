@@ -666,11 +666,126 @@ class ServiceTest(TestCase):
         self.assertIn("$154.843,13 está confirmado", output)
         self.assertIn("ARCA todavía muestra un saldo de $125.633,44", output)
         self.assertIn("No vuelvas a pagarlo por ahora", output)
-        self.assertIn("Próximo pago — jueves 20/08/2026", output)
-        self.assertIn("Total: $193.666,21", output)
-        self.assertIn("otros impuestos nacionales", output)
+        self.assertIn("Necesita atención", output)
+        self.assertIn("Próximos vencimientos", output)
+        self.assertIn("jueves 20/08/2026 — dentro de 14 días", output)
+        self.assertIn("• Total: $193.666,21", output)
+        self.assertIn("• Incluye: Ingresos Brutos y Monotributo", output)
+        self.assertIn("Este resumen cubre Monotributo", output)
         for forbidden in ("SETI", "CCMA", "VEPAI", "sub-VEP", "imputación"):
             self.assertNotIn(forbidden, output)
+
+    def test_summary_shows_each_tax_when_due_dates_are_different(self):
+        self._verified_user()
+        self._snapshot(
+            1001,
+            "ARCA_CCMA",
+            "account_status",
+            {
+                "debtor_total": "0",
+                "upcoming": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "balance": "150784.21",
+                    }
+                ],
+            },
+        )
+        self._snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            {
+                "next_obligation": {
+                    "period": "2026-07",
+                    "due_date": "2026-08-25",
+                    "amount": "42882.00",
+                },
+                "vepai": {"reconciliation": {"status": "COMPLETE"}},
+            },
+        )
+
+        output = TaxMonitorService(self.db, today=date(2026, 8, 10)).summary(1001)
+
+        self.assertIn("jueves 20/08/2026 — dentro de 10 días", output)
+        self.assertIn("• Monotributo: $150.784,21", output)
+        self.assertIn("martes 25/08/2026 — dentro de 15 días", output)
+        self.assertIn("• Ingresos Brutos: $42.882,00", output)
+        self.assertNotIn("Período:", output)
+
+    def test_summary_is_a_dashboard_when_everything_is_clear(self):
+        self._verified_user()
+        self._snapshot(
+            1001,
+            "ARCA_CCMA",
+            "account_status",
+            {
+                "debtor_total": "0",
+                "upcoming": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "balance": "150784.21",
+                    }
+                ],
+            },
+        )
+        self._snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            {
+                "next_obligation": {
+                    "period": "2026-07",
+                    "due_date": "2026-08-20",
+                    "amount": "42882.00",
+                },
+                "vepai": {"reconciliation": {"status": "COMPLETE"}},
+            },
+        )
+        self._snapshot(
+            1001,
+            "ARCA_DFE",
+            "unread_communications",
+            {"communications": []},
+        )
+        self._snapshot(
+            1001,
+            "ARCA_PROFILE",
+            "taxpayer_profile",
+            {"categories": [{"description": "F", "status": "ACTIVO"}]},
+        )
+        self._snapshot(
+            1001,
+            "ARCA_INVOICES",
+            "issued_invoices",
+            {
+                "window_from": "2025-08-01",
+                "window_to": "2026-07-31",
+                "history_complete": True,
+                "complete_months": [f"2026-{month:02d}" for month in range(1, 8)],
+                "monthly_totals": [
+                    {"period": f"2026-{month:02d}", "total": "3300000"}
+                    for month in range(1, 8)
+                ],
+            },
+        )
+
+        output = TaxMonitorService(
+            self.db,
+            today=date(2026, 8, 10),
+            category_limits_provider=lambda _today: TEST_CATEGORY_LIMITS,
+        ).summary(1001)
+
+        self.assertIn("🟢 Todo en orden", output)
+        self.assertIn("🟢 Sin deuda vencida de Monotributo.", output)
+        self.assertIn("🟢 Sin deuda vencida de Ingresos Brutos.", output)
+        self.assertIn("🟢 Sin mensajes nuevos de ARCA.", output)
+        self.assertIn("🟢 Categoría F; la proyección sigue en F.", output)
+        self.assertIn("jueves 20/08/2026 — dentro de 10 días", output)
+        self.assertIn("• Total: $193.666,21", output)
+        self.assertIn("• Incluye: Ingresos Brutos y Monotributo", output)
 
     def test_summary_treats_unmatched_debt_as_debt_to_pay(self):
         self._verified_user()

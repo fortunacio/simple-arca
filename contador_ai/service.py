@@ -1097,8 +1097,9 @@ class TaxMonitorService:
         if identity is None or identity["status"] != "VERIFIED":
             return "Para empezar, conectá y verificá tu cuenta de ARCA con /conectar."
 
-        lines = ["Resumen", "", "Con lo que hoy puedo revisar:"]
+        lines = ["Resumen"]
         attention: list[str] = []
+        clear_statuses: list[str] = []
         source_alerts = self._plain_source_alerts(chat_id)
         pending = self._confirmed_payment_pending(chat_id)
         ccma = self.valid_snapshot(chat_id, "ARCA_CCMA", "account_status")
@@ -1124,6 +1125,8 @@ class TaxMonitorService:
                     )
                 else:
                     attention.append(f"🔴 Tenés {format_money(debt)} de Monotributo vencido.")
+            else:
+                clear_statuses.append("🟢 Sin deuda vencida de Monotributo.")
         elif (
             "ARCA_CCMA" in self.live_synchronizers
             and not any("Monotributo" in item for item in source_alerts)
@@ -1138,6 +1141,8 @@ class TaxMonitorService:
                 attention.append(
                     f"🔴 Ingresos Brutos tiene {len(missing)} período(s) sin pago identificado."
                 )
+            elif isinstance(reconciliation, dict) and reconciliation.get("status") == "COMPLETE":
+                clear_statuses.append("🟢 Sin deuda vencida de Ingresos Brutos.")
         elif (
             "SANTA_FE_IIBB" in self.live_synchronizers
             and not any("Ingresos Brutos" in item for item in source_alerts)
@@ -1146,30 +1151,46 @@ class TaxMonitorService:
 
         next_items = self._next_payment_items(chat_id)
         if next_items:
-            earliest = next_items[0][0]
-            same_day = [item for item in next_items if item[0] == earliest]
-            try:
-                due = date.fromisoformat(earliest)
-                days = (due - self.today).days
-                timing = "hoy" if days == 0 else (
-                    "mañana" if days == 1 else (
-                        f"dentro de {days} días" if days > 1 else f"hace {-days} días"
-                    )
+            grouped: dict[str, dict[str, object]] = {}
+            for due_date, label, _period, amount in next_items:
+                entry = grouped.setdefault(
+                    due_date,
+                    {"total": Decimal("0"), "labels": []},
                 )
-                heading = "Próximo pago" if days >= 0 else "Pago vencido"
-                due_label = f"{WEEKDAYS[due.weekday()]} {format_date(earliest)}"
-            except ValueError:
-                timing = "fecha sin verificar"
-                heading = "Próximo pago"
-                due_label = format_date(earliest)
-            block = [f"{heading} — {due_label} ({timing})"]
-            total = Decimal("0")
-            for _due_date, label, _period, amount in same_day:
-                block.append(f"• {label}: {format_money(amount)}")
-                total += amount
-            if len(same_day) > 1:
-                block.append(f"Total: {format_money(total)}")
-            attention.append("\n".join(block))
+                entry["total"] = Decimal(str(entry["total"])) + amount
+                labels = entry["labels"]
+                if isinstance(labels, list) and label not in labels:
+                    labels.append(label)
+
+            block = ["Próximos vencimientos"]
+            for due_date, entry in sorted(grouped.items()):
+                try:
+                    due = date.fromisoformat(due_date)
+                    days = (due - self.today).days
+                    timing = "hoy" if days == 0 else (
+                        "mañana" if days == 1 else (
+                            f"dentro de {days} días" if days > 1 else f"hace {-days} días"
+                        )
+                    )
+                    due_label = f"{WEEKDAYS[due.weekday()]} {format_date(due_date)}"
+                except ValueError:
+                    timing = "fecha sin verificar"
+                    due_label = format_date(due_date)
+                labels = entry["labels"] if isinstance(entry["labels"], list) else []
+                label_text = " y ".join(str(label) for label in labels)
+                block.extend(["", f"{due_label} — {timing}"])
+                if len(labels) > 1:
+                    block.extend(
+                        [
+                            f"• Total: {format_money(entry['total'])}",
+                            f"• Incluye: {label_text}",
+                        ]
+                    )
+                else:
+                    block.append(f"• {label_text}: {format_money(entry['total'])}")
+            upcoming = "\n".join(block)
+        else:
+            upcoming = ""
 
         inbox = self.valid_snapshot(chat_id, "ARCA_DFE", "unread_communications")
         if inbox is not None and inbox.get("communications"):
@@ -1178,6 +1199,8 @@ class TaxMonitorService:
                 f"📩 Tenés {count} mensaje{'s' if count != 1 else ''} nuevo"
                 f"{'s' if count != 1 else ''} de ARCA."
             )
+        elif inbox is not None:
+            clear_statuses.append("🟢 Sin mensajes nuevos de ARCA.")
 
         profile = self.profile_snapshot(chat_id)
         invoices = self.invoice_snapshot(chat_id)
@@ -1193,23 +1216,34 @@ class TaxMonitorService:
             current = category_letter(current_description)
             projection = self.projection_lines(invoices)
             projected = projection[1].split(" — ", 1)[0] if len(projection) > 1 else ""
-            if current and projected and len(projected) == 1 and projected != current:
-                direction = "subir" if projected > current else "bajar"
-                attention.append(
-                    f"⚠️ Con tu facturación actual podrías {direction} de la categoría "
-                    f"{current} a la {projected}."
-                )
+            if current and projected and len(projected) == 1:
+                if projected != current:
+                    direction = "subir" if projected > current else "bajar"
+                    attention.append(
+                        f"⚠️ Con tu facturación actual podrías {direction} de la categoría "
+                        f"{current} a la {projected}."
+                    )
+                else:
+                    clear_statuses.append(
+                        f"🟢 Categoría {current}; la proyección sigue en {projected}."
+                    )
 
         attention.extend(f"⚠️ {item}" for item in source_alerts)
         if attention:
+            lines.extend(["", "Necesita atención"])
             for item in attention:
                 lines.extend(["", item])
         else:
-            lines.extend(["", "No encontré nada que requiera atención ahora."])
+            lines.extend(["", "🟢 Todo en orden"])
+        if clear_statuses:
+            lines.extend(["", *clear_statuses])
+        if upcoming:
+            lines.extend(["", upcoming])
         lines.extend(
             [
                 "",
-                "Todavía no puedo revisar otros impuestos nacionales fuera de Monotributo.",
+                "Este resumen cubre Monotributo, Ingresos Brutos de Santa Fe, "
+                "facturación y mensajes de ARCA.",
             ]
         )
         return "\n".join(lines)

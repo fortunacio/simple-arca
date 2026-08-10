@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from contador_ai.db import Database
 from contador_ai.arca.errors import WsfePointOfSaleUnavailable
@@ -53,6 +54,28 @@ class ServiceTest(TestCase):
         self.assertNotIn("datos históricos ni simulados", output)
         for forbidden in ("150.784", "672.973", "Categoría F", "categoría 3"):
             self.assertNotIn(forbidden, output)
+
+    def test_current_date_is_not_frozen_at_service_startup(self):
+        service = TaxMonitorService(self.db)
+        with patch("contador_ai.service.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(
+                2026,
+                8,
+                10,
+                10,
+                tzinfo=timezone(timedelta(hours=-3)),
+            )
+            self.assertEqual(service.today, date(2026, 8, 10))
+
+            mocked_datetime.now.return_value = datetime(
+                2026,
+                8,
+                11,
+                0,
+                1,
+                tzinfo=timezone(timedelta(hours=-3)),
+            )
+            self.assertEqual(service.today, date(2026, 8, 11))
 
     def _verified_user(self, chat_id=1001):
         self.db.ensure_user(chat_id)

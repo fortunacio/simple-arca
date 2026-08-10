@@ -151,7 +151,10 @@ class TaxMonitorService:
         arca_enrollment_ttl: timedelta = timedelta(minutes=10),
     ):
         self.db = db
-        self.today = today or date.today()
+        # Keep an explicit date only for deterministic tests. In the running bot
+        # the service is long-lived, so the current date must be evaluated for
+        # every request instead of being frozen at process startup.
+        self._today_override = today
         self.operator_cuit = normalize_cuit(operator_cuit)
         self.certificate_alias = certificate_alias.strip()
         self.arca_environment = arca_environment
@@ -160,6 +163,12 @@ class TaxMonitorService:
         self.ccma_login_url = ccma_login_url.strip()
         self.arca_enrollment_base_url = arca_enrollment_base_url.rstrip("/")
         self.arca_enrollment_ttl = arca_enrollment_ttl
+
+    @property
+    def today(self) -> date:
+        if self._today_override is not None:
+            return self._today_override
+        return datetime.now(ARGENTINA_TIMEZONE).date()
 
     def help(self, chat_id: int) -> str:
         lines = ["¿Qué querés hacer?", ""]

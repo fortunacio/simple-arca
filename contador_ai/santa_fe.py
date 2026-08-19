@@ -17,6 +17,11 @@ from .db import Database
 
 
 REGSIM_URL = "https://www.santafe.gob.ar/e-regsim/index.php"
+REGSIM_FORM_URL = f"{REGSIM_URL}?action=Registro::boletasPago"
+REGSIM_AJAX_HEADERS = {
+    "Referer": REGSIM_FORM_URL,
+    "X-Requested-With": "XMLHttpRequest",
+}
 VEPAI_URL = "https://www.santafe.gob.ar/e-vepa/index.php"
 ARGENTINA_TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 
@@ -293,6 +298,19 @@ def parse_interest(value: str) -> str:
     return _money(text)
 
 
+def _form_iibb_account(html_text: str, expected_account: str) -> str:
+    parser = _InputParser()
+    parser.feed(html_text)
+    official_account = parser.values.get("nro_cuenta_iibb_vep", "").strip()
+    official_digits = re.sub(r"\D", "", official_account)
+    expected_digits = re.sub(r"\D", "", expected_account)
+    if not official_digits:
+        raise SantaFeIibbError("Régimen Simplificado no informó la cuenta para generar el VEP")
+    if official_digits != expected_digits:
+        raise SantaFeIibbError("Santa Fe devolvió una cuenta distinta de la vinculada al chat")
+    return official_account
+
+
 def _periods_between(first: str, last: str) -> list[str]:
     start_year, start_month = (int(part) for part in first.split("-"))
     end_year, end_month = (int(part) for part in last.split("-"))
@@ -394,27 +412,31 @@ class SantaFeIibbConnector:
         )
 
     @staticmethod
-    def _open_regsim(client: httpx.Client, represented_cuit: str) -> None:
+    def _open_regsim(client: httpx.Client, represented_cuit: str) -> str:
         menu = client.post(
             REGSIM_URL,
             data={"action": "Ingreso::menu", "cuit": represented_cuit},
         )
         menu.raise_for_status()
-        form = client.get(f"{REGSIM_URL}?action=Registro::boletasPago")
+        form = client.get(REGSIM_FORM_URL)
         form.raise_for_status()
+        return form.text
 
     @staticmethod
     def _quote_with_client(
         client: httpx.Client,
         period: str,
         payment_date: date,
-    ) -> dict[str, str]:
+    ) -> tuple[dict[str, str], dict[str, str]]:
         period_response = client.post(
             f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarPeriodoVep",
             data={"periodo_osiris": period.replace("-", "")},
+            headers=REGSIM_AJAX_HEADERS,
         )
         period_response.raise_for_status()
         base = parse_period_quote(period_response.text, period)
+        period_fields = _InputParser()
+        period_fields.feed(period_response.text)
         interest_response = client.post(
             f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarInteres",
             data={
@@ -424,11 +446,12 @@ class SantaFeIibbConnector:
                 "fecha_pago": payment_date.strftime("%d/%m/%Y"),
                 "importe": str(base["amount"]).replace(".", ","),
             },
+            headers=REGSIM_AJAX_HEADERS,
         )
         interest_response.raise_for_status()
         interest = parse_interest(interest_response.text)
         principal = str(base["amount"])
-        return {
+        quote = {
             "period": period,
             "due_date": str(base["due_date"]),
             "payment_date": payment_date.isoformat(),
@@ -436,6 +459,13 @@ class SantaFeIibbConnector:
             "interest": interest,
             "total": str(Decimal(principal) + Decimal(interest)),
         }
+        wire_values = {
+            "due_date": period_fields.values["fe_vencimi_periodo_vep"].strip(),
+            "payment_date": payment_date.strftime("%d/%m/%Y"),
+            "principal": period_fields.values["importe_periodo_vep"].strip(),
+            "interest": _normalized(_visible_text(interest_response.text)),
+        }
+        return quote, wire_values
 
     def quote_payment(
         self,
@@ -451,7 +481,8 @@ class SantaFeIibbConnector:
         login = self._login(chat_id, represented_cuit, "santafe_regsim")
         with self._client(login) as client:
             self._open_regsim(client, represented_cuit)
-            return self._quote_with_client(client, period, payment_date)
+            quote, _wire_values = self._quote_with_client(client, period, payment_date)
+            return quote
 
     def generate_vep(
         self,
@@ -468,8 +499,9 @@ class SantaFeIibbConnector:
             raise SantaFeIibbError("La red de pago no es válida")
         login = self._login(chat_id, represented_cuit, "santafe_regsim")
         with self._client(login) as client:
-            self._open_regsim(client, represented_cuit)
-            quote = self._quote_with_client(client, period, payment_date)
+            form_html = self._open_regsim(client, represented_cuit)
+            official_account = _form_iibb_account(form_html, account)
+            quote, wire_values = self._quote_with_client(client, period, payment_date)
             comparable = ("due_date", "principal", "interest", "total")
             if any(str(quote[key]) != str(expected_quote.get(key, "")) for key in comparable):
                 raise IibbQuoteChanged(quote)
@@ -477,18 +509,22 @@ class SantaFeIibbConnector:
                 response = client.post(
                     f"{REGSIM_URL}?header=AJAX&action=Registro::liquidar_VEP",
                     data={
-                        "nro_iibb": account,
+                        "nro_iibb": official_account,
                         "id_entidad": network_id,
                         "periodo": period.replace("-", ""),
-                        "importe": quote["principal"].replace(".", ","),
-                        "fe_vencimi": datetime.strptime(
-                            quote["due_date"], "%Y-%m-%d"
-                        ).strftime("%d/%m/%Y"),
-                        "fe_pago": payment_date.strftime("%d/%m/%Y"),
-                        "interes": quote["interest"].replace(".", ","),
+                        "importe": wire_values["principal"],
+                        "fe_vencimi": wire_values["due_date"],
+                        "fe_pago": wire_values["payment_date"],
+                        "interes": wire_values["interest"],
                     },
+                    headers=REGSIM_AJAX_HEADERS,
                 )
                 response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise IibbGenerationUnknown(
+                    f"Santa Fe respondió HTTP {exc.response.status_code} durante la generación; "
+                    "no se reintentará automáticamente"
+                ) from exc
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 raise IibbGenerationUnknown(
                     "No se pudo confirmar si Santa Fe generó el VEP"
@@ -502,12 +538,19 @@ class SantaFeIibbConnector:
                     "Santa Fe respondió sin un número de VEP reconocible"
                 )
             vep_number = match.group(0)
-            document = client.get(
-                f"{REGSIM_URL}?action=ImpresionReportes::imprimirVEP&nro_vep={vep_number}"
-            )
-            document.raise_for_status()
+            try:
+                document = client.get(
+                    f"{REGSIM_URL}?action=ImpresionReportes::imprimirVEP&nro_vep={vep_number}"
+                )
+                document.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise IibbGenerationUnknown(
+                    f"Santa Fe informó el VEP {vep_number}, pero no se pudo descargar el PDF"
+                ) from exc
             if not document.content.startswith(b"%PDF"):
-                raise SantaFeIibbError("Santa Fe no devolvió el comprobante PDF del VEP")
+                raise IibbGenerationUnknown(
+                    f"Santa Fe informó el VEP {vep_number}, pero no devolvió un PDF válido"
+                )
             return {"vep_number": vep_number, "quote": quote, "pdf": document.content}
 
     def fetch_regsim(

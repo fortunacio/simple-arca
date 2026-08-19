@@ -6,6 +6,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
+import httpx
+
 from contador_ai.db import Database
 from contador_ai.iibb_payment import (
     IibbPaymentBotService,
@@ -13,8 +15,13 @@ from contador_ai.iibb_payment import (
     IibbPaymentStore,
     PAYMENT_URL,
 )
-from contador_ai.santa_fe import IibbGenerationUnknown, IibbQuoteChanged
-from contador_ai.santa_fe import SantaFeIibbConnector
+from contador_ai.santa_fe import (
+    IibbGenerationUnknown,
+    IibbQuoteChanged,
+    REGSIM_AJAX_HEADERS,
+    SantaFeIibbConnector,
+    SantaFeIibbError,
+)
 from contador_ai.arca_http_auth import ArcaHttpLogin
 
 
@@ -51,17 +58,25 @@ class FakeConnector:
 
 
 class FakeResponse:
-    def __init__(self, text="", content=None):
+    def __init__(self, text="", content=None, *, status_code=200, url="https://example.test"):
         self.text = text
         self.content = text.encode() if content is None else content
+        self.status_code = status_code
+        self.url = url
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            request = httpx.Request("POST", self.url)
+            response = httpx.Response(self.status_code, request=request)
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}", request=request, response=response
+            )
 
 
 class FakeHttpClient:
-    def __init__(self):
+    def __init__(self, *, generation_status=200):
         self.posts = []
+        self.generation_status = generation_status
 
     def __enter__(self):
         return self
@@ -69,23 +84,26 @@ class FakeHttpClient:
     def __exit__(self, *args):
         return None
 
-    def post(self, url, data):
-        self.posts.append((url, data))
+    def post(self, url, data, headers=None):
+        self.posts.append((url, data, headers or {}))
         if "actualizarPeriodoVep" in url:
             return FakeResponse(
                 '<input id="fe_vencimi_periodo_vep" value="20/08/2026">'
                 '<input id="importe_periodo_vep" value="42882,00">'
             )
         if "actualizarInteres" in url:
-            return FakeResponse("0,00")
+            return FakeResponse("0.00")
         if "liquidar_VEP" in url:
-            return FakeResponse("1234567890")
+            return FakeResponse("1234567890", status_code=self.generation_status, url=url)
         return FakeResponse("ok")
 
     def get(self, url):
         if "imprimirVEP" in url:
             return FakeResponse(content=b"%PDF-official")
-        return FakeResponse("<html>formulario</html>")
+        return FakeResponse(
+            '<input id="nro_cuenta_iibb_vep" value="1311234567">',
+            url=url,
+        )
 
 
 class ConnectorUnderTest(SantaFeIibbConnector):
@@ -271,18 +289,65 @@ class IibbPaymentTest(TestCase):
             expected_quote=QUOTE,
         )
 
-        generation = next(data for url, data in client.posts if "liquidar_VEP" in url)
+        generation, headers = next(
+            (data, headers)
+            for url, data, headers in client.posts
+            if "liquidar_VEP" in url
+        )
         self.assertEqual(
             generation,
             {
-                "nro_iibb": "131-123456-7",
+                "nro_iibb": "1311234567",
                 "id_entidad": "1002",
                 "periodo": "202607",
                 "importe": "42882,00",
                 "fe_vencimi": "20/08/2026",
                 "fe_pago": "06/08/2026",
-                "interes": "0,00",
+                "interes": "0.00",
             },
         )
+        self.assertEqual(headers, REGSIM_AJAX_HEADERS)
+        ajax_headers = [
+            headers
+            for url, _data, headers in client.posts
+            if "header=AJAX" in url
+        ]
+        self.assertTrue(ajax_headers)
+        self.assertTrue(all(headers == REGSIM_AJAX_HEADERS for headers in ajax_headers))
         self.assertEqual(result["vep_number"], "1234567890")
         self.assertEqual(result["pdf"], b"%PDF-official")
+
+    def test_connector_rejects_a_different_account_from_the_official_form(self):
+        client = FakeHttpClient()
+        connector = ConnectorUnderTest(client)
+
+        with self.assertRaisesRegex(SantaFeIibbError, "cuenta distinta"):
+            connector.generate_vep(
+                1001,
+                "20123456786",
+                account="131-999999-9",
+                period="2026-07",
+                payment_date=date(2026, 8, 6),
+                network_id="1002",
+                expected_quote=QUOTE,
+            )
+
+        self.assertFalse(any("liquidar_VEP" in url for url, _data, _headers in client.posts))
+
+    def test_generation_http_error_is_unknown_and_cannot_be_retried(self):
+        client = FakeHttpClient(generation_status=500)
+        connector = ConnectorUnderTest(client)
+
+        with self.assertRaisesRegex(IibbGenerationUnknown, "HTTP 500"):
+            connector.generate_vep(
+                1001,
+                "20123456786",
+                account="131-123456-7",
+                period="2026-07",
+                payment_date=date(2026, 8, 6),
+                network_id="1002",
+                expected_quote=QUOTE,
+            )
+
+        generation_calls = [url for url, _data, _headers in client.posts if "liquidar_VEP" in url]
+        self.assertEqual(len(generation_calls), 1)

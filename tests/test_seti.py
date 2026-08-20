@@ -23,6 +23,7 @@ class SetiReconciliationTest(TestCase):
                 "importe": 154843.13,
                 "fechaDePago": "2026-08-04 15:11:23.0",
                 "entidadPago": "MERCADO PAGO",
+                "descripcion": "VCON#12",
                 "isSuperVep": True,
             }
         )
@@ -30,7 +31,24 @@ class SetiReconciliationTest(TestCase):
         self.assertEqual(result["status"], "PAID")
         self.assertEqual(result["amount"], "154843.13")
         self.assertEqual(result["paid_on"], "2026-08-04")
+        self.assertEqual(result["tax_type"], "ARCA")
+        self.assertEqual(result["tax_period"], "")
         self.assertTrue(result["is_consolidated"])
+
+    def test_classifies_santa_fe_regime_payment(self):
+        result = BrowserSetiConnector._normalize_payment(
+            {
+                "estado": 2,
+                "nroVep": 1234565295,
+                "importe": 42882,
+                "fechaDePago": "2026-08-19 18:01:00.0",
+                "entidadPago": "BANELCO",
+                "descripcion": "SF-RGS07/26",
+            }
+        )
+
+        self.assertEqual(result["tax_type"], "SANTA_FE_IIBB")
+        self.assertEqual(result["tax_period"], "2026-07")
 
     def test_query_is_scoped_to_the_represented_cuit(self):
         url = BrowserSetiConnector._query_url("20383717419")
@@ -128,6 +146,70 @@ class SetiReconciliationTest(TestCase):
             self.assertEqual(reconciliation["matched_veps"], 1)
             self.assertEqual(reconciliation["unmatched_veps"], 1)
 
+    def test_worker_classifies_a_known_local_iibb_vep_without_description(self):
+        with TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.ensure_user(1001)
+            db.set_pending_tax_identity(1001, "20383717419", "production")
+            db.mark_tax_identity_verified(1001)
+            db.upsert_live_snapshot(
+                1001,
+                "ARCA_CCMA",
+                "account_status",
+                "2026-08-19T12:00:00+00:00",
+                "2026-08-20T12:00:00+00:00",
+                json.dumps({"debtor_total": "0", "payments": []}),
+            )
+            with db.connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO iibb_payment_drafts(
+                        id, chat_id, represented_cuit, account, period, status,
+                        network_id, network_name, payment_date, vep_number
+                    ) VALUES (?, ?, ?, ?, ?, 'GENERATED', ?, ?, ?, ?)
+                    """,
+                    (
+                        "payment-1",
+                        1001,
+                        "20383717419",
+                        "131-123456-7",
+                        "2026-07",
+                        "1002",
+                        "Santander / Pago Mis Cuentas",
+                        "2026-08-19",
+                        "1234565295",
+                    ),
+                )
+
+            class Connector:
+                @staticmethod
+                def sync(_chat_id, _cuit):
+                    return {
+                        "veps": [
+                            {
+                                "number": "1234565295",
+                                "status": "PAID",
+                                "amount": "42882.00",
+                                "paid_on": "2026-08-19",
+                                "is_consolidated": False,
+                            }
+                        ]
+                    }
+
+            SetiPaymentsWorker(
+                db,
+                Connector(),
+                snapshot_ttl=timedelta(hours=12),
+            ).sync_chat(1001)
+
+            row = db.get_live_snapshot(1001, "ARCA_SETI", "payment_status")
+            payload = json.loads(row["payload_json"])
+            self.assertEqual(payload["veps"][0]["tax_type"], "SANTA_FE_IIBB")
+            self.assertEqual(payload["veps"][0]["tax_period"], "2026-07")
+            self.assertEqual(payload["ccma_reconciliation"]["paid_veps"], 0)
+            self.assertEqual(payload["ccma_reconciliation"]["excluded_iibb_veps"], 1)
+
     def test_matches_each_ccma_movement_only_once_across_all_veps(self):
         veps = [
             {"status": "PAID", "amount": "2868.28", "paid_on": "2026-08-04"},
@@ -146,6 +228,38 @@ class SetiReconciliationTest(TestCase):
 
         self.assertEqual(result["matched_veps"], 2)
         self.assertEqual(result["unmatched_veps"], 1)
+
+    def test_excludes_iibb_veps_from_monotributo_reconciliation(self):
+        veps = [
+            {
+                "number": "1",
+                "status": "PAID",
+                "tax_type": "ARCA",
+                "amount": "10060.00",
+                "paid_on": "2026-08-19",
+            },
+            {
+                "number": "2",
+                "status": "PAID",
+                "tax_type": "SANTA_FE_IIBB",
+                "amount": "42882.00",
+                "paid_on": "2026-08-19",
+            },
+        ]
+        ccma = {
+            "debtor_total": "0",
+            "payments": [{"paid_on": "2026-08-19", "amount": "10060.00"}],
+        }
+
+        result = reconcile_seti_payments(veps, ccma)
+
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertEqual(result["paid_veps"], 1)
+        self.assertEqual(result["matched_veps"], 1)
+        self.assertEqual(result["unmatched_veps"], 0)
+        self.assertEqual(result["excluded_iibb_veps"], 1)
+        self.assertNotIn("ccma_match", veps[1])
+
     def test_does_not_match_ccma_payments_from_another_date(self):
         vep = {
             "paid_on": "2026-08-04",

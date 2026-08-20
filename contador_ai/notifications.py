@@ -9,7 +9,14 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .db import Database
-from .service import PROVIDERS, TaxMonitorService, format_date, format_money
+from .seti import SANTA_FE_IIBB_DESCRIPTION
+from .service import (
+    PROVIDERS,
+    TaxMonitorService,
+    format_date,
+    format_money,
+    format_month_year,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -127,7 +134,32 @@ class TaxNotificationMonitor:
 
         seti = self._snapshot(chat_id, "ARCA_SETI")
         seti_payload = seti[0] if seti is not None else {}
+        known_iibb_periods = self.db.get_iibb_vep_periods(chat_id)
+
+        def iibb_period(vep: dict) -> str | None:
+            number = str(vep.get("number", ""))
+            if number in known_iibb_periods:
+                return known_iibb_periods[number]
+            if str(vep.get("tax_type", "")).upper() == "SANTA_FE_IIBB":
+                return str(vep.get("tax_period", ""))
+            match = SANTA_FE_IIBB_DESCRIPTION.fullmatch(
+                str(vep.get("description", "")).strip()
+            )
+            if match:
+                return f"20{match.group('year')}-{match.group('month')}"
+            return None
+
+        paid_iibb_veps = [
+            (vep, period)
+            for vep in (seti_payload.get("veps", []) or [])
+            if str(vep.get("status", "")).upper() == "PAID"
+            and (period := iibb_period(vep)) is not None
+        ]
         payment_reconciliation = seti_payload.get("ccma_reconciliation", {})
+        if not isinstance(payment_reconciliation, dict):
+            payment_reconciliation = {}
+        elif paid_iibb_veps and "excluded_iibb_veps" not in payment_reconciliation:
+            payment_reconciliation = {}
         payment_update_pending = False
         if isinstance(payment_reconciliation, dict):
             paid = int(payment_reconciliation.get("paid_veps", 0))
@@ -197,25 +229,63 @@ class TaxNotificationMonitor:
             if isinstance(reconciliation, dict) and reconciliation:
                 matched = int(reconciliation.get("matched_veps", 0))
                 total = int(reconciliation.get("paid_veps", 0))
+                unmatched = int(
+                    reconciliation.get("unmatched_veps", max(0, total - matched))
+                )
                 status = str(reconciliation.get("status", "UNKNOWN"))
-                fingerprint = f"{status}:{matched}:{total}:{reconciliation.get('ccma_debtor_total')}"
-                if status == "COMPLETE":
+                fingerprint = (
+                    f"{status}:{matched}:{total}:"
+                    f"{reconciliation.get('ccma_debtor_total')}"
+                )
+                event_key = "seti:ccma:v2"
+                if status == "COMPLETE" and self.db.has_notification_event(
+                    chat_id, event_key
+                ):
                     line = "• Tu pago de Monotributo ya quedó reflejado por completo."
-                else:
+                elif status != "COMPLETE" and total > 0 and unmatched > 0:
                     line = (
                         "• Tu pago de Monotributo está confirmado, pero la cuenta todavía "
                         "no terminó de actualizarse. No vuelvas a pagarlo."
                     )
-                add(
-                    "Pagos",
-                    "seti:ccma",
-                    fingerprint,
-                    line,
-                )
+                else:
+                    line = ""
+                if line:
+                    add(
+                        "Pagos",
+                        event_key,
+                        fingerprint,
+                        line,
+                    )
 
         iibb = self._snapshot(chat_id, "SANTA_FE_IIBB")
         if iibb is not None:
             payload, _fetched_at = iibb
+            paid_periods = {
+                str(item.get("period", ""))
+                for item in payload.get("vepai", {}).get("payments", [])
+            }
+            for vep, period in paid_iibb_veps:
+                if period and period in paid_periods:
+                    continue
+                number = str(vep.get("number", ""))
+                if not number:
+                    continue
+                period_label = ""
+                try:
+                    year, month = (int(part) for part in period.split("-"))
+                    period_label = f" de {format_month_year(date(year, month, 1))}"
+                except (TypeError, ValueError):
+                    pass
+                add(
+                    "Pagos",
+                    f"seti:iibb:{number}",
+                    f"PAID:{period}:{vep.get('amount')}:{vep.get('paid_on')}",
+                    (
+                        f"• Tu pago de Ingresos Brutos{period_label} está confirmado, "
+                        "pero la cuenta provincial todavía no terminó de actualizarse. "
+                        "No vuelvas a pagarlo."
+                    ),
+                )
             reconciliation = payload.get("vepai", {}).get("reconciliation", {})
             missing = tuple(str(item) for item in reconciliation.get("missing_periods", []))
             if missing:

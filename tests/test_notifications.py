@@ -185,6 +185,12 @@ class NotificationMonitorTest(TestCase):
                 }
             ),
         )
+        self.db.mark_notification_sent(
+            1001,
+            "seti:ccma:v2",
+            "PARTIAL:8:12:500.00",
+            self.now.isoformat(),
+        )
 
         batch = TaxNotificationMonitor(
             self.db,
@@ -194,6 +200,114 @@ class NotificationMonitorTest(TestCase):
 
         self.assertIn("Monotributo: $500,00 de deuda vencida", batch.text)
         self.assertIn("pago de Monotributo ya quedó reflejado", batch.text)
+
+    def test_iibb_payment_keeps_the_warning_without_calling_it_monotributo(self):
+        self.snapshot(
+            "SANTA_FE_IIBB",
+            {
+                "vepai": {
+                    "status": "AVAILABLE",
+                    "payments": [],
+                    "reconciliation": {"status": "COMPLETE", "missing_periods": []},
+                }
+            },
+        )
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            self.now.isoformat(),
+            (self.now + timedelta(days=1)).isoformat(),
+            json.dumps(
+                {
+                    "veps": [
+                        {
+                            "number": "1234565295",
+                            "status": "PAID",
+                            "description": "SF-RGS07/26",
+                            "amount": "42882.00",
+                            "paid_on": "2026-08-06",
+                        }
+                    ],
+                    "ccma_reconciliation": {
+                        "status": "COMPLETE",
+                        "paid_veps": 12,
+                        "matched_veps": 12,
+                        "unmatched_veps": 0,
+                        "ccma_debtor_total": "0.00",
+                    },
+                }
+            ),
+        )
+        service = TaxMonitorService(
+            self.db,
+            today=date(2026, 8, 6),
+            live_synchronizers={"SANTA_FE_IIBB": lambda _chat_id: None},
+        )
+        monitor = TaxNotificationMonitor(self.db, service, now=lambda: self.now)
+
+        batch = monitor.check_chat(1001)
+
+        self.assertIsNotNone(batch)
+        self.assertIn("pago de Ingresos Brutos de julio de 2026 está confirmado", batch.text)
+        self.assertIn("cuenta provincial todavía no terminó de actualizarse", batch.text)
+        self.assertIn("No vuelvas a pagarlo", batch.text)
+        self.assertNotIn("pago de Monotributo", batch.text)
+        monitor.mark_sent(1001, batch)
+        self.assertIsNone(monitor.check_chat(1001))
+
+    def test_iibb_warning_is_not_sent_after_vepai_reflects_the_period(self):
+        self.snapshot(
+            "SANTA_FE_IIBB",
+            {
+                "vepai": {
+                    "status": "AVAILABLE",
+                    "payments": [{"period": "2026-07"}],
+                    "reconciliation": {"status": "COMPLETE", "missing_periods": []},
+                }
+            },
+        )
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            self.now.isoformat(),
+            (self.now + timedelta(days=1)).isoformat(),
+            json.dumps(
+                {
+                    "veps": [
+                        {
+                            "number": "1234565295",
+                            "status": "PAID",
+                            "tax_type": "SANTA_FE_IIBB",
+                            "tax_period": "2026-07",
+                            "amount": "42882.00",
+                            "paid_on": "2026-08-06",
+                        }
+                    ],
+                    "ccma_reconciliation": {
+                        "status": "COMPLETE",
+                        "paid_veps": 12,
+                        "matched_veps": 12,
+                        "unmatched_veps": 0,
+                        "ccma_debtor_total": "0.00",
+                        "excluded_iibb_veps": 1,
+                    },
+                }
+            ),
+        )
+
+        batch = TaxNotificationMonitor(
+            self.db,
+            TaxMonitorService(
+                self.db,
+                today=date(2026, 8, 6),
+                live_synchronizers={"SANTA_FE_IIBB": lambda _chat_id: None},
+            ),
+            now=lambda: self.now,
+        ).check_chat(1001)
+
+        self.assertIsNone(batch)
 
     def test_warns_when_a_background_source_is_stale(self):
         stale_time = self.now - timedelta(hours=13)

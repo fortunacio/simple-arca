@@ -472,6 +472,17 @@ class Database:
                 "SELECT * FROM tax_identities WHERE chat_id = ?", (chat_id,)
             ).fetchone()
 
+    def get_iibb_vep_periods(self, chat_id: int) -> dict[str, str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT vep_number, period FROM iibb_payment_drafts
+                WHERE chat_id = ? AND vep_number IS NOT NULL
+                """,
+                (chat_id,),
+            ).fetchall()
+        return {str(row["vep_number"]): str(row["period"]) for row in rows}
+
     def mark_tax_identity_verified(self, chat_id: int) -> None:
         with self.connect() as connection:
             connection.execute(

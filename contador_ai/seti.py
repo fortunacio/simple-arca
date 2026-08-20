@@ -13,6 +13,12 @@ from urllib.parse import urlencode
 from .db import Database
 
 
+SANTA_FE_IIBB_DESCRIPTION = re.compile(
+    r"^SF-RGS(?P<month>0[1-9]|1[0-2])/(?P<year>\d{2})$",
+    re.IGNORECASE,
+)
+
+
 class SetiError(RuntimeError):
     pass
 
@@ -47,18 +53,26 @@ class BrowserSetiConnector:
         paid_at = str(item.get("fechaDePago") or "")
         state = int(item.get("estado", -1))
         number = str(item.get("nroVep") or "")
+        description = str(item.get("descripcion") or "").strip()
+        iibb_match = SANTA_FE_IIBB_DESCRIPTION.fullmatch(description)
         return {
             "number": number,
             "status": "PAID" if state == 2 else "UNKNOWN",
             "seti_state": state,
             "amount": str(_decimal(item.get("importe", "0"))),
-            "description": str(item.get("descripcion") or ""),
+            "description": description,
             "paid_on": paid_at[:10] if re.fullmatch(r"\d{4}-\d{2}-\d{2}.*", paid_at) else "",
             "paid_at": paid_at,
             "payment_entity": str(item.get("entidadPago") or ""),
             "is_consolidated": bool(item.get("isSuperVep")),
             "is_sub_vep": bool(item.get("isSubVep")),
             "parent_number": str(item.get("superVep") or ""),
+            "tax_type": "SANTA_FE_IIBB" if iibb_match else "ARCA",
+            "tax_period": (
+                f"20{iibb_match.group('year')}-{iibb_match.group('month')}"
+                if iibb_match
+                else ""
+            ),
             "components": [],
         }
 
@@ -214,6 +228,13 @@ def reconcile_seti_payments(veps: list[dict], ccma: dict) -> dict[str, object]:
         for vep in veps
         if str(vep.get("status", "")).upper() == "PAID"
         and not bool(vep.get("is_consolidated"))
+        and str(vep.get("tax_type", "ARCA")).upper() != "SANTA_FE_IIBB"
+    ]
+    excluded_iibb = [
+        vep
+        for vep in veps
+        if str(vep.get("status", "")).upper() == "PAID"
+        and str(vep.get("tax_type", "")).upper() == "SANTA_FE_IIBB"
     ]
     matched: list[dict] = []
     unmatched: list[dict] = []
@@ -244,6 +265,7 @@ def reconcile_seti_payments(veps: list[dict], ccma: dict) -> dict[str, object]:
         "matched_total": str(matched_total),
         "unmatched_total": str(unmatched_total),
         "ccma_debtor_total": str(_decimal(ccma.get("debtor_total", "0"))),
+        "excluded_iibb_veps": len(excluded_iibb),
     }
 
 
@@ -274,6 +296,12 @@ class SetiPaymentsWorker:
         try:
             payload = self.connector.sync(chat_id, identity["represented_cuit"])
             veps = list(payload.get("veps", []))
+            iibb_periods = self.db.get_iibb_vep_periods(chat_id)
+            for vep in veps:
+                period = iibb_periods.get(str(vep.get("number", "")))
+                if period:
+                    vep["tax_type"] = "SANTA_FE_IIBB"
+                    vep["tax_period"] = period
             payload["ccma_reconciliation"] = reconcile_seti_payments(veps, ccma)
         except Exception as exc:
             self.db.upsert_connection(chat_id, "ARCA_SETI", "ERROR", last_error=str(exc))

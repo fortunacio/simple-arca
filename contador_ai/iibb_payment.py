@@ -200,7 +200,36 @@ class IibbPaymentStore:
                 recovered += 1
         return recovered
 
+    def _paid_seti_vep_numbers(self, chat_id: int) -> set[str]:
+        snapshot = self.db.get_live_snapshot(chat_id, "ARCA_SETI", "payment_status")
+        if snapshot is None:
+            return set()
+        try:
+            payload = json.loads(snapshot["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            return set()
+        return {
+            str(vep.get("number", ""))
+            for vep in payload.get("veps", [])
+            if str(vep.get("status", "")).upper() == "PAID"
+            and str(vep.get("number", ""))
+        }
+
     def expire_generated(self, current: date) -> int:
+        with self.db.connect() as connection:
+            chat_ids = {
+                int(row["chat_id"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT chat_id FROM iibb_payment_drafts
+                    WHERE status = 'GENERATED' AND vep_expires_on < ?
+                    """,
+                    (current.isoformat(),),
+                ).fetchall()
+            }
+        for chat_id in chat_ids:
+            self.reconcile_paid(chat_id)
+
         with self.db.connect() as connection:
             rows = connection.execute(
                 """
@@ -387,26 +416,31 @@ class IibbPaymentStore:
 
     def reconcile_paid(self, chat_id: int) -> int:
         snapshot = self.db.get_live_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
-        if snapshot is None:
-            return 0
-        payload = json.loads(snapshot["payload_json"])
+        try:
+            payload = json.loads(snapshot["payload_json"]) if snapshot is not None else {}
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
         paid_periods = {
             str(item.get("period", ""))
             for item in payload.get("vepai", {}).get("payments", [])
         }
-        if not paid_periods:
+        paid_vep_numbers = self._paid_seti_vep_numbers(chat_id)
+        if not paid_periods and not paid_vep_numbers:
             return 0
-        placeholders = ",".join("?" for _ in paid_periods)
         with self.db.connect() as connection:
             rows = connection.execute(
-                f"""
-                SELECT id, chat_id FROM iibb_payment_drafts
-                WHERE chat_id = ? AND status = 'GENERATED'
-                  AND period IN ({placeholders})
+                """
+                SELECT id, chat_id, period, vep_number FROM iibb_payment_drafts
+                WHERE chat_id = ? AND status IN ('GENERATED', 'UNKNOWN', 'EXPIRED')
                 """,
-                (chat_id, *sorted(paid_periods)),
+                (chat_id,),
             ).fetchall()
             for row in rows:
+                if (
+                    str(row["period"]) not in paid_periods
+                    and str(row["vep_number"] or "") not in paid_vep_numbers
+                ):
+                    continue
                 connection.execute(
                     """
                     UPDATE iibb_payment_drafts SET status = 'PAID',
@@ -665,8 +699,8 @@ class IibbPaymentBotService:
             )
         if status == "EXPIRED":
             return BotReply(
-                "El VEP venció sin que Santa Fe informara el pago. Podés preparar uno nuevo desde Pagos y vencimientos.",
-                ((('Volver a pagos', 'tax:payments'),),),
+                "El VEP alcanzó su fecha límite y todavía no pude confirmar el pago. Revisá SETI o el banco antes de generar otro para evitar un pago duplicado.",
+                ((('Abrir ARCA', PAYMENT_URL),), (('Volver a pagos', 'tax:payments'),)),
                 replace,
             )
         if status == "ERROR":

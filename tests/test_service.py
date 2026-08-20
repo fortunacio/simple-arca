@@ -801,6 +801,74 @@ class ServiceTest(TestCase):
         self.assertIn("Tenés $500,00 de Monotributo vencido", output)
         self.assertNotIn("No vuelvas a pagarlo", output)
 
+    def test_summary_waits_one_business_day_before_calling_ccma_balance_overdue(self):
+        self._verified_user()
+        self._snapshot(
+            1001,
+            "ARCA_CCMA",
+            "account_status",
+            {
+                "debtor_total": "150784.21",
+                "overdue": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-21",
+                        "balance": "150784.21",
+                    }
+                ],
+                "upcoming": [],
+            },
+        )
+
+        output = TaxMonitorService(self.db, today=date(2026, 8, 24)).summary(1001)
+
+        self.assertIn("débito automático puede estar procesándose", output)
+        self.assertNotIn("Monotributo vencido", output)
+
+    def test_summary_keeps_iibb_paid_in_seti_out_of_debt_and_due_dates(self):
+        self._verified_user()
+        self._snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            {
+                "next_obligation": {
+                    "period": "2026-07",
+                    "due_date": "2026-08-20",
+                    "amount": "42882.00",
+                },
+                "vepai": {
+                    "payments": [],
+                    "reconciliation": {
+                        "status": "MISSING",
+                        "missing_periods": ["2026-07"],
+                    },
+                },
+            },
+        )
+        self._snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            {
+                "veps": [
+                    {
+                        "number": "1234565295",
+                        "status": "PAID",
+                        "tax_type": "SANTA_FE_IIBB",
+                        "tax_period": "2026-07",
+                    }
+                ]
+            },
+        )
+
+        output = TaxMonitorService(self.db, today=date(2026, 8, 20)).summary(1001)
+
+        self.assertIn("pago de Ingresos Brutos está confirmado", output)
+        self.assertIn("No vuelvas a pagarlo", output)
+        self.assertNotIn("sin pago identificado", output)
+        self.assertNotIn("Ingresos Brutos: $42.882,00", output)
+
     def test_payments_page_changes_message_after_seven_days(self):
         self._verified_user()
         self._snapshot(

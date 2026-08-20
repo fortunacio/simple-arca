@@ -20,6 +20,7 @@ from .monotributo import (
     projected_category,
     projection_window,
 )
+from .seti import SANTA_FE_IIBB_DESCRIPTION
 
 
 PROVIDERS = {
@@ -642,6 +643,72 @@ class TaxMonitorService:
             totals[period] = totals.get(period, Decimal("0")) + abs(amount)
         return sorted(totals.items())
 
+    @classmethod
+    def _balance_total(cls, items: list[dict]) -> Decimal:
+        return sum((total for _period, total in cls._period_totals(items)), Decimal("0"))
+
+    @staticmethod
+    def _business_days_after(start: date, current: date) -> int:
+        days = 0
+        cursor = start
+        while cursor < current:
+            cursor += timedelta(days=1)
+            if cursor.weekday() < 5:
+                days += 1
+        return days
+
+    def _ccma_balance_buckets(self, snapshot: dict) -> tuple[Decimal, Decimal]:
+        if "overdue" not in snapshot:
+            try:
+                return Decimal(str(snapshot.get("debtor_total", "0"))), Decimal("0")
+            except InvalidOperation:
+                return Decimal("0"), Decimal("0")
+        actionable = Decimal("0")
+        processing = Decimal("0")
+        for item in snapshot.get("overdue", []):
+            try:
+                amount = abs(Decimal(str(item.get("balance", "0"))))
+                due = date.fromisoformat(str(item.get("due_date", "")))
+            except (InvalidOperation, ValueError):
+                try:
+                    actionable += abs(Decimal(str(item.get("balance", "0"))))
+                except InvalidOperation:
+                    continue
+                continue
+            if self._business_days_after(due, self.today) < 2:
+                processing += amount
+            else:
+                actionable += amount
+        return actionable, processing
+
+    def _ccma_overdue_total(self, snapshot: dict) -> Decimal:
+        return self._ccma_balance_buckets(snapshot)[0]
+
+    def _paid_iibb_periods(self, chat_id: int) -> set[str]:
+        snapshot = self.valid_snapshot(chat_id, "ARCA_SETI", "payment_status")
+        if snapshot is None:
+            return set()
+        known_periods = self.db.get_iibb_vep_periods(chat_id)
+        periods: set[str] = set()
+        for vep in snapshot.get("veps", []):
+            if str(vep.get("status", "")).upper() != "PAID":
+                continue
+            number = str(vep.get("number", ""))
+            if number in known_periods:
+                periods.add(known_periods[number])
+                continue
+            if str(vep.get("tax_type", "")).upper() == "SANTA_FE_IIBB":
+                period = str(vep.get("tax_period", ""))
+                if period:
+                    periods.add(period)
+                continue
+            match = SANTA_FE_IIBB_DESCRIPTION.fullmatch(
+                str(vep.get("description", "")).strip()
+            )
+            if match:
+                periods.add(f"20{match.group('year')}-{match.group('month')}")
+        return periods
+
     @staticmethod
     def _display_month(period: str) -> str:
         try:
@@ -665,7 +732,7 @@ class TaxMonitorService:
                 return "\n".join(lines)
             return self.source_command(chat_id, "ARCA_CCMA")
 
-        debtor_total = Decimal(str(snapshot.get("debtor_total", "0")))
+        debtor_total, processing_total = self._ccma_balance_buckets(snapshot)
         creditor_total = Decimal(str(snapshot.get("creditor_total", "0")))
         lines = ["Monotributo", ""]
         if debtor_total:
@@ -674,6 +741,14 @@ class TaxMonitorService:
                 lines.append(f"• {self._display_month(period)}: {format_money(total)}")
         else:
             lines.append("No registra deuda vencida en CCMA.")
+        if processing_total:
+            lines.extend(
+                [
+                    "",
+                    f"ARCA todavía muestra {format_money(processing_total)} pendiente.",
+                    "El débito automático puede estar procesándose.",
+                ]
+            )
         if creditor_total:
             lines.extend(["", f"Saldo a favor: {format_money(creditor_total)}"])
 
@@ -751,13 +826,28 @@ class TaxMonitorService:
         registered_payments = snapshot.get("payments", [])
         payments = vepai_payments or registered_payments
         reconciliation = vepai.get("reconciliation", {}) if isinstance(vepai, dict) else {}
-        if reconciliation.get("status") == "COMPLETE":
+        paid_iibb_periods = self._paid_iibb_periods(chat_id)
+        missing_periods = {
+            str(period)
+            for period in reconciliation.get("missing_periods", [])
+            if str(period) not in paid_iibb_periods
+        }
+        if reconciliation.get("status") == "COMPLETE" or (
+            reconciliation.get("status") == "MISSING" and not missing_periods
+        ):
             lines.extend(["", "Deuda vencida en Régimen Simplificado: no."])
-        elif reconciliation.get("status") == "MISSING":
+            if reconciliation.get("status") == "MISSING" and paid_iibb_periods:
+                lines.append(
+                    "El pago está confirmado; Santa Fe todavía no terminó de actualizar la cuenta."
+                )
+        elif missing_periods:
             lines.extend(["", "Deuda vencida: hay períodos sin pago identificado."])
 
         next_obligation = snapshot.get("next_obligation")
-        if isinstance(next_obligation, dict):
+        if (
+            isinstance(next_obligation, dict)
+            and str(next_obligation.get("period", "")) not in paid_iibb_periods
+        ):
             title = "Pago vencido" if next_obligation.get("overdue") else "Próximo pago"
             due_label = "Venció" if next_obligation.get("overdue") else "Vence"
             lines.extend(
@@ -952,18 +1042,19 @@ class TaxMonitorService:
         iibb = self.valid_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
         if iibb is not None and isinstance(iibb.get("next_obligation"), dict):
             obligation = iibb["next_obligation"]
-            try:
-                amount = Decimal(str(obligation.get("amount", "0")))
-            except InvalidOperation:
-                amount = Decimal("0")
-            items.append(
-                (
-                    str(obligation.get("due_date", "")),
-                    "Ingresos Brutos",
-                    str(obligation.get("period", "")),
-                    amount,
+            if str(obligation.get("period", "")) not in self._paid_iibb_periods(chat_id):
+                try:
+                    amount = Decimal(str(obligation.get("amount", "0")))
+                except InvalidOperation:
+                    amount = Decimal("0")
+                items.append(
+                    (
+                        str(obligation.get("due_date", "")),
+                        "Ingresos Brutos",
+                        str(obligation.get("period", "")),
+                        amount,
+                    )
                 )
-            )
         return sorted(items, key=lambda item: (item[0], item[1]))
 
     def _confirmed_payment_pending(self, chat_id: int) -> dict[str, object] | None:
@@ -1113,10 +1204,7 @@ class TaxMonitorService:
                 "en la cuenta. No vuelvas a pagarlo por ahora; te avisaré cuando cambie."
             )
         elif ccma is not None:
-            try:
-                debt = Decimal(str(ccma.get("debtor_total", "0")))
-            except InvalidOperation:
-                debt = Decimal("0")
+            debt, processing = self._ccma_balance_buckets(ccma)
             if debt > 0:
                 if "ARCA_SETI" in self.live_synchronizers and payment_snapshot is None:
                     attention.append(
@@ -1125,6 +1213,11 @@ class TaxMonitorService:
                     )
                 else:
                     attention.append(f"🔴 Tenés {format_money(debt)} de Monotributo vencido.")
+            elif processing > 0:
+                attention.append(
+                    f"🟡 ARCA todavía muestra {format_money(processing)} de Monotributo "
+                    "pendiente; el débito automático puede estar procesándose."
+                )
             else:
                 clear_statuses.append("🟢 Sin deuda vencida de Monotributo.")
         elif (
@@ -1137,10 +1230,21 @@ class TaxMonitorService:
         if iibb is not None:
             reconciliation = iibb.get("vepai", {}).get("reconciliation", {})
             if isinstance(reconciliation, dict) and reconciliation.get("status") == "MISSING":
-                missing = list(reconciliation.get("missing_periods", []))
-                attention.append(
-                    f"🔴 Ingresos Brutos tiene {len(missing)} período(s) sin pago identificado."
-                )
+                paid_periods = self._paid_iibb_periods(chat_id)
+                missing = [
+                    period
+                    for period in reconciliation.get("missing_periods", [])
+                    if str(period) not in paid_periods
+                ]
+                if missing:
+                    attention.append(
+                        f"🔴 Ingresos Brutos tiene {len(missing)} período(s) sin pago identificado."
+                    )
+                else:
+                    attention.append(
+                        "🟡 El pago de Ingresos Brutos está confirmado; Santa Fe todavía "
+                        "no terminó de actualizar la cuenta. No vuelvas a pagarlo."
+                    )
             elif isinstance(reconciliation, dict) and reconciliation.get("status") == "COMPLETE":
                 clear_statuses.append("🟢 Sin deuda vencida de Ingresos Brutos.")
         elif (
@@ -1313,15 +1417,21 @@ class TaxMonitorService:
                     "• El saldo requiere revisión, pero el pago sigue confirmado. No lo pagues nuevamente."
                 )
         elif ccma is not None:
-            try:
-                debt = Decimal(str(ccma.get("debtor_total", "0")))
-            except InvalidOperation:
-                debt = Decimal("0")
+            debt, processing = self._ccma_balance_buckets(ccma)
             lines.extend(
                 [
                     "",
                     "Monotributo",
-                    f"• {'Sin deuda vencida.' if not debt else f'Deuda vencida: {format_money(debt)}.'}",
+                    (
+                        f"• Deuda vencida: {format_money(debt)}."
+                        if debt
+                        else (
+                            f"• ARCA todavía muestra {format_money(processing)} pendiente; "
+                            "el débito automático puede estar procesándose."
+                            if processing
+                            else "• Sin deuda vencida."
+                        )
+                    ),
                 ]
             )
 
@@ -1333,7 +1443,17 @@ class TaxMonitorService:
             if isinstance(reconciliation, dict) and reconciliation.get("status") == "COMPLETE":
                 lines.append("• Sin deuda vencida.")
             elif isinstance(reconciliation, dict) and reconciliation.get("status") == "MISSING":
-                lines.append("• Hay períodos sin un pago identificado.")
+                paid_periods = self._paid_iibb_periods(chat_id)
+                missing = [
+                    period
+                    for period in reconciliation.get("missing_periods", [])
+                    if str(period) not in paid_periods
+                ]
+                lines.append(
+                    "• Hay períodos sin un pago identificado."
+                    if missing
+                    else "• Pago confirmado; pendiente de actualización provincial."
+                )
             if groups:
                 latest_date = max(str(group.get("paid_on", "")) for group in groups)
                 latest_total = sum(
@@ -1540,18 +1660,19 @@ class TaxMonitorService:
         iibb = self.valid_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
         if iibb is not None and isinstance(iibb.get("next_obligation"), dict):
             obligation = iibb["next_obligation"]
-            try:
-                amount = Decimal(str(obligation.get("amount", "0")))
-            except InvalidOperation:
-                amount = Decimal("0")
-            items.append(
-                (
-                    str(obligation.get("due_date", "")),
-                    "Ingresos Brutos",
-                    str(obligation.get("period", "")),
-                    amount,
+            if str(obligation.get("period", "")) not in self._paid_iibb_periods(chat_id):
+                try:
+                    amount = Decimal(str(obligation.get("amount", "0")))
+                except InvalidOperation:
+                    amount = Decimal("0")
+                items.append(
+                    (
+                        str(obligation.get("due_date", "")),
+                        "Ingresos Brutos",
+                        str(obligation.get("period", "")),
+                        amount,
+                    )
                 )
-            )
 
         lines = ["Próximos pagos"]
         if not items:

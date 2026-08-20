@@ -428,7 +428,6 @@ def sync_portal_sources(
     if santa_fe_worker is not None:
         try:
             santa_fe_worker.sync_chat(chat_id)
-            iibb_payment_store.reconcile_paid(chat_id)
             santa_fe_ready = True
         except (CcmaCredentialsRejected, CcmaSessionRequired):
             database.clear_portal_access(chat_id)
@@ -441,6 +440,8 @@ def sync_portal_sources(
                 "Falló la sincronización de Ingresos Brutos para chat_id=%s",
                 chat_id,
             )
+
+    iibb_payment_store.reconcile_paid(chat_id)
 
     ready = ccma_ready and santa_fe_ready
     if ready and database.get_portal_access(chat_id) is not None:

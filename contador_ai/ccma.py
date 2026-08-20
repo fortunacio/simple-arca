@@ -164,18 +164,28 @@ def parse_ccma_account(
                 )
         current = (_period_iso(period), tax, description, _date(movement_date))
 
-    overdue = tuple(
+    debt_bearing = tuple(
         balance
         for balance in balances
         if balance.balance > 0 and balance.due_date <= calculated_on
     )
+    current_period = calculated_on.strftime("%Y-%m")
+    overdue = tuple(
+        balance
+        for balance in debt_bearing
+        if balance.due_date < calculated_on or balance.period < current_period
+    )
     upcoming = tuple(
         balance
         for balance in balances
-        if balance.balance > 0 and balance.due_date > calculated_on
+        if balance.balance > 0
+        and (
+            balance.due_date > calculated_on
+            or (balance.due_date == calculated_on and balance.period >= current_period)
+        )
     )
     credits = tuple(balance for balance in balances if balance.balance < 0)
-    detailed_debt = sum((item.balance for item in overdue), Decimal("0"))
+    detailed_debt = sum((item.balance for item in debt_bearing), Decimal("0"))
     detailed_credit = -sum((item.balance for item in credits), Decimal("0"))
     if abs(detailed_debt - debtor_total) > Decimal("0.02"):
         raise CcmaError("El detalle de deuda no coincide con el total informado por CCMA")
@@ -192,7 +202,7 @@ def parse_ccma_account(
         (item.amount for item in payments if item.paid_on == latest_payment_date),
         Decimal("0"),
     )
-    overdue_periods = {item.period for item in overdue}
+    overdue_periods = {item.period for item in debt_bearing}
     latest_periods = {
         item.period for item in payments if item.paid_on == latest_payment_date
     }

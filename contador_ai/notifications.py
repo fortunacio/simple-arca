@@ -22,6 +22,7 @@ from .service import (
 LOGGER = logging.getLogger(__name__)
 ARGENTINA_TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 REMINDER_DAYS = frozenset({14, 7, 3, 1, 0})
+MONOTRIBUTO_GRACE_BUSINESS_DAYS = 2
 SNAPSHOT_KINDS = {
     "ARCA_PROFILE": "taxpayer_profile",
     "ARCA_DFE": "unread_communications",
@@ -89,6 +90,16 @@ class TaxNotificationMonitor:
             return None
         return (payload, fetched_at) if fetched_at is not None else None
 
+    @staticmethod
+    def _business_days_after(start: date, current: date) -> int:
+        days = 0
+        cursor = start
+        while cursor < current:
+            cursor += timedelta(days=1)
+            if cursor.weekday() < 5:
+                days += 1
+        return days
+
     def refresh_official_apis(self, chat_id: int) -> None:
         now = self.now()
         state_key = f"monitor:last_api_refresh:{chat_id}"
@@ -155,6 +166,7 @@ class TaxNotificationMonitor:
             if str(vep.get("status", "")).upper() == "PAID"
             and (period := iibb_period(vep)) is not None
         ]
+        paid_iibb_periods = {period for _vep, period in paid_iibb_veps if period}
         payment_reconciliation = seti_payload.get("ccma_reconciliation", {})
         if not isinstance(payment_reconciliation, dict):
             payment_reconciliation = {}
@@ -180,35 +192,113 @@ class TaxNotificationMonitor:
                 debt = Decimal(str(ccma_payload.get("debtor_total", "0")))
             except InvalidOperation:
                 debt = Decimal("0")
-            overdue = ccma_payload.get("overdue", [])
-            if debt > 0 and not payment_update_pending:
-                fingerprint = "ACTIONABLE:" + json.dumps(
-                    [
-                        str(debt),
-                        sorted(
-                            (str(item.get("period")), str(item.get("balance")))
-                            for item in overdue
-                        ),
-                    ],
-                    separators=(",", ":"),
+            overdue = ccma_payload.get("overdue", []) or []
+            upcoming = ccma_payload.get("upcoming", []) or []
+            current_periods = {
+                str(item.get("period", ""))
+                for item in (*overdue, *upcoming)
+                if str(item.get("period", ""))
+            }
+            overdue_grouped: dict[tuple[str, str], Decimal] = {}
+            due_grouped: dict[tuple[str, str], Decimal] = {}
+            undated_debt = Decimal("0")
+            for item in overdue:
+                period = str(item.get("period", ""))
+                due_value = str(item.get("due_date", ""))
+                try:
+                    amount = Decimal(str(item.get("balance", "0")))
+                except InvalidOperation:
+                    continue
+                try:
+                    due = date.fromisoformat(due_value)
+                except ValueError:
+                    undated_debt += amount
+                    continue
+                current_period = today.strftime("%Y-%m")
+                target = (
+                    due_grouped
+                    if due > today or (due == today and period >= current_period)
+                    else overdue_grouped
                 )
-                add(
-                    "Pagos pendientes",
-                    "debt:arca_ccma",
-                    fingerprint,
-                    f"• Monotributo: {format_money(debt)} de deuda vencida.",
-                )
+                target[(period, due_value)] = target.get((period, due_value), Decimal("0")) + amount
 
-            grouped: dict[tuple[str, str], Decimal] = {}
-            for item in ccma_payload.get("upcoming", []):
+            for item in upcoming:
                 key = (str(item.get("period", "")), str(item.get("due_date", "")))
                 try:
-                    grouped[key] = grouped.get(key, Decimal("0")) + Decimal(
+                    due_grouped[key] = due_grouped.get(key, Decimal("0")) + Decimal(
                         str(item.get("balance", "0"))
                     )
                 except InvalidOperation:
                     continue
-            for (period, due_value), amount in grouped.items():
+
+            if not payment_update_pending:
+                for (period, due_value), amount in overdue_grouped.items():
+                    due = date.fromisoformat(due_value)
+                    business_days = self._business_days_after(due, today)
+                    if business_days < MONOTRIBUTO_GRACE_BUSINESS_DAYS:
+                        add(
+                            "Pagos",
+                            f"pending:arca_ccma:{period}",
+                            f"{due_value}:{amount}",
+                            (
+                                f"• Monotributo: ARCA todavía muestra {format_money(amount)} "
+                                "pendiente; el débito automático puede estar procesándose."
+                            ),
+                        )
+                    else:
+                        add(
+                            "Pagos pendientes",
+                            f"review:arca_ccma:{period}",
+                            f"{due_value}:{amount}",
+                            (
+                                f"• Monotributo: ARCA todavía muestra {format_money(amount)} "
+                                "pendiente después de dos días hábiles. Requiere revisión."
+                            ),
+                        )
+                if undated_debt > 0:
+                    fingerprint = "ACTIONABLE:" + json.dumps(
+                        [
+                            str(debt),
+                            sorted(
+                                (str(item.get("period")), str(item.get("balance")))
+                                for item in overdue
+                            ),
+                        ],
+                        separators=(",", ":"),
+                    )
+                    add(
+                        "Pagos pendientes",
+                        "debt:arca_ccma",
+                        fingerprint,
+                        f"• Monotributo: {format_money(undated_debt)} de deuda vencida.",
+                    )
+
+            tracked_periods: set[str] = set()
+            for prefix in ("pending:arca_ccma:", "review:arca_ccma:"):
+                tracked_periods.update(
+                    key.removeprefix(prefix)
+                    for key in self.db.notification_event_keys(chat_id, prefix)
+                )
+            tracked_periods.update(
+                key.removeprefix("due:arca_ccma:").split(":", 1)[0]
+                for key in self.db.notification_event_keys(chat_id, "due:arca_ccma:")
+            )
+            for period in tracked_periods - current_periods:
+                try:
+                    period_label = format_month_year(date.fromisoformat(f"{period}-01"))
+                except ValueError:
+                    period_label = period
+                add(
+                    "Pagos",
+                    f"confirmed:arca_ccma:{period}",
+                    "CLEARED",
+                    (
+                        f"• Monotributo de {period_label}: ARCA ya no muestra "
+                        "saldo pendiente."
+                    ),
+                )
+
+            for (period, due_value), amount in due_grouped.items():
                 try:
                     due = date.fromisoformat(due_value)
                 except ValueError:
@@ -265,9 +355,21 @@ class TaxNotificationMonitor:
                 for item in payload.get("vepai", {}).get("payments", [])
             }
             for vep, period in paid_iibb_veps:
-                if period and period in paid_periods:
-                    continue
                 number = str(vep.get("number", ""))
+                if period and period in paid_periods:
+                    if number and self.db.has_notification_event(
+                        chat_id, f"seti:iibb:{number}"
+                    ):
+                        add(
+                            "Pagos",
+                            f"confirmed:iibb:{number}",
+                            f"POSTED:{period}",
+                            (
+                                "• Tu pago de Ingresos Brutos ya quedó reflejado "
+                                "en la cuenta provincial."
+                            ),
+                        )
+                    continue
                 if not number:
                     continue
                 period_label = ""
@@ -287,7 +389,11 @@ class TaxNotificationMonitor:
                     ),
                 )
             reconciliation = payload.get("vepai", {}).get("reconciliation", {})
-            missing = tuple(str(item) for item in reconciliation.get("missing_periods", []))
+            missing = tuple(
+                str(item)
+                for item in reconciliation.get("missing_periods", [])
+                if str(item) not in paid_iibb_periods
+            )
             if missing:
                 add(
                     "Pagos pendientes",
@@ -296,7 +402,10 @@ class TaxNotificationMonitor:
                     f"• Ingresos Brutos: hay {len(missing)} período(s) sin pago identificado.",
                 )
             obligation = payload.get("next_obligation")
-            if isinstance(obligation, dict):
+            if (
+                isinstance(obligation, dict)
+                and str(obligation.get("period", "")) not in paid_iibb_periods
+            ):
                 due_value = str(obligation.get("due_date", ""))
                 try:
                     due = date.fromisoformat(due_value)

@@ -409,6 +409,18 @@ class Database:
             ).fetchone()
         return row is not None
 
+    def notification_event_keys(self, chat_id: int, prefix: str) -> tuple[str, ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT event_key FROM notification_deliveries
+                WHERE chat_id = ? AND event_key LIKE ?
+                ORDER BY event_key
+                """,
+                (chat_id, f"{prefix}%"),
+            ).fetchall()
+        return tuple(str(row["event_key"]) for row in rows)
+
     def mark_notification_sent(
         self,
         chat_id: int,

@@ -250,6 +250,81 @@ class IibbPaymentTest(TestCase):
         self.assertEqual(self.store.reconcile_paid(1001), 1)
         self.assertEqual(self.store.get(row["id"])["status"], "PAID")
 
+    def test_seti_paid_marks_generated_vep_paid_before_vepai_updates(self):
+        row = self.request()
+        self.processor.process_one()
+        self.store.request_generation(row["id"], 1001)
+        self.processor.process_one()
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            "2026-08-07T12:00:00+00:00",
+            "2026-08-08T12:00:00+00:00",
+            json.dumps(
+                {
+                    "veps": [
+                        {
+                            "number": "1234567890",
+                            "status": "PAID",
+                            "tax_type": "SANTA_FE_IIBB",
+                            "tax_period": "2026-07",
+                        }
+                    ]
+                }
+            ),
+        )
+
+        self.assertEqual(self.store.reconcile_paid(1001), 1)
+        self.assertEqual(self.store.get(row["id"])["status"], "PAID")
+
+    def test_paid_seti_vep_cannot_expire(self):
+        row = self.request()
+        self.processor.process_one()
+        self.store.request_generation(row["id"], 1001)
+        self.processor.process_one()
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            "2026-08-07T12:00:00+00:00",
+            "2026-08-08T12:00:00+00:00",
+            json.dumps(
+                {
+                    "veps": [
+                        {"number": "1234567890", "status": "PAID"}
+                    ]
+                }
+            ),
+        )
+
+        self.assertEqual(self.store.expire_generated(date(2026, 8, 7)), 0)
+        self.assertEqual(self.store.get(row["id"])["status"], "PAID")
+
+    def test_seti_repairs_an_expired_vep_once_payment_is_visible(self):
+        row = self.request()
+        self.processor.process_one()
+        self.store.request_generation(row["id"], 1001)
+        self.processor.process_one()
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE iibb_payment_drafts SET status = 'EXPIRED' WHERE id = ?",
+                (row["id"],),
+            )
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            "2026-08-07T12:00:00+00:00",
+            "2026-08-08T12:00:00+00:00",
+            json.dumps(
+                {"veps": [{"number": "1234567890", "status": "PAID"}]}
+            ),
+        )
+
+        self.assertEqual(self.store.reconcile_paid(1001), 1)
+        self.assertEqual(self.store.get(row["id"])["status"], "PAID")
+
     def test_unauthorized_chat_cannot_start(self):
         reply = self.bot.start(999)
         self.assertIn("no está habilitado", reply.text)

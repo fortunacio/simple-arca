@@ -88,6 +88,19 @@ class CcmaParserTest(TestCase):
         self.assertEqual(Decimal(result["latest_payment_total"]), Decimal("29411.85"))
         self.assertEqual(result["payment_reconciliation"], "PARTIAL")
 
+    def test_current_period_is_not_overdue_during_its_due_date(self):
+        summary = SUMMARY.replace("05/08/2026", "20/08/2026").replace(
+            "154,967.91", "305,752.12"
+        )
+
+        result = parse_ccma_account(summary, ROWS)
+
+        self.assertNotIn("2026-08", {item["period"] for item in result["overdue"]})
+        self.assertEqual(
+            sum(Decimal(item["balance"]) for item in result["upcoming"]),
+            Decimal("150784.21"),
+        )
+
     def test_rejects_a_summary_that_does_not_match_the_detail(self):
         with self.assertRaisesRegex(CcmaError, "no coincide"):
             parse_ccma_account(SUMMARY.replace("154,967.91", "1.00"), ROWS)

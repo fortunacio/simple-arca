@@ -201,6 +201,99 @@ class NotificationMonitorTest(TestCase):
         self.assertIn("Monotributo: $500,00 de deuda vencida", batch.text)
         self.assertIn("pago de Monotributo ya quedó reflejado", batch.text)
 
+    def test_due_date_is_not_called_overdue_even_with_an_old_snapshot_shape(self):
+        self.now = datetime(2026, 8, 20, 12, tzinfo=timezone.utc)
+        self.snapshot(
+            "ARCA_CCMA",
+            {
+                "debtor_total": "150784.21",
+                "overdue": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "balance": "150784.21",
+                    }
+                ],
+                "upcoming": [],
+            },
+        )
+
+        batch = TaxNotificationMonitor(
+            self.db, self.service, now=lambda: self.now
+        ).check_chat(1001)
+
+        self.assertIn("vence hoy", batch.text)
+        self.assertNotIn("deuda vencida", batch.text)
+        self.assertNotIn("requiere revisión", batch.text)
+
+    def test_first_business_day_after_due_date_uses_processing_message(self):
+        self.now = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+        self.snapshot(
+            "ARCA_CCMA",
+            {
+                "debtor_total": "150784.21",
+                "overdue": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-21",
+                        "balance": "150784.21",
+                    }
+                ],
+                "upcoming": [],
+            },
+        )
+
+        batch = TaxNotificationMonitor(
+            self.db, self.service, now=lambda: self.now
+        ).check_chat(1001)
+
+        self.assertIn("débito automático puede estar procesándose", batch.text)
+        self.assertNotIn("deuda vencida", batch.text)
+        self.assertNotIn("requiere revisión", batch.text)
+
+    def test_second_business_day_after_due_date_requires_review(self):
+        self.now = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+        self.snapshot(
+            "ARCA_CCMA",
+            {
+                "debtor_total": "150784.21",
+                "overdue": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-21",
+                        "balance": "150784.21",
+                    }
+                ],
+                "upcoming": [],
+            },
+        )
+
+        batch = TaxNotificationMonitor(
+            self.db, self.service, now=lambda: self.now
+        ).check_chat(1001)
+
+        self.assertIn("después de dos días hábiles", batch.text)
+        self.assertIn("Requiere revisión", batch.text)
+        self.assertNotIn("puede estar procesándose", batch.text)
+
+    def test_monotributo_clearance_is_confirmed_after_tracking(self):
+        self.db.mark_notification_sent(
+            1001,
+            "due:arca_ccma:2026-08:0",
+            "2026-08-20:150784.21",
+            self.now.isoformat(),
+        )
+        self.snapshot(
+            "ARCA_CCMA",
+            {"debtor_total": "0", "overdue": [], "upcoming": []},
+        )
+
+        batch = TaxNotificationMonitor(
+            self.db, self.service, now=lambda: self.now
+        ).check_chat(1001)
+
+        self.assertIn("ARCA ya no muestra saldo pendiente", batch.text)
+
     def test_iibb_payment_keeps_the_warning_without_calling_it_monotributo(self):
         self.snapshot(
             "SANTA_FE_IIBB",
@@ -308,6 +401,68 @@ class NotificationMonitorTest(TestCase):
         ).check_chat(1001)
 
         self.assertIsNone(batch)
+
+    def test_seti_paid_suppresses_stale_iibb_debt_and_due_date(self):
+        self.now = datetime(2026, 8, 20, 12, tzinfo=timezone.utc)
+        self.snapshot(
+            "SANTA_FE_IIBB",
+            {
+                "next_obligation": {
+                    "period": "2026-07",
+                    "due_date": "2026-08-20",
+                    "amount": "42882.00",
+                },
+                "vepai": {
+                    "payments": [],
+                    "reconciliation": {
+                        "status": "MISSING",
+                        "missing_periods": ["2026-07"],
+                    },
+                },
+            },
+        )
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_SETI",
+            "payment_status",
+            self.now.isoformat(),
+            (self.now + timedelta(days=1)).isoformat(),
+            json.dumps(
+                {
+                    "veps": [
+                        {
+                            "number": "1234565295",
+                            "status": "PAID",
+                            "tax_type": "SANTA_FE_IIBB",
+                            "tax_period": "2026-07",
+                            "amount": "42882.00",
+                            "paid_on": "2026-08-19",
+                        }
+                    ],
+                    "ccma_reconciliation": {
+                        "status": "COMPLETE",
+                        "paid_veps": 0,
+                        "matched_veps": 0,
+                        "unmatched_veps": 0,
+                        "excluded_iibb_veps": 1,
+                    },
+                }
+            ),
+        )
+
+        batch = TaxNotificationMonitor(
+            self.db,
+            TaxMonitorService(
+                self.db,
+                today=date(2026, 8, 20),
+                live_synchronizers={"SANTA_FE_IIBB": lambda _chat_id: None},
+            ),
+            now=lambda: self.now,
+        ).check_chat(1001)
+
+        self.assertIn("pago de Ingresos Brutos", batch.text)
+        self.assertNotIn("sin pago identificado", batch.text)
+        self.assertNotIn("vence hoy", batch.text)
 
     def test_warns_when_a_background_source_is_stale(self):
         stale_time = self.now - timedelta(hours=13)

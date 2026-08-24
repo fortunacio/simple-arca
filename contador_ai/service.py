@@ -684,6 +684,36 @@ class TaxMonitorService:
     def _ccma_overdue_total(self, snapshot: dict) -> Decimal:
         return self._ccma_balance_buckets(snapshot)[0]
 
+    def _ccma_tracking_details(self, snapshot: dict) -> dict[str, object] | None:
+        candidates: list[dict[str, object]] = []
+        for obligation in snapshot.get("obligations", []):
+            if not isinstance(obligation, dict):
+                continue
+            try:
+                due = date.fromisoformat(str(obligation.get("due_date", "")))
+                balance = Decimal(str(obligation.get("balance", "0")))
+                principal = Decimal(str(obligation["principal"]))
+                principal_outstanding = Decimal(
+                    str(obligation["principal_outstanding"])
+                )
+                interest = Decimal(str(obligation["interest"]))
+            except (InvalidOperation, KeyError, ValueError):
+                continue
+            if due > self.today or balance <= 0:
+                continue
+            candidates.append(
+                {
+                    "period": str(obligation.get("period", "")),
+                    "due_date": due,
+                    "balance": balance,
+                    "principal": principal,
+                    "principal_outstanding": principal_outstanding,
+                    "interest": interest,
+                    "status": str(obligation.get("status", "")).upper(),
+                }
+            )
+        return max(candidates, key=lambda item: str(item["period"])) if candidates else None
+
     def _paid_iibb_periods(self, chat_id: int) -> set[str]:
         snapshot = self.valid_snapshot(chat_id, "ARCA_SETI", "payment_status")
         if snapshot is None:
@@ -708,6 +738,45 @@ class TaxMonitorService:
             if match:
                 periods.add(f"20{match.group('year')}-{match.group('month')}")
         return periods
+
+    def _ccma_balance_timeline(
+        self,
+        chat_id: int,
+        snapshot: dict,
+    ) -> list[tuple[date, Decimal]]:
+        daily: dict[date, Decimal] = {}
+        for row in self.db.notification_deliveries(
+            chat_id,
+            "due:arca_ccma:",
+            limit=100,
+        ):
+            fingerprint = str(row["fingerprint"])
+            _due_value, separator, amount_value = fingerprint.partition(":")
+            if not separator:
+                continue
+            try:
+                sent_at = datetime.fromisoformat(
+                    str(row["sent_at"]).replace("Z", "+00:00")
+                )
+                if sent_at.tzinfo is None:
+                    sent_at = sent_at.replace(tzinfo=timezone.utc)
+                observed_on = sent_at.astimezone(ARGENTINA_TIMEZONE).date()
+                daily[observed_on] = Decimal(amount_value)
+            except (InvalidOperation, ValueError):
+                continue
+        for row in self.db.get_ccma_observations(chat_id, limit=60):
+            try:
+                daily[date.fromisoformat(str(row["calculated_on"]))] = Decimal(
+                    str(row["debtor_total"])
+                )
+            except (InvalidOperation, ValueError):
+                continue
+        try:
+            calculated_on = date.fromisoformat(str(snapshot.get("calculated_on", "")))
+            daily[calculated_on] = Decimal(str(snapshot.get("debtor_total", "0")))
+        except (InvalidOperation, ValueError):
+            pass
+        return sorted(daily.items())[-10:]
 
     @staticmethod
     def _display_month(period: str) -> str:
@@ -749,6 +818,62 @@ class TaxMonitorService:
                     "El débito automático puede estar procesándose.",
                 ]
             )
+
+        for obligation in snapshot.get("obligations", []):
+            if not isinstance(obligation, dict):
+                continue
+            try:
+                due = date.fromisoformat(str(obligation.get("due_date", "")))
+                balance = Decimal(str(obligation.get("balance", "0")))
+                principal = Decimal(str(obligation["principal"]))
+                principal_outstanding = Decimal(
+                    str(obligation["principal_outstanding"])
+                )
+                interest = Decimal(str(obligation["interest"]))
+            except (InvalidOperation, KeyError, ValueError):
+                continue
+            if balance <= 0 or due > self.today:
+                continue
+            period = str(obligation.get("period", ""))
+            status = str(obligation.get("status", "")).upper()
+            lines.extend(
+                [
+                    "",
+                    f"Seguimiento de {self._display_month(period)}",
+                    f"• Vencimiento original: {format_date(due.isoformat())}",
+                    f"• Capital original: {format_money(principal)}",
+                    f"• Capital todavía pendiente en ARCA: {format_money(principal_outstanding)}",
+                    f"• Intereses informados por ARCA: {format_money(interest)}",
+                    f"• Saldo total informado: {format_money(balance)}",
+                ]
+            )
+            if status == "INTEREST_ONLY":
+                lines.append(
+                    "• ARCA ya registró el capital, pero todavía mantiene intereses."
+                )
+            elif status == "PARTIALLY_POSTED":
+                lines.append("• ARCA registró el pago sólo parcialmente.")
+            elif interest > 0:
+                lines.append(
+                    "• ARCA todavía no refleja un pago aplicado a este período y sigue calculando intereses."
+                )
+
+        timeline = self._ccma_balance_timeline(chat_id, snapshot)
+        if len(timeline) > 1:
+            lines.extend(["", "Evolución del saldo informado por ARCA"])
+            previous: Decimal | None = None
+            for observed_on, amount in timeline:
+                delta = amount - previous if previous is not None else Decimal("0")
+                delta_label = (
+                    f" ({'+' if delta > 0 else ''}{format_money(delta)})"
+                    if previous is not None and delta
+                    else ""
+                )
+                lines.append(
+                    f"• {format_date(observed_on.isoformat())}: "
+                    f"{format_money(amount)}{delta_label}"
+                )
+                previous = amount
         if creditor_total:
             lines.extend(["", f"Saldo a favor: {format_money(creditor_total)}"])
 
@@ -1205,7 +1330,25 @@ class TaxMonitorService:
             )
         elif ccma is not None:
             debt, processing = self._ccma_balance_buckets(ccma)
-            if debt > 0:
+            tracking = self._ccma_tracking_details(ccma)
+            if tracking is not None and tracking["status"] == "INTEREST_ONLY":
+                attention.append(
+                    "🟡 ARCA ya registró el capital de Monotributo de "
+                    f"{self._display_month(str(tracking['period']))}, pero todavía deja "
+                    f"{format_money(tracking['interest'])} de intereses. Requiere revisar "
+                    "la fecha de imputación antes de pagarlos."
+                )
+            elif debt > 0 and tracking is not None and Decimal(
+                str(tracking["interest"])
+            ) > 0:
+                attention.append(
+                    f"🔴 ARCA todavía mantiene {format_money(tracking['balance'])} "
+                    f"de Monotributo de {self._display_month(str(tracking['period']))}: "
+                    f"{format_money(tracking['principal_outstanding'])} de capital y "
+                    f"{format_money(tracking['interest'])} de intereses. Si ya se debitó, "
+                    "no vuelvas a pagarlo; seguimos la imputación."
+                )
+            elif debt > 0:
                 if "ARCA_SETI" in self.live_synchronizers and payment_snapshot is None:
                     attention.append(
                         f"⚠️ La cuenta muestra {format_money(debt)}, pero no pude verificar "
@@ -1418,12 +1561,27 @@ class TaxMonitorService:
                 )
         elif ccma is not None:
             debt, processing = self._ccma_balance_buckets(ccma)
+            tracking = self._ccma_tracking_details(ccma)
             lines.extend(
                 [
                     "",
                     "Monotributo",
                     (
-                        f"• Deuda vencida: {format_money(debt)}."
+                        (
+                            "• ARCA ya registró el capital, pero todavía deja "
+                            f"{format_money(tracking['interest'])} de intereses."
+                        )
+                        if tracking is not None
+                        and tracking["status"] == "INTEREST_ONLY"
+                        else (
+                            f"• ARCA informa {format_money(tracking['principal_outstanding'])} "
+                            "de capital y "
+                            f"{format_money(tracking['interest'])} de intereses pendientes."
+                        )
+                        if debt
+                        and tracking is not None
+                        and Decimal(str(tracking["interest"])) > 0
+                        else f"• Deuda vencida: {format_money(debt)}."
                         if debt
                         else (
                             f"• ARCA todavía muestra {format_money(processing)} pendiente; "

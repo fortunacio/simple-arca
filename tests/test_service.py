@@ -346,6 +346,71 @@ class ServiceTest(TestCase):
         self.assertIn("Saldo deudor que CCMA todavía informa", output)
         self.assertIn("agosto de 2026: $150.784,21 — 20/08/2026", output)
 
+    def test_monotributo_shows_principal_interest_and_balance_history(self):
+        self.db.ensure_user(1001)
+        fetched_at = datetime.now(timezone.utc)
+        payload = {
+            "calculated_on": "2026-08-24",
+            "debtor_total": "151337.08",
+            "creditor_total": "0",
+            "overdue": [
+                {
+                    "period": "2026-08",
+                    "due_date": "2026-08-20",
+                    "balance": "151337.08",
+                }
+            ],
+            "upcoming": [],
+            "obligations": [
+                {
+                    "period": "2026-08",
+                    "due_date": "2026-08-20",
+                    "principal": "150784.21",
+                    "principal_outstanding": "150784.21",
+                    "interest": "552.87",
+                    "balance": "151337.08",
+                    "status": "OUTSTANDING",
+                }
+            ],
+        }
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_CCMA",
+            "account_status",
+            fetched_at.isoformat(),
+            (fetched_at + timedelta(hours=1)).isoformat(),
+            json.dumps(payload),
+        )
+        self.db.record_ccma_observation(
+            1001,
+            "2026-08-23T03:05:00+00:00",
+            "2026-08-23",
+            "151198.87",
+            "{}",
+        )
+        self.db.record_ccma_observation(
+            1001,
+            "2026-08-24T03:09:00+00:00",
+            "2026-08-24",
+            "151337.08",
+            "{}",
+        )
+        self.db.upsert_connection(1001, "ARCA_CCMA", "CONNECTED", fetched_at.isoformat())
+        service = TaxMonitorService(
+            self.db,
+            today=date(2026, 8, 24),
+            live_synchronizers={"ARCA_CCMA": lambda _chat_id: None},
+        )
+
+        output = service.dispatch("/monotributo", 1001)
+
+        self.assertIn("Vencimiento original: 20/08/2026", output)
+        self.assertIn("Capital original: $150.784,21", output)
+        self.assertIn("Intereses informados por ARCA: $552,87", output)
+        self.assertIn("23/08/2026: $151.198,87", output)
+        self.assertIn("24/08/2026: $151.337,08 (+$138,21)", output)
+        self.assertIn("sigue calculando intereses", output)
+
     def test_monotributo_requests_login_when_ccma_session_expired(self):
         self.db.ensure_user(1001)
         self.db.upsert_connection(1001, "ARCA_CCMA", "LOGIN_REQUIRED")

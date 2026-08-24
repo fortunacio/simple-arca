@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -26,15 +28,31 @@ class CcmaBalance:
     description: str
     due_date: date
     balance: Decimal
+    principal: Decimal | None = None
+    principal_outstanding: Decimal | None = None
+    interest: Decimal | None = None
+    last_movement_description: str = ""
+    last_movement_date: date | None = None
 
     def to_payload(self) -> dict[str, str]:
-        return {
+        payload = {
             "period": self.period,
             "tax": self.tax,
             "description": self.description,
             "due_date": self.due_date.isoformat(),
             "balance": str(self.balance),
         }
+        if self.principal is not None:
+            payload["principal"] = str(self.principal)
+        if self.principal_outstanding is not None:
+            payload["principal_outstanding"] = str(self.principal_outstanding)
+        if self.interest is not None:
+            payload["interest"] = str(self.interest)
+        if self.last_movement_description:
+            payload["last_movement_description"] = self.last_movement_description
+        if self.last_movement_date is not None:
+            payload["last_movement_date"] = self.last_movement_date.isoformat()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -86,6 +104,95 @@ def _period_iso(value: str) -> str:
     return f"{year}-{month}"
 
 
+def _normalized_description(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value)
+        if not unicodedata.combining(character)
+    ).lower()
+
+
+def _movement_amount(cells: Sequence[str]) -> Decimal | None:
+    amount_text = next(
+        (
+            cell
+            for cell in reversed(cells)
+            if re.fullmatch(r"\(?[0-9,]+\.\d{2}\)?", cell)
+        ),
+        "",
+    )
+    return abs(_money(amount_text)) if amount_text else None
+
+
+def _obligation_payloads(
+    balances: Sequence[CcmaBalance],
+    payments: Sequence[CcmaPayment],
+    calculated_on: date,
+) -> list[dict[str, str]]:
+    grouped: dict[str, list[CcmaBalance]] = defaultdict(list)
+    for balance in balances:
+        if balance.balance > 0:
+            grouped[balance.period].append(balance)
+
+    payment_dates: dict[str, list[date]] = defaultdict(list)
+    payment_totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+    for payment in payments:
+        payment_dates[payment.period].append(payment.paid_on)
+        payment_totals[payment.period] += payment.amount
+
+    result: list[dict[str, str]] = []
+    for period, items in sorted(grouped.items()):
+        due_date = min(item.due_date for item in items)
+        balance_total = sum((item.balance for item in items), Decimal("0"))
+        breakdown_known = all(item.principal is not None for item in items)
+        principal = (
+            sum((item.principal or Decimal("0") for item in items), Decimal("0"))
+            if breakdown_known
+            else None
+        )
+        principal_outstanding = (
+            sum(
+                (item.principal_outstanding or Decimal("0") for item in items),
+                Decimal("0"),
+            )
+            if breakdown_known
+            else None
+        )
+        interest = (
+            sum((item.interest or Decimal("0") for item in items), Decimal("0"))
+            if breakdown_known
+            else None
+        )
+        latest_payment = max(payment_dates.get(period, []), default=None)
+        if due_date >= calculated_on:
+            status = "UPCOMING"
+        elif (
+            principal_outstanding is not None
+            and principal_outstanding <= Decimal("0.02")
+            and interest is not None
+            and interest > Decimal("0.02")
+        ):
+            status = "INTEREST_ONLY"
+        elif payment_totals.get(period, Decimal("0")) > 0:
+            status = "PARTIALLY_POSTED"
+        else:
+            status = "OUTSTANDING"
+        payload = {
+            "period": period,
+            "due_date": due_date.isoformat(),
+            "balance": str(balance_total),
+            "status": status,
+            "latest_payment_date": latest_payment.isoformat() if latest_payment else "",
+            "payments_total": str(payment_totals.get(period, Decimal("0"))),
+        }
+        if principal is not None:
+            payload["principal"] = str(principal)
+            payload["principal_outstanding"] = str(principal_outstanding)
+            payload["interest"] = str(interest)
+        result.append(payload)
+    return result
+
+
 def parse_ccma_account(
     summary_text: str,
     rows: Iterable[Sequence[str]],
@@ -109,6 +216,10 @@ def parse_ccma_account(
     balances: list[CcmaBalance] = []
     payments: list[CcmaPayment] = []
     current: tuple[str, str, str, date] | None = None
+    obligations: dict[tuple[str, str], tuple[str, date, Decimal]] = {}
+    principal_payments: dict[tuple[str, str], Decimal] = defaultdict(
+        lambda: Decimal("0")
+    )
 
     for raw_cells in rows:
         cells = [" ".join(str(cell).split()) for cell in raw_cells]
@@ -127,7 +238,45 @@ def parse_ccma_account(
             )
             balance = _money(amount_text)
             if balance:
-                balances.append(CcmaBalance(*current, balance))
+                period_value, tax, description, movement_date = current
+                obligation = obligations.get((period_value, tax))
+                if obligation is None:
+                    balances.append(
+                        CcmaBalance(
+                            period_value,
+                            tax,
+                            description,
+                            movement_date,
+                            balance,
+                            last_movement_description=description,
+                            last_movement_date=movement_date,
+                        )
+                    )
+                else:
+                    obligation_description, due_date, principal = obligation
+                    principal_outstanding = max(
+                        Decimal("0"),
+                        principal - principal_payments[(period_value, tax)],
+                    )
+                    interest = (
+                        max(Decimal("0"), balance - principal_outstanding)
+                        if balance > 0
+                        else Decimal("0")
+                    )
+                    balances.append(
+                        CcmaBalance(
+                            period_value,
+                            tax,
+                            obligation_description,
+                            due_date,
+                            balance,
+                            principal,
+                            principal_outstanding,
+                            interest,
+                            description,
+                            movement_date,
+                        )
+                    )
             continue
 
         tax_index = next(
@@ -143,7 +292,16 @@ def parse_ccma_account(
         tax = tail[tax_index]
         date_index = tail.index(movement_date)
         description = tail[date_index - 1] if date_index else ""
-        if description.lower().startswith("pago"):
+        period_value = _period_iso(period)
+        key = (period_value, tax)
+        normalized_description = _normalized_description(description)
+        amount = _movement_amount(tail[date_index + 1 :])
+        if normalized_description.startswith("obligacion mensual") and amount is not None:
+            previous = obligations.get(key)
+            candidate = (description, _date(movement_date), amount)
+            if previous is None or candidate[1] < previous[1]:
+                obligations[key] = candidate
+        if normalized_description.startswith("pago"):
             amount_text = next(
                 (
                     cell
@@ -153,16 +311,19 @@ def parse_ccma_account(
                 "",
             )
             if amount_text:
+                payment_amount = abs(_money(f"({amount_text})"))
                 payments.append(
                     CcmaPayment(
-                        _period_iso(period),
+                        period_value,
                         tax,
                         description,
                         _date(movement_date),
-                        abs(_money(f"({amount_text})")),
+                        payment_amount,
                     )
                 )
-        current = (_period_iso(period), tax, description, _date(movement_date))
+                if "interes" not in normalized_description:
+                    principal_payments[key] += payment_amount
+        current = (period_value, tax, description, _date(movement_date))
 
     debt_bearing = tuple(
         balance
@@ -225,6 +386,7 @@ def parse_ccma_account(
         "upcoming": [item.to_payload() for item in upcoming],
         "credits": [item.to_payload() for item in credits],
         "payments": [item.to_payload() for item in recent_payments],
+        "obligations": _obligation_payloads(balances, payments, calculated_on),
         "latest_payment_date": latest_payment_date.isoformat() if latest_payment_date else "",
         "latest_payment_total": str(latest_payment_total),
         "payment_reconciliation": payment_reconciliation,

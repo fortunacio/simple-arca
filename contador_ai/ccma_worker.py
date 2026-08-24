@@ -374,13 +374,25 @@ class CcmaWorker:
             self.db.upsert_connection(chat_id, "ARCA_CCMA", "ERROR", last_error=str(exc))
             raise
         fetched_at = datetime.now(timezone.utc)
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.db.record_ccma_observation(
+            chat_id,
+            fetched_at.isoformat(),
+            str(payload.get("calculated_on", "")),
+            str(payload.get("debtor_total", "0")),
+            payload_json,
+        )
         self.db.upsert_live_snapshot(
             chat_id,
             "ARCA_CCMA",
             "account_status",
             fetched_at.isoformat(),
             (fetched_at + self.snapshot_ttl).isoformat(),
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            payload_json,
         )
         self.db.upsert_connection(
             chat_id,

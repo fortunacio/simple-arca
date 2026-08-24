@@ -37,6 +37,16 @@ CREATE TABLE IF NOT EXISTS live_snapshots (
     FOREIGN KEY (chat_id) REFERENCES users(chat_id)
 );
 
+CREATE TABLE IF NOT EXISTS ccma_account_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    fetched_at TEXT NOT NULL,
+    calculated_on TEXT NOT NULL,
+    debtor_total TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS onboarding_tokens (
     token_hash TEXT PRIMARY KEY,
     chat_id INTEGER NOT NULL,
@@ -320,6 +330,9 @@ ON iibb_payment_drafts(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_iibb_payment_notifications
 ON iibb_payment_drafts(notification_pending, updated_at);
 
+CREATE INDEX IF NOT EXISTS idx_ccma_observations_chat_time
+ON ccma_account_observations(chat_id, fetched_at DESC);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_iibb_payment_one_active_period
 ON iibb_payment_drafts(chat_id, account, period)
 WHERE status IN (
@@ -420,6 +433,25 @@ class Database:
                 (chat_id, f"{prefix}%"),
             ).fetchall()
         return tuple(str(row["event_key"]) for row in rows)
+
+    def notification_deliveries(
+        self,
+        chat_id: int,
+        prefix: str,
+        *,
+        limit: int = 100,
+    ):
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT event_key, fingerprint, sent_at
+                FROM notification_deliveries
+                WHERE chat_id = ? AND event_key LIKE ?
+                ORDER BY sent_at DESC
+                LIMIT ?
+                """,
+                (chat_id, f"{prefix}%", max(1, min(limit, 500))),
+            ).fetchall()
 
     def mark_notification_sent(
         self,
@@ -634,6 +666,37 @@ class Database:
                 """,
                 (chat_id, provider, kind, fetched_at, expires_at, payload_json),
             )
+
+    def record_ccma_observation(
+        self,
+        chat_id: int,
+        fetched_at: str,
+        calculated_on: str,
+        debtor_total: str,
+        payload_json: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ccma_account_observations(
+                    chat_id, fetched_at, calculated_on, debtor_total, payload_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (chat_id, fetched_at, calculated_on, debtor_total, payload_json),
+            )
+
+    def get_ccma_observations(self, chat_id: int, *, limit: int = 30):
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT fetched_at, calculated_on, debtor_total, payload_json
+                FROM ccma_account_observations
+                WHERE chat_id = ?
+                ORDER BY fetched_at DESC
+                LIMIT ?
+                """,
+                (chat_id, max(1, min(limit, 365))),
+            ).fetchall()
 
     def get_live_snapshot(self, chat_id: int, provider: str, kind: str):
         with self.connect() as connection:

@@ -276,6 +276,121 @@ class NotificationMonitorTest(TestCase):
         self.assertIn("Requiere revisión", batch.text)
         self.assertNotIn("puede estar procesándose", batch.text)
 
+    def test_interest_growth_is_recorded_without_repeating_the_same_alert(self):
+        self.now = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+        self.snapshot(
+            "ARCA_CCMA",
+            {
+                "debtor_total": "151337.08",
+                "overdue": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "balance": "151337.08",
+                    }
+                ],
+                "upcoming": [],
+                "obligations": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "principal": "150784.21",
+                        "principal_outstanding": "150784.21",
+                        "interest": "552.87",
+                        "balance": "151337.08",
+                        "status": "OUTSTANDING",
+                    }
+                ],
+            },
+        )
+        self.snapshot(
+            "SANTA_FE_IIBB",
+            {"vepai": {"reconciliation": {"status": "COMPLETE"}}},
+        )
+        monitor = TaxNotificationMonitor(self.db, self.service, now=lambda: self.now)
+
+        first = monitor.check_chat(1001)
+
+        self.assertIn("Capital: $150.784,21", first.text)
+        self.assertIn("intereses: $552,87", first.text)
+        self.assertNotIn("vence hoy", first.text)
+        monitor.mark_sent(1001, first)
+
+        self.now = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+        self.snapshot(
+            "ARCA_CCMA",
+            {
+                "debtor_total": "151475.30",
+                "overdue": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "balance": "151475.30",
+                    }
+                ],
+                "upcoming": [],
+                "obligations": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "principal": "150784.21",
+                        "principal_outstanding": "150784.21",
+                        "interest": "691.09",
+                        "balance": "151475.30",
+                        "status": "OUTSTANDING",
+                    }
+                ],
+            },
+        )
+        self.snapshot(
+            "SANTA_FE_IIBB",
+            {"vepai": {"reconciliation": {"status": "COMPLETE"}}},
+        )
+
+        second = monitor.check_chat(1001)
+
+        self.assertTrue(second is None or "Monotributo" not in second.text)
+
+    def test_notifies_when_payment_posting_leaves_only_interest(self):
+        self.now = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+        self.snapshot(
+            "ARCA_CCMA",
+            {
+                "debtor_total": "10.00",
+                "overdue": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "balance": "10.00",
+                    }
+                ],
+                "upcoming": [],
+                "obligations": [
+                    {
+                        "period": "2026-08",
+                        "due_date": "2026-08-20",
+                        "principal": "100.00",
+                        "principal_outstanding": "0",
+                        "interest": "10.00",
+                        "balance": "10.00",
+                        "status": "INTEREST_ONLY",
+                        "latest_payment_date": "2026-08-20",
+                    }
+                ],
+            },
+        )
+
+        batch = TaxNotificationMonitor(
+            self.db,
+            self.service,
+            now=lambda: self.now,
+        ).check_chat(1001)
+
+        self.assertIn("ARCA ya registró el capital", batch.text)
+        self.assertIn("$10,00 de intereses", batch.text)
+        self.assertIn("no los pagues nuevamente", batch.text)
+        self.assertNotIn("vence hoy", batch.text)
+
     def test_monotributo_clearance_is_confirmed_after_tracking(self):
         self.db.mark_notification_sent(
             1001,

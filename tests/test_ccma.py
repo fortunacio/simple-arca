@@ -1,5 +1,5 @@
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -10,6 +10,7 @@ from cryptography.fernet import Fernet
 from contador_ai.ccma import CcmaError, parse_ccma_account
 from contador_ai.ccma_worker import (
     CcmaBrowserConnector,
+    CcmaWorker,
     EncryptedArcaCredentials,
     EncryptedBrowserState,
     sync_portal_sources,
@@ -101,6 +102,58 @@ class CcmaParserTest(TestCase):
             Decimal("150784.21"),
         )
 
+    def test_interest_recalculation_preserves_original_due_date_and_breakdown(self):
+        summary = """
+        ÚLTIMA DEUDA CALCULADA FECHA DE CÁLCULO: 24/08/2026
+        PERÍODO TOTAL CALCULADO 01/2023 - 08/2026
+        Total Saldo Deudor: 151,337.08 Total Saldo Acreedor: 0.00
+        """
+        rows = (
+            ("", "08/2026", "020", "019", "019", "Obligacion Mensual Monot.", "20/08/2026", "78,573.20", "", ""),
+            ("", "08/2026", "020", "019", "051", "Intereses Resarcitorios Monot.", "24/08/2026", "288.10", "", ""),
+            ("", "08/2026", "", "", "", "Saldo", "24/08/2026", "", "", "(78,861.30)"),
+            ("", "08/2026", "021", "019", "019", "Obligacion Mensual Auton./Monot.", "20/08/2026", "29,386.76", "", ""),
+            ("", "08/2026", "021", "019", "051", "Intereses Resarcitorios Monot. / Aut.", "24/08/2026", "107.75", "", ""),
+            ("", "08/2026", "", "", "", "Saldo", "24/08/2026", "", "", "(29,494.51)"),
+            ("", "08/2026", "024", "019", "019", "Obligacion Mensual Obra Social", "20/08/2026", "42,824.25", "", ""),
+            ("", "08/2026", "024", "019", "051", "Intereses Resarcit. Monot. / Aut. (Obra Social)", "24/08/2026", "157.02", "", ""),
+            ("", "08/2026", "", "", "", "Saldo", "24/08/2026", "", "", "(42,981.27)"),
+        )
+
+        result = parse_ccma_account(summary, rows)
+
+        self.assertEqual(result["upcoming"], [])
+        self.assertEqual({item["due_date"] for item in result["overdue"]}, {"2026-08-20"})
+        obligation = result["obligations"][0]
+        self.assertEqual(obligation["status"], "OUTSTANDING")
+        self.assertEqual(Decimal(obligation["principal"]), Decimal("150784.21"))
+        self.assertEqual(
+            Decimal(obligation["principal_outstanding"]),
+            Decimal("150784.21"),
+        )
+        self.assertEqual(Decimal(obligation["interest"]), Decimal("552.87"))
+        self.assertEqual(Decimal(obligation["balance"]), Decimal("151337.08"))
+
+    def test_payment_posting_can_leave_only_residual_interest(self):
+        summary = """
+        ÚLTIMA DEUDA CALCULADA FECHA DE CÁLCULO: 24/08/2026
+        PERÍODO TOTAL CALCULADO 08/2026 - 08/2026
+        Total Saldo Deudor: 10.00 Total Saldo Acreedor: 0.00
+        """
+        rows = (
+            ("", "08/2026", "020", "019", "019", "Obligacion Mensual Monot.", "20/08/2026", "100.00", "", ""),
+            ("", "08/2026", "020", "019", "019", "Pago Obligacion Mensual", "20/08/2026", "", "100.00", ""),
+            ("", "08/2026", "020", "019", "051", "Intereses Resarcitorios Monot.", "24/08/2026", "10.00", "", ""),
+            ("", "08/2026", "", "", "", "Saldo", "24/08/2026", "", "", "(10.00)"),
+        )
+
+        result = parse_ccma_account(summary, rows)
+
+        obligation = result["obligations"][0]
+        self.assertEqual(obligation["status"], "INTEREST_ONLY")
+        self.assertEqual(Decimal(obligation["principal_outstanding"]), Decimal("0"))
+        self.assertEqual(Decimal(obligation["interest"]), Decimal("10.00"))
+
     def test_rejects_a_summary_that_does_not_match_the_detail(self):
         with self.assertRaisesRegex(CcmaError, "no coincide"):
             parse_ccma_account(SUMMARY.replace("154,967.91", "1.00"), ROWS)
@@ -185,3 +238,34 @@ class CcmaParserTest(TestCase):
             self.assertEqual(seti.calls, [1001])
             self.assertEqual(santa_fe.calls, [1001])
             self.assertIsNotNone(db.get_portal_access(1001)["ready_at"])
+
+    def test_worker_keeps_each_ccma_observation_in_history(self):
+        payloads = [
+            {"calculated_on": "2026-08-23", "debtor_total": "151198.87"},
+            {"calculated_on": "2026-08-24", "debtor_total": "151337.08"},
+        ]
+
+        class Connector:
+            def sync(self, _chat_id, _represented_cuit):
+                return payloads.pop(0)
+
+        with TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.ensure_user(1001)
+            db.set_pending_tax_identity(1001, "20383717419", "production")
+            db.mark_tax_identity_verified(1001)
+            worker = CcmaWorker(
+                db,
+                Connector(),
+                snapshot_ttl=timedelta(hours=12),
+            )
+
+            worker.sync_chat(1001)
+            worker.sync_chat(1001)
+
+            observations = db.get_ccma_observations(1001)
+            self.assertEqual(len(observations), 2)
+            self.assertEqual(observations[0]["calculated_on"], "2026-08-24")
+            latest = db.get_live_snapshot(1001, "ARCA_CCMA", "account_status")
+            self.assertIn('"debtor_total":"151337.08"', latest["payload_json"])

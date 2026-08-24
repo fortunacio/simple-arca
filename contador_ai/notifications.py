@@ -194,9 +194,15 @@ class TaxNotificationMonitor:
                 debt = Decimal("0")
             overdue = ccma_payload.get("overdue", []) or []
             upcoming = ccma_payload.get("upcoming", []) or []
+            obligations = ccma_payload.get("obligations", []) or []
+            obligation_by_period = {
+                str(item.get("period", "")): item
+                for item in obligations
+                if isinstance(item, dict) and str(item.get("period", ""))
+            }
             current_periods = {
                 str(item.get("period", ""))
-                for item in (*overdue, *upcoming)
+                for item in (*overdue, *upcoming, *obligations)
                 if str(item.get("period", ""))
             }
             overdue_grouped: dict[tuple[str, str], Decimal] = {}
@@ -234,25 +240,83 @@ class TaxNotificationMonitor:
             if not payment_update_pending:
                 for (period, due_value), amount in overdue_grouped.items():
                     due = date.fromisoformat(due_value)
+                    obligation = obligation_by_period.get(period, {})
+                    status = str(obligation.get("status", "")).upper()
+                    breakdown_known = all(
+                        key in obligation
+                        for key in ("principal", "principal_outstanding", "interest")
+                    )
+                    try:
+                        principal_outstanding = Decimal(
+                            str(obligation.get("principal_outstanding", "0"))
+                        )
+                        interest = Decimal(str(obligation.get("interest", "0")))
+                    except InvalidOperation:
+                        principal_outstanding = interest = Decimal("0")
+                        breakdown_known = False
+                    latest_payment_date = str(
+                        obligation.get("latest_payment_date", "")
+                    )
+                    if breakdown_known and status == "INTEREST_ONLY":
+                        add(
+                            "Pagos pendientes",
+                            f"residual-interest:arca_ccma:{period}",
+                            f"{due_value}:{latest_payment_date or 'POSTED'}:v1",
+                            (
+                                f"• Monotributo de {format_month_year(date.fromisoformat(f'{period}-01'))}: "
+                                "ARCA ya registró el capital, pero todavía deja "
+                                f"{format_money(interest)} de intereses. Requiere revisar "
+                                "la fecha de imputación; no los pagues nuevamente sin verificarla."
+                            ),
+                        )
+                        continue
+                    if breakdown_known and status == "PARTIALLY_POSTED":
+                        add(
+                            "Pagos pendientes",
+                            f"partial-posting:arca_ccma:{period}",
+                            f"{due_value}:{latest_payment_date or 'POSTED'}:v1",
+                            (
+                                f"• Monotributo de {format_month_year(date.fromisoformat(f'{period}-01'))}: "
+                                "ARCA registró parte del pago. Todavía muestra "
+                                f"{format_money(principal_outstanding)} de capital y "
+                                f"{format_money(interest)} de intereses "
+                                f"({format_money(amount)} en total)."
+                            ),
+                        )
+                        continue
                     business_days = self._business_days_after(due, today)
                     if business_days < MONOTRIBUTO_GRACE_BUSINESS_DAYS:
+                        detail = (
+                            f" Capital: {format_money(principal_outstanding)}; "
+                            f"intereses: {format_money(interest)}."
+                            if breakdown_known
+                            else ""
+                        )
                         add(
                             "Pagos",
                             f"pending:arca_ccma:{period}",
-                            f"{due_value}:{amount}",
+                            f"{due_value}:v2",
                             (
                                 f"• Monotributo: ARCA todavía muestra {format_money(amount)} "
-                                "pendiente; el débito automático puede estar procesándose."
+                                f"pendiente.{detail} El débito automático puede estar "
+                                "procesándose; lo sigo controlando."
                             ),
                         )
                     else:
+                        detail = (
+                            f" Capital: {format_money(principal_outstanding)}; "
+                            f"intereses: {format_money(interest)}."
+                            if breakdown_known
+                            else ""
+                        )
                         add(
                             "Pagos pendientes",
                             f"review:arca_ccma:{period}",
-                            f"{due_value}:{amount}",
+                            f"{due_value}:v2",
                             (
                                 f"• Monotributo: ARCA todavía muestra {format_money(amount)} "
-                                "pendiente después de dos días hábiles. Requiere revisión."
+                                f"pendiente después de dos días hábiles.{detail} "
+                                "Requiere revisión de la imputación."
                             ),
                         )
                 if undated_debt > 0:
@@ -310,7 +374,7 @@ class TaxNotificationMonitor:
                 add(
                     "Próximos vencimientos",
                     f"due:arca_ccma:{period}:{days}",
-                    f"{due_value}:{amount}",
+                    f"{due_value}:v2",
                     f"• Monotributo: {format_money(amount)} — {format_date(due_value)} ({suffix}).",
                 )
 

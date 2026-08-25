@@ -391,6 +391,78 @@ class NotificationMonitorTest(TestCase):
         self.assertIn("no los pagues nuevamente", batch.text)
         self.assertNotIn("vence hoy", batch.text)
 
+    def test_partial_posting_breaks_down_paid_and_pending_components(self):
+        self.now = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+        payload = {
+            "debtor_total": "78933.33",
+            "overdue": [
+                {
+                    "period": "2026-08",
+                    "tax": "020",
+                    "due_date": "2026-08-20",
+                    "balance": "78933.33",
+                    "principal_outstanding": "78573.20",
+                    "interest": "360.13",
+                }
+            ],
+            "upcoming": [],
+            "payments": [
+                {
+                    "period": "2026-08",
+                    "tax": "021",
+                    "description": "Pago Obligacion Mensual Auton./Monot.",
+                    "paid_on": "2026-08-20",
+                    "amount": "29386.76",
+                },
+                {
+                    "period": "2026-08",
+                    "tax": "024",
+                    "description": (
+                        "Pago Obligacion Mensual Auton./Monot.(Obra Social)"
+                    ),
+                    "paid_on": "2026-08-20",
+                    "amount": "42824.25",
+                },
+            ],
+            "obligations": [
+                {
+                    "period": "2026-08",
+                    "due_date": "2026-08-20",
+                    "principal": "78573.20",
+                    "principal_outstanding": "78573.20",
+                    "interest": "360.13",
+                    "balance": "78933.33",
+                    "status": "PARTIALLY_POSTED",
+                    "latest_payment_date": "2026-08-20",
+                }
+            ],
+        }
+        self.snapshot("ARCA_CCMA", payload)
+        monitor = TaxNotificationMonitor(self.db, self.service, now=lambda: self.now)
+
+        batch = monitor.check_chat(1001)
+
+        self.assertIn("Pago parcialmente registrado por ARCA", batch.text)
+        self.assertIn("Aporte jubilatorio: $29.386,76", batch.text)
+        self.assertIn("Obra social: $42.824,25", batch.text)
+        self.assertIn("Total registrado: $72.211,01", batch.text)
+        self.assertIn("Impuesto integrado: $78.573,20", batch.text)
+        self.assertIn("Intereses visibles: $360,13", batch.text)
+        self.assertIn("Saldo actual: $78.933,33", batch.text)
+        self.assertNotIn("\nPagos pendientes\n", batch.text)
+
+        monitor.mark_sent(1001, batch)
+        payload["debtor_total"] = "79005.36"
+        payload["overdue"][0]["balance"] = "79005.36"
+        payload["overdue"][0]["interest"] = "432.16"
+        payload["obligations"][0]["interest"] = "432.16"
+        payload["obligations"][0]["balance"] = "79005.36"
+        self.now = datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
+        self.snapshot("ARCA_CCMA", payload)
+
+        second = monitor.check_chat(1001)
+        self.assertTrue(second is None or "Monotributo" not in second.text)
+
     def test_monotributo_clearance_is_confirmed_after_tracking(self):
         self.db.mark_notification_sent(
             1001,

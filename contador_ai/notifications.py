@@ -23,6 +23,11 @@ LOGGER = logging.getLogger(__name__)
 ARGENTINA_TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 REMINDER_DAYS = frozenset({14, 7, 3, 1, 0})
 MONOTRIBUTO_GRACE_BUSINESS_DAYS = 2
+MONOTRIBUTO_COMPONENT_LABELS = {
+    "020": "Impuesto integrado",
+    "021": "Aporte jubilatorio",
+    "024": "Obra social",
+}
 SNAPSHOT_KINDS = {
     "ARCA_PROFILE": "taxpayer_profile",
     "ARCA_DFE": "unread_communications",
@@ -99,6 +104,50 @@ class TaxNotificationMonitor:
             if cursor.weekday() < 5:
                 days += 1
         return days
+
+    @staticmethod
+    def _monotributo_components(
+        payload: dict,
+        period: str,
+    ) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
+        paid: dict[str, Decimal] = {}
+        for item in payload.get("payments", []) or []:
+            description = str(item.get("description", "")).casefold()
+            if (
+                str(item.get("period", "")) != period
+                or "pago oblig" not in description
+                or "mensual" not in description
+            ):
+                continue
+            try:
+                amount = Decimal(str(item.get("amount", "0")))
+            except InvalidOperation:
+                continue
+            if amount <= 0:
+                continue
+            tax = str(item.get("tax", ""))
+            paid[tax] = paid.get(tax, Decimal("0")) + amount
+
+        pending: dict[str, Decimal] = {}
+        for item in payload.get("overdue", []) or []:
+            if str(item.get("period", "")) != period:
+                continue
+            try:
+                amount = Decimal(str(item["principal_outstanding"]))
+            except (InvalidOperation, KeyError):
+                continue
+            if amount <= 0:
+                continue
+            tax = str(item.get("tax", ""))
+            pending[tax] = pending.get(tax, Decimal("0")) + amount
+        return paid, pending
+
+    @staticmethod
+    def _component_label(tax: str) -> str:
+        return MONOTRIBUTO_COMPONENT_LABELS.get(
+            tax,
+            f"Concepto {tax or 'sin identificar'}",
+        )
 
     def refresh_official_apis(self, chat_id: int) -> None:
         now = self.now()
@@ -271,17 +320,63 @@ class TaxNotificationMonitor:
                         )
                         continue
                     if breakdown_known and status == "PARTIALLY_POSTED":
+                        paid_components, pending_components = self._monotributo_components(
+                            ccma_payload,
+                            period,
+                        )
+                        component_signature = json.dumps(
+                            [
+                                sorted(
+                                    (tax, str(value))
+                                    for tax, value in paid_components.items()
+                                ),
+                                sorted(
+                                    (tax, str(value))
+                                    for tax, value in pending_components.items()
+                                ),
+                            ],
+                            separators=(",", ":"),
+                        )
+                        month = format_month_year(
+                            date.fromisoformat(f"{period}-01")
+                        )
+                        detail_lines = [
+                            f"• Monotributo de {month}"
+                        ]
+                        if paid_components:
+                            detail_lines.append("  ARCA ya registró:")
+                            detail_lines.extend(
+                                f"  - {self._component_label(tax)}: {format_money(value)}"
+                                for tax, value in sorted(paid_components.items())
+                            )
+                            detail_lines.append(
+                                "  Total registrado: "
+                                f"{format_money(sum(paid_components.values(), Decimal('0')))}"
+                            )
+                        if pending_components:
+                            detail_lines.append("  Sigue pendiente:")
+                            detail_lines.extend(
+                                f"  - {self._component_label(tax)}: {format_money(value)}"
+                                for tax, value in sorted(pending_components.items())
+                            )
+                        else:
+                            detail_lines.append(
+                                f"  Capital todavía pendiente: {format_money(principal_outstanding)}"
+                            )
+                        detail_lines.extend(
+                            [
+                                f"  Intereses visibles: {format_money(interest)}",
+                                f"  Saldo actual: {format_money(amount)}",
+                            ]
+                        )
                         add(
-                            "Pagos pendientes",
+                            "Pago parcialmente registrado por ARCA",
                             f"partial-posting:arca_ccma:{period}",
-                            f"{due_value}:{latest_payment_date or 'POSTED'}:v1",
                             (
-                                f"• Monotributo de {format_month_year(date.fromisoformat(f'{period}-01'))}: "
-                                "ARCA registró parte del pago. Todavía muestra "
-                                f"{format_money(principal_outstanding)} de capital y "
-                                f"{format_money(interest)} de intereses "
-                                f"({format_money(amount)} en total)."
+                                f"{due_value}:{latest_payment_date or 'POSTED'}:"
+                                f"v2:{component_signature}"
                             ),
+                            "\n".join(detail_lines),
                         )
                         continue
                     business_days = self._business_days_after(due, today)

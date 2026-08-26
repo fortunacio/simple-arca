@@ -671,6 +671,32 @@ class NotificationMonitorTest(TestCase):
 
         self.assertIn("Monotributo lleva demasiado tiempo sin actualizarse", batch.text)
 
+    def test_waits_for_scheduled_refresh_before_warning_that_source_is_stale(self):
+        fetched_at = self.now - timedelta(hours=12, minutes=1)
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_CCMA",
+            "account_status",
+            fetched_at.isoformat(),
+            (fetched_at + timedelta(days=1)).isoformat(),
+            json.dumps({"debtor_total": "0", "overdue": [], "upcoming": []}),
+        )
+        self.db.upsert_connection(1001, "ARCA_CCMA", "ERROR")
+        service = TaxMonitorService(
+            self.db,
+            today=date(2026, 8, 6),
+            live_synchronizers={"ARCA_CCMA": lambda _chat_id: None},
+        )
+        monitor = TaxNotificationMonitor(self.db, service, now=lambda: self.now)
+
+        self.assertIsNone(monitor.check_chat(1001))
+
+        current = self.now + timedelta(minutes=15)
+        delayed = TaxNotificationMonitor(self.db, service, now=lambda: current).check_chat(1001)
+
+        self.assertIsNotNone(delayed)
+        self.assertIn("Monotributo lleva demasiado tiempo sin actualizarse", delayed.text)
+
     def test_missing_shared_access_is_reported_only_once(self):
         self.db.set_pending_tax_identity(1001, "20383717419", "production")
         self.db.mark_tax_identity_verified(1001)

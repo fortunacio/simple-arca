@@ -187,9 +187,10 @@ valores por defecto son:
 | Tabla oficial de topes | 86.400 segundos |
 
 Los snapshots de APIs oficiales duran treinta y seis horas y los de portales
-veinticuatro horas. El bot avisa a las treinta horas si una API oficial sigue sin
-actualizarse y a las doce si falla un portal, antes de que venza el dato guardado. La
-evaluación de cinco minutos normalmente sólo lee SQLite; abre las APIs oficiales
+veinticuatro horas. El bot considera atrasada una API oficial a las treinta horas y un
+portal a las doce. Antes de enviar la notificación espera quince minutos para que pueda
+terminar el reintento programado; si la fuente se recupera durante esa ventana no avisa.
+La evaluación de cinco minutos normalmente sólo lee SQLite; abre las APIs oficiales
 únicamente cuando ya transcurrió el intervalo de seis horas. Los portales los actualiza
 exclusivamente el worker en su propio ciclo.
 

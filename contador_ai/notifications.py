@@ -44,6 +44,7 @@ STALE_AFTER = {
     "ARCA_SETI": timedelta(hours=12),
     "SANTA_FE_IIBB": timedelta(hours=12),
 }
+STALE_NOTIFICATION_GRACE = timedelta(minutes=15)
 
 
 @dataclass(frozen=True)
@@ -67,12 +68,14 @@ class TaxNotificationMonitor:
         now: Callable[[], datetime] | None = None,
         refresh_interval: timedelta = timedelta(hours=6),
         broken_reminder_interval: timedelta = timedelta(hours=1),
+        stale_notification_grace: timedelta = STALE_NOTIFICATION_GRACE,
     ):
         self.db = db
         self.service = service
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.refresh_interval = refresh_interval
         self.broken_reminder_interval = broken_reminder_interval
+        self.stale_notification_grace = stale_notification_grace
 
     @staticmethod
     def _parse_datetime(value: str | None) -> datetime | None:
@@ -669,7 +672,10 @@ class TaxNotificationMonitor:
                 last_success = snapshot[1]
             status = str(connection["status"]) if connection else "MISSING"
             needs_credentials = status in {"LOGIN_REQUIRED", "CREDENTIALS_REQUIRED"}
-            stale = last_success is None or now - last_success > maximum_age
+            stale = (
+                last_success is None
+                or now - last_success > maximum_age + self.stale_notification_grace
+            )
             if not needs_credentials and not stale:
                 continue
             fingerprint = f"{status}:{last_success.isoformat() if last_success else 'never'}"

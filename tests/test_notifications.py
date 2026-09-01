@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from contador_ai.db import Database
+from contador_ai.health import FailureDetail
 from contador_ai.notifications import TaxNotificationMonitor
 from contador_ai.service import TaxMonitorService
 
@@ -661,7 +662,12 @@ class NotificationMonitorTest(TestCase):
             (stale_time + timedelta(days=1)).isoformat(),
             json.dumps({"debtor_total": "0", "overdue": [], "upcoming": []}),
         )
-        self.db.upsert_connection(1001, "ARCA_CCMA", "ERROR")
+        self.db.upsert_connection(
+            1001,
+            "ARCA_CCMA",
+            "CONNECTED",
+            stale_time.isoformat(),
+        )
 
         batch = TaxNotificationMonitor(
             self.db,
@@ -669,7 +675,49 @@ class NotificationMonitorTest(TestCase):
             now=lambda: self.now,
         ).check_chat(1001)
 
-        self.assertIn("Monotributo lleva demasiado tiempo sin actualizarse", batch.text)
+        self.assertIn("no pudo completar las actualizaciones programadas", batch.text)
+        self.assertIn("Último dato válido", batch.text)
+
+    def test_stale_snapshot_does_not_generate_tax_events(self):
+        stale_time = self.now - timedelta(hours=13)
+        self.db.upsert_live_snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            stale_time.isoformat(),
+            (stale_time + timedelta(days=1)).isoformat(),
+            json.dumps(
+                {
+                    "next_obligation": {
+                        "period": "2026-08",
+                        "due_date": self.now.date().isoformat(),
+                        "amount": "42882.00",
+                    },
+                    "vepai": {"status": "AVAILABLE", "payments": []},
+                }
+            ),
+        )
+        self.db.upsert_connection(
+            1001,
+            "SANTA_FE_IIBB",
+            "CONNECTED",
+            stale_time.isoformat(),
+        )
+        service = TaxMonitorService(
+            self.db,
+            today=self.now.date(),
+            live_synchronizers={"SANTA_FE_IIBB": lambda _chat_id: None},
+        )
+
+        batch = TaxNotificationMonitor(
+            self.db,
+            service,
+            now=lambda: self.now,
+        ).check_chat(1001)
+
+        self.assertIsNotNone(batch)
+        self.assertIn("actualizaciones programadas", batch.text)
+        self.assertNotIn("vence hoy", batch.text)
 
     def test_waits_for_scheduled_refresh_before_warning_that_source_is_stale(self):
         fetched_at = self.now - timedelta(hours=12, minutes=1)
@@ -681,7 +729,12 @@ class NotificationMonitorTest(TestCase):
             (fetched_at + timedelta(days=1)).isoformat(),
             json.dumps({"debtor_total": "0", "overdue": [], "upcoming": []}),
         )
-        self.db.upsert_connection(1001, "ARCA_CCMA", "ERROR")
+        self.db.upsert_connection(
+            1001,
+            "ARCA_CCMA",
+            "CONNECTED",
+            fetched_at.isoformat(),
+        )
         service = TaxMonitorService(
             self.db,
             today=date(2026, 8, 6),
@@ -695,7 +748,7 @@ class NotificationMonitorTest(TestCase):
         delayed = TaxNotificationMonitor(self.db, service, now=lambda: current).check_chat(1001)
 
         self.assertIsNotNone(delayed)
-        self.assertIn("Monotributo lleva demasiado tiempo sin actualizarse", delayed.text)
+        self.assertIn("no pudo completar las actualizaciones programadas", delayed.text)
 
     def test_missing_shared_access_is_reported_only_once(self):
         self.db.set_pending_tax_identity(1001, "20383717419", "production")
@@ -709,10 +762,9 @@ class NotificationMonitorTest(TestCase):
             now=lambda: self.now,
         ).check_chat(1001)
 
-        self.assertEqual(batch.text.count("completar la conexión una sola vez"), 1)
-        self.assertNotIn("volver a validar", batch.text)
+        self.assertEqual(batch.text.count("Falta completar la conexión una sola vez"), 1)
 
-    def test_broken_access_is_reminded_hourly_until_it_recovers(self):
+    def test_broken_access_is_reminded_daily_until_it_recovers(self):
         self.db.set_pending_tax_identity(1001, "20383717419", "production")
         self.db.mark_tax_identity_verified(1001)
         self.db.upsert_connection(1001, "ARCA_CCMA", "LOGIN_REQUIRED")
@@ -722,14 +774,14 @@ class NotificationMonitorTest(TestCase):
             self.db,
             self.service,
             now=lambda: current[0],
-            broken_reminder_interval=timedelta(hours=1),
+            auth_reminder_interval=timedelta(days=1),
         )
 
         first = monitor.check_chat(1001)
         self.assertIsNotNone(first)
         monitor.mark_sent(1001, first)
 
-        current[0] += timedelta(minutes=59)
+        current[0] += timedelta(hours=23, minutes=59)
         self.assertIsNone(monitor.check_chat(1001))
 
         current[0] += timedelta(minutes=1)
@@ -744,6 +796,14 @@ class NotificationMonitorTest(TestCase):
             current[0].isoformat(),
         )
         for provider in ("ARCA_CCMA", "SANTA_FE_IIBB"):
+            self.db.upsert_live_snapshot(
+                1001,
+                provider,
+                "account_status",
+                current[0].isoformat(),
+                (current[0] + timedelta(days=1)).isoformat(),
+                "{}",
+            )
             self.db.upsert_connection(
                 1001,
                 provider,
@@ -752,7 +812,7 @@ class NotificationMonitorTest(TestCase):
             )
         self.assertIsNone(monitor.check_chat(1001))
 
-    def test_stale_service_is_reminded_hourly_until_it_recovers(self):
+    def test_stale_service_is_not_repeated_and_reports_recovery(self):
         stale_time = self.now - timedelta(hours=13)
         self.db.upsert_live_snapshot(
             1001,
@@ -762,28 +822,113 @@ class NotificationMonitorTest(TestCase):
             (stale_time + timedelta(days=1)).isoformat(),
             json.dumps({"debtor_total": "0", "overdue": [], "upcoming": []}),
         )
-        self.db.upsert_connection(1001, "ARCA_CCMA", "ERROR")
+        self.db.upsert_connection(
+            1001,
+            "ARCA_CCMA",
+            "CONNECTED",
+            stale_time.isoformat(),
+        )
         current = [self.now]
         monitor = TaxNotificationMonitor(
             self.db,
             self.service,
             now=lambda: current[0],
-            broken_reminder_interval=timedelta(hours=1),
+            auth_reminder_interval=timedelta(days=1),
         )
 
         first = monitor.check_chat(1001)
         self.assertIsNotNone(first)
         monitor.mark_sent(1001, first)
-        current[0] += timedelta(hours=1)
-        reminder = monitor.check_chat(1001)
-        self.assertIsNotNone(reminder)
-        self.assertIn("Monotributo lleva demasiado tiempo sin actualizarse", reminder.text)
-        monitor.mark_sent(1001, reminder)
+        current[0] += timedelta(days=2)
+        self.assertIsNone(monitor.check_chat(1001))
 
-        self.db.upsert_connection(
+        self.db.upsert_live_snapshot(
             1001,
             "ARCA_CCMA",
-            "CONNECTED",
+            "account_status",
+            current[0].isoformat(),
+            (current[0] + timedelta(days=1)).isoformat(),
+            json.dumps({"debtor_total": "0", "overdue": [], "upcoming": []}),
+        )
+        self.db.record_connection_success(
+            1001,
+            "ARCA_CCMA",
             current[0].isoformat(),
         )
-        self.assertIsNone(monitor.check_chat(1001))
+        recovered = monitor.check_chat(1001)
+        self.assertIsNotNone(recovered)
+        self.assertIn("volvió a actualizarse correctamente", recovered.text)
+
+    def test_notifies_again_when_the_structured_cause_changes(self):
+        monitor = TaxNotificationMonitor(
+            self.db,
+            self.service,
+            now=lambda: self.now,
+        )
+        self.db.record_connection_failure(
+            1001,
+            "ARCA_CCMA",
+            "EXTERNAL_UNAVAILABLE",
+            FailureDetail(
+                "UPSTREAM_UNAVAILABLE",
+                stage="ccma_navigation",
+                code="HTTP_503",
+            ).to_json(),
+            attempted_at=self.now.isoformat(),
+        )
+
+        first = monitor.check_chat(1001)
+        self.assertIsNotNone(first)
+        self.assertIn("no está disponible", first.text)
+        monitor.mark_sent(1001, first)
+
+        self.db.record_connection_failure(
+            1001,
+            "ARCA_CCMA",
+            "UNEXPECTED_RESPONSE",
+            FailureDetail(
+                "UNEXPECTED_RESPONSE",
+                stage="ccma_account_contract",
+            ).to_json(),
+            attempted_at=(self.now + timedelta(minutes=1)).isoformat(),
+        )
+
+        changed = monitor.check_chat(1001)
+        self.assertIsNotNone(changed)
+        self.assertIn("respondió de una forma inesperada", changed.text)
+
+    def test_estado_resumen_and_notifications_share_the_same_health_cause(self):
+        self.db.set_pending_tax_identity(1001, "20383717419", "production")
+        self.db.mark_tax_identity_verified(1001)
+        self.db.mark_portal_access_verified(
+            1001,
+            "20383717419",
+            self.now.isoformat(),
+        )
+        self.db.record_connection_failure(
+            1001,
+            "ARCA_CCMA",
+            "EXTERNAL_UNAVAILABLE",
+            FailureDetail(
+                "UPSTREAM_UNAVAILABLE",
+                stage="ccma_navigation",
+                host="monotributo.afip.gob.ar",
+                code="HTTP_503",
+            ).to_json(),
+            attempted_at=self.now.isoformat(),
+        )
+        phrase = "Deuda de Monotributo no está disponible en el organismo"
+
+        summary = self.service.summary(1001)
+        status = self.service.status(1001)
+        batch = TaxNotificationMonitor(
+            self.db,
+            self.service,
+            now=lambda: self.now,
+        ).check_chat(1001)
+
+        self.assertIn(phrase, summary)
+        self.assertIn("Estado: UPSTREAM_UNAVAILABLE", status)
+        self.assertIn("Etapa: ccma_navigation", status)
+        self.assertIsNotNone(batch)
+        self.assertIn(phrase, batch.text)

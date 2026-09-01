@@ -26,7 +26,7 @@ El certificado actual vence el 04/08/2028. Programar su renovación con anticipa
 
 Inspección de sólo lectura realizada el 06/08/2026:
 
-- host: `winston.tail98a73b.ts.net`;
+- host: `winston.mandrill-piano.ts.net`;
 - IP de Tailscale: `100.75.19.73`;
 - Coolify: `4.1.2`;
 - Docker: `29.6.1`; Docker Compose: `5.3.1`;
@@ -120,7 +120,7 @@ de Telegram.
 | `TAILSCALE_BIND_IP` | `100.75.19.73` |
 | `ARCA_ENROLLMENT_HOST_PORT` | `8091` |
 | `CCMA_NOVNC_HOST_PORT` | `6080` |
-| `ARCA_ENROLLMENT_BASE_URL` | `http://winston.tail98a73b.ts.net:8091` |
+| `ARCA_ENROLLMENT_BASE_URL` | `http://winston.mandrill-piano.ts.net:8091` |
 | `ARCA_ENROLLMENT_ALLOW_TAILSCALE_HTTP` | `true` |
 
 La aplicación rechaza HTTP si la URL no es localhost, una IP del rango de Tailscale o
@@ -143,7 +143,7 @@ IIBB_PAYMENTS_ENABLED=true
 IIBB_PAYMENT_CHAT_IDS=CHAT_PERSONAL
 AUTOMATIC_MONITOR_ENABLED=true
 AUTOMATIC_MONITOR_CHECK_SECONDS=300
-AUTOMATIC_BROKEN_REMINDER_SECONDS=3600
+AUTOMATIC_AUTH_REMINDER_SECONDS=86400
 AUTOMATIC_SYNC_INTERVAL_SECONDS=21600
 ARCA_OFFICIAL_SNAPSHOT_TTL_SECONDS=129600
 ARCA_CATEGORY_LIMITS_REFRESH_SECONDS=86400
@@ -156,7 +156,7 @@ LOG_LEVEL=INFO
 Para el acceso de emergencia configurar:
 
 ```env
-CCMA_LOGIN_URL=http://winston.tail98a73b.ts.net:6080/vnc.html?autoconnect=true&resize=scale
+CCMA_LOGIN_URL=http://winston.mandrill-piano.ts.net:6080/vnc.html?autoconnect=true&resize=scale
 ```
 
 No definir `TAX_MONITOR_DB`, `CCMA_SESSION_DIR`, `ARCA_ENROLLMENT_BIND` ni

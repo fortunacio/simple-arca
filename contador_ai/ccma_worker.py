@@ -21,7 +21,13 @@ from .ccma import (
     parse_ccma_account,
 )
 from .db import Database
-from .external import ExternalContractError, ExternalUnavailable
+from .external import (
+    ExternalContractError,
+    ExternalRejected,
+    ExternalUnavailable,
+    failure_detail,
+)
+from .health import FailureDetail
 from .iibb_payment import IibbPaymentProcessor, IibbPaymentStore
 from .santa_fe import ARGENTINA_TIMEZONE, SantaFeIibbConnector, SantaFeIibbWorker
 from .seti import BrowserSetiConnector, SetiPaymentsWorker
@@ -166,8 +172,16 @@ class CcmaBrowserConnector:
 
     @staticmethod
     def _open_account(context, button):
-        with context.expect_page(timeout=30_000) as popup:
-            button.click()
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        try:
+            with context.expect_page(timeout=30_000) as popup:
+                button.click()
+        except PlaywrightTimeoutError as exc:
+            raise ExternalUnavailable(
+                host="monotributo.afip.gob.ar",
+                stage="ccma_account_popup",
+            ) from exc
         account = popup.value
         try:
             account.wait_for_url(
@@ -175,16 +189,30 @@ class CcmaBrowserConnector:
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )
-        except Exception as exc:
-            raise CcmaSessionRequired("ARCA no abrió CCMA con la sesión guardada")
+        except PlaywrightTimeoutError as exc:
+            raise ExternalUnavailable(
+                host="monotributo.afip.gob.ar",
+                stage="ccma_account_navigation",
+            ) from exc
         if CCMA_URL_PART not in account.url:
-            raise CcmaSessionRequired("ARCA no abrió CCMA con la sesión guardada")
+            raise ExternalContractError(
+                host="monotributo.afip.gob.ar",
+                stage="ccma_account_destination",
+            )
         return account
 
     @staticmethod
     def _calculate_account(account) -> None:
-        account.get_by_role("button", name="CALCULO DE DEUDA").click()
-        account.wait_for_url(re.compile(r"/P04_ctacte\.asp"), timeout=60_000)
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        try:
+            account.get_by_role("button", name="CALCULO DE DEUDA").click()
+            account.wait_for_url(re.compile(r"/P04_ctacte\.asp"), timeout=60_000)
+        except PlaywrightTimeoutError as exc:
+            raise ExternalUnavailable(
+                host="monotributo.afip.gob.ar",
+                stage="ccma_calculation",
+            ) from exc
 
     def _authenticate(self, page, cuit: str, password: str) -> None:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -204,19 +232,8 @@ class CcmaBrowserConnector:
             account_button = page.get_by_role("button", name="Ver Saldo / Pagar")
             account_button.wait_for(state="visible", timeout=20_000)
         except PlaywrightTimeoutError as exc:
-            safe_url = page.url.split("?", 1)[0]
-            try:
-                title = page.title()
-            except Exception:
-                title = ""
-            LOGGER.warning(
-                "ARCA no aceptó la sesión HTTP en Monotributo: url=%s título=%s",
-                safe_url,
-                title,
-            )
-            raise ExternalContractError(
-                host="monotributo.afip.gob.ar",
-                stage="monotributo_account_action",
+            raise CcmaSessionRequired(
+                "ARCA requiere completar la validación del acceso"
             ) from exc
 
     def verify_and_store_credentials(
@@ -325,11 +342,20 @@ class CcmaBrowserConnector:
                         )
                     )"""
                 )
-                result = parse_ccma_account(body, rows)
+                try:
+                    result = parse_ccma_account(body, rows)
+                except CcmaError as exc:
+                    raise ExternalContractError(
+                        host="monotributo.afip.gob.ar",
+                        stage="ccma_account_contract",
+                    ) from exc
                 self.state.save(chat_id, context.storage_state())
                 return result
             except PlaywrightTimeoutError as exc:
-                raise CcmaError("CCMA tardó demasiado en responder") from exc
+                raise ExternalUnavailable(
+                    host="monotributo.afip.gob.ar",
+                    stage="ccma_browser",
+                ) from exc
             finally:
                 context.close()
                 browser.close()
@@ -354,38 +380,58 @@ class CcmaWorker:
         try:
             payload = self.connector.sync(chat_id, identity["represented_cuit"])
         except CcmaCredentialsRejected as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "ARCA_CCMA",
                 "CREDENTIALS_REQUIRED",
-                last_error=str(exc),
+                FailureDetail(
+                    "CREDENTIALS_REJECTED",
+                    stage="ccma_authentication",
+                ).to_json(),
             )
             raise
         except CcmaSessionRequired as exc:
-            self.db.upsert_connection(chat_id, "ARCA_CCMA", "LOGIN_REQUIRED", last_error=str(exc))
+            self.db.record_connection_failure(
+                chat_id,
+                "ARCA_CCMA",
+                "LOGIN_REQUIRED",
+                FailureDetail("AUTH_REQUIRED", stage="ccma_session").to_json(),
+            )
             raise
         except ExternalUnavailable as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "ARCA_CCMA",
                 "EXTERNAL_UNAVAILABLE",
-                last_error=str(exc),
+                failure_detail(exc).to_json(),
+            )
+            raise
+        except ExternalRejected as exc:
+            self.db.record_connection_failure(
+                chat_id,
+                "ARCA_CCMA",
+                "UPSTREAM_ERROR",
+                failure_detail(exc).to_json(),
             )
             raise
         except ExternalContractError as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "ARCA_CCMA",
-                "INTEGRATION_CHANGED",
-                last_error=str(exc),
+                "UNEXPECTED_RESPONSE",
+                failure_detail(exc).to_json(),
             )
             raise
         except Exception as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "ARCA_CCMA",
                 "INTERNAL_ERROR",
-                last_error=str(exc),
+                FailureDetail(
+                    "INTERNAL_ERROR",
+                    stage="ccma_sync",
+                    code=exc.__class__.__name__,
+                ).to_json(),
             )
             raise
         fetched_at = datetime.now(timezone.utc)
@@ -409,11 +455,10 @@ class CcmaWorker:
             (fetched_at + self.snapshot_ttl).isoformat(),
             payload_json,
         )
-        self.db.upsert_connection(
+        self.db.record_connection_success(
             chat_id,
             "ARCA_CCMA",
-            "CONNECTED",
-            last_success_at=fetched_at.isoformat(),
+            fetched_at.isoformat(),
         )
 
 
@@ -440,8 +485,7 @@ def sync_portal_sources(
         database.clear_portal_access(chat_id)
         LOGGER.error("ARCA rechazó las credenciales guardadas para chat_id=%s", chat_id)
     except CcmaSessionRequired:
-        database.clear_portal_access(chat_id)
-        LOGGER.warning("CCMA necesita configurar el acceso para chat_id=%s", chat_id)
+        LOGGER.warning("CCMA necesita validación manual para chat_id=%s", chat_id)
     except ExternalUnavailable as exc:
         LOGGER.warning(
             "Una dependencia externa no está disponible para chat_id=%s: %s",
@@ -454,10 +498,16 @@ def sync_portal_sources(
             chat_id,
             exc,
         )
+    except ExternalRejected as exc:
+        LOGGER.error(
+            "La dependencia externa rechazó la consulta para chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
     except Exception:
         LOGGER.exception("Falló la sincronización CCMA para chat_id=%s", chat_id)
 
-    if seti_worker is not None and ccma_ready:
+    if seti_worker is not None:
         try:
             seti_worker.sync_chat(chat_id)
         except Exception:
@@ -466,7 +516,13 @@ def sync_portal_sources(
     if santa_fe_worker is not None:
         try:
             santa_fe_worker.sync_chat(chat_id)
-        except (CcmaCredentialsRejected, CcmaSessionRequired):
+        except CcmaCredentialsRejected:
+            database.clear_portal_access(chat_id)
+            LOGGER.warning(
+                "Ingresos Brutos rechazó las credenciales para chat_id=%s",
+                chat_id,
+            )
+        except CcmaSessionRequired:
             LOGGER.warning(
                 "Ingresos Brutos no pudo completar el ingreso para chat_id=%s; "
                 "se conserva el acceso de ARCA verificado",
@@ -484,6 +540,12 @@ def sync_portal_sources(
                 chat_id,
                 exc,
             )
+        except ExternalRejected as exc:
+            LOGGER.error(
+                "Ingresos Brutos rechazó la consulta para chat_id=%s: %s",
+                chat_id,
+                exc,
+            )
         except Exception:
             LOGGER.exception(
                 "Falló la sincronización de Ingresos Brutos para chat_id=%s",
@@ -492,10 +554,41 @@ def sync_portal_sources(
 
     iibb_payment_store.reconcile_paid(chat_id)
 
-    ready = ccma_ready
-    if ready and database.get_portal_access(chat_id) is not None:
-        database.mark_portal_access_ready(chat_id, datetime.now(timezone.utc).isoformat())
-    return ready
+    return ccma_ready
+
+
+def sync_initial_portal_sources(
+    chat_id: int,
+    database: Database,
+    ccma_worker: CcmaWorker,
+    seti_worker: SetiPaymentsWorker | None,
+    santa_fe_worker: SantaFeIibbWorker | None,
+    iibb_payment_store: IibbPaymentStore,
+) -> bool:
+    access_before = database.get_portal_access(chat_id)
+    try:
+        return sync_portal_sources(
+            chat_id,
+            database,
+            ccma_worker,
+            seti_worker,
+            santa_fe_worker,
+            iibb_payment_store,
+        )
+    finally:
+        ready_at = datetime.now(timezone.utc).isoformat()
+        if database.get_portal_access(chat_id) is None and access_before is not None:
+            database.mark_portal_access_verified(
+                chat_id,
+                str(access_before["represented_cuit"]),
+                str(access_before["verified_at"]),
+            )
+            database.set_bot_state(
+                f"portal_access:clear_after_notification:{chat_id}",
+                ready_at,
+            )
+        if database.get_portal_access(chat_id) is not None:
+            database.mark_portal_access_ready(chat_id, ready_at)
 
 
 def main() -> None:
@@ -606,7 +699,7 @@ def main() -> None:
             ),
             database,
             connector,
-            on_verified=lambda chat_id: sync_portal_sources(
+            on_verified=lambda chat_id: sync_initial_portal_sources(
                 chat_id,
                 database,
                 worker,

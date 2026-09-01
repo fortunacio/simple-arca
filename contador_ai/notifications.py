@@ -9,6 +9,13 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .db import Database
+from .health import (
+    SOURCE_POLICIES,
+    SourceCondition,
+    UserAction,
+    render_health_brief,
+    source_health,
+)
 from .seti import SANTA_FE_IIBB_DESCRIPTION
 from .service import (
     PROVIDERS,
@@ -28,29 +35,12 @@ MONOTRIBUTO_COMPONENT_LABELS = {
     "021": "Aporte jubilatorio",
     "024": "Obra social",
 }
-SNAPSHOT_KINDS = {
-    "ARCA_PROFILE": "taxpayer_profile",
-    "ARCA_DFE": "unread_communications",
-    "ARCA_CCMA": "account_status",
-    "ARCA_SETI": "payment_status",
-    "ARCA_INVOICES": "issued_invoices",
-    "SANTA_FE_IIBB": "account_status",
-}
-STALE_AFTER = {
-    "ARCA_PROFILE": timedelta(hours=30),
-    "ARCA_DFE": timedelta(hours=30),
-    "ARCA_INVOICES": timedelta(hours=30),
-    "ARCA_CCMA": timedelta(hours=12),
-    "ARCA_SETI": timedelta(hours=12),
-    "SANTA_FE_IIBB": timedelta(hours=12),
-}
-STALE_NOTIFICATION_GRACE = timedelta(minutes=15)
-
-
 @dataclass(frozen=True)
 class NotificationDelivery:
     event_key: str
     fingerprint: str
+    state_key: str | None = None
+    state_value: str | None = None
 
 
 @dataclass(frozen=True)
@@ -67,15 +57,13 @@ class TaxNotificationMonitor:
         *,
         now: Callable[[], datetime] | None = None,
         refresh_interval: timedelta = timedelta(hours=6),
-        broken_reminder_interval: timedelta = timedelta(hours=1),
-        stale_notification_grace: timedelta = STALE_NOTIFICATION_GRACE,
+        auth_reminder_interval: timedelta = timedelta(days=1),
     ):
         self.db = db
         self.service = service
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.refresh_interval = refresh_interval
-        self.broken_reminder_interval = broken_reminder_interval
-        self.stale_notification_grace = stale_notification_grace
+        self.auth_reminder_interval = auth_reminder_interval
 
     @staticmethod
     def _parse_datetime(value: str | None) -> datetime | None:
@@ -88,15 +76,10 @@ class TaxNotificationMonitor:
         return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
     def _snapshot(self, chat_id: int, provider: str) -> tuple[dict, datetime] | None:
-        row = self.db.get_live_snapshot(chat_id, provider, SNAPSHOT_KINDS[provider])
-        if row is None:
+        health = source_health(self.db, chat_id, provider, self.now())
+        if not health.snapshot.is_fresh or health.snapshot.payload is None:
             return None
-        try:
-            payload = json.loads(row["payload_json"])
-            fetched_at = self._parse_datetime(row["fetched_at"])
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return None
-        return (payload, fetched_at) if fetched_at is not None else None
+        return (health.snapshot.payload, health.snapshot.fetched_at)
 
     @staticmethod
     def _business_days_after(start: date, current: date) -> int:
@@ -182,6 +165,8 @@ class TaxNotificationMonitor:
             line: str,
             *,
             repeat_after: timedelta | None = None,
+            state_key: str | None = None,
+            state_value: str | None = None,
         ) -> None:
             if repeat_after is None:
                 if self.db.notification_was_sent(chat_id, event_key, fingerprint):
@@ -193,7 +178,9 @@ class TaxNotificationMonitor:
                 if last_sent is not None and now - last_sent < repeat_after:
                     return
             sections.setdefault(section, []).append(line)
-            deliveries.append(NotificationDelivery(event_key, fingerprint))
+            deliveries.append(
+                NotificationDelivery(event_key, fingerprint, state_key, state_value)
+            )
 
         seti = self._snapshot(chat_id, "ARCA_SETI")
         seti_payload = seti[0] if seti is not None else {}
@@ -619,18 +606,9 @@ class TaxNotificationMonitor:
                         f"• La categoría proyectada cambió a {category}. Revisá /resumen.",
                     )
 
-        connection_labels = {
-            "ARCA_PROFILE": "Categoría y facturación",
-            "ARCA_DFE": "Mensajes de ARCA",
-            "ARCA_CCMA": "Monotributo",
-            "ARCA_SETI": "Monotributo",
-            "ARCA_INVOICES": "Categoría y facturación",
-            "SANTA_FE_IIBB": "Ingresos Brutos",
-        }
         connections = {row["provider"]: row for row in self.db.get_connections(chat_id)}
         portal_providers = {"ARCA_CCMA", "ARCA_SETI", "SANTA_FE_IIBB"}
         identity = self.db.get_tax_identity(chat_id)
-        portal_access = self.db.get_portal_access(chat_id)
         portal_enabled = any(
             provider in self.service.live_synchronizers for provider in portal_providers
         )
@@ -638,9 +616,9 @@ class TaxNotificationMonitor:
             portal_enabled
             and identity is not None
             and identity["status"] == "VERIFIED"
-            and (
-                portal_access is None
-                or portal_access["represented_cuit"] != identity["represented_cuit"]
+            and not self.db.portal_access_matches(
+                chat_id,
+                str(identity["represented_cuit"]),
             )
         )
         if portal_needs_credentials:
@@ -654,42 +632,81 @@ class TaxNotificationMonitor:
                 "portal-access",
                 "missing",
                 "• El acceso guardado dejó de funcionar. Volvé a cargar tu clave "
-                "fiscal una vez."
+                "fiscal desde /resumen."
                 if had_portal_access
                 else "• Falta completar la conexión una sola vez para consultar "
-                "Monotributo e Ingresos Brutos.",
-                repeat_after=self.broken_reminder_interval,
+                "Monotributo e Ingresos Brutos. Abrí /resumen.",
+                repeat_after=self.auth_reminder_interval,
             )
-        for provider, maximum_age in STALE_AFTER.items():
+        for provider in SOURCE_POLICIES:
             if provider not in self.service.live_synchronizers:
                 continue
             if portal_needs_credentials and provider in portal_providers:
                 continue
-            connection = connections.get(provider)
-            snapshot = self._snapshot(chat_id, provider)
-            last_success = self._parse_datetime(connection["last_success_at"]) if connection else None
-            if last_success is None and snapshot is not None:
-                last_success = snapshot[1]
-            status = str(connection["status"]) if connection else "MISSING"
-            needs_credentials = status in {"LOGIN_REQUIRED", "CREDENTIALS_REQUIRED"}
-            stale = (
-                last_success is None
-                or now - last_success > maximum_age + self.stale_notification_grace
-            )
-            if not needs_credentials and not stale:
+            health = source_health(self.db, chat_id, provider, now)
+            if health.condition == SourceCondition.PENDING:
                 continue
-            fingerprint = f"{status}:{last_success.isoformat() if last_success else 'never'}"
-            reason = (
-                "necesita volver a validar el acceso"
-                if needs_credentials
-                else "lleva demasiado tiempo sin actualizarse"
+            state_key = f"monitor:health:{chat_id}:{provider}"
+            previous_raw = self.db.get_bot_state(state_key)
+            try:
+                previous = json.loads(previous_raw) if previous_raw else None
+            except json.JSONDecodeError:
+                previous = None
+            previous_condition = (
+                str(previous.get("condition")) if isinstance(previous, dict) else ""
+            )
+            previous_fingerprint = (
+                str(previous.get("fingerprint")) if isinstance(previous, dict) else ""
+            )
+            state_value = json.dumps(
+                {
+                    "condition": health.condition.value,
+                    "fingerprint": health.incident_fingerprint,
+                },
+                separators=(",", ":"),
+            )
+            if health.condition == SourceCondition.HEALTHY:
+                if previous_condition and previous_condition != SourceCondition.HEALTHY.value:
+                    add(
+                        "Servicios recuperados",
+                        f"health:{provider}:recovered",
+                        health.incident_fingerprint,
+                        f"• {health.policy.label} volvió a actualizarse correctamente.",
+                        state_key=state_key,
+                        state_value=state_value,
+                    )
+                continue
+
+            same_incident = (
+                previous_condition == health.condition.value
+                and previous_fingerprint == health.incident_fingerprint
+            )
+            repeat_after = None
+            if same_incident:
+                if health.action not in {
+                    UserAction.COMPLETE_ACCESS,
+                    UserAction.MANUAL_VALIDATION,
+                }:
+                    continue
+                repeat_after = self.auth_reminder_interval
+            section = (
+                "Acción requerida"
+                if health.action in {
+                    UserAction.COMPLETE_ACCESS,
+                    UserAction.MANUAL_VALIDATION,
+                }
+                else "Revisión técnica"
+                if health.action == UserAction.TECHNICAL_REVIEW
+                else "Problemas de actualización"
             )
             add(
-                "Servicios desactualizados",
-                f"stale:{provider}",
-                fingerprint,
-                f"• {connection_labels.get(provider, PROVIDERS[provider])} {reason}.",
-                repeat_after=self.broken_reminder_interval,
+                section,
+                f"health:{provider}:problem",
+                health.incident_fingerprint,
+                f"• {render_health_brief(health)}",
+                repeat_after=repeat_after,
+                state_key=state_key,
+                state_value=state_value,
             )
 
         if not deliveries:
@@ -708,3 +725,5 @@ class TaxNotificationMonitor:
                 delivery.fingerprint,
                 sent_at,
             )
+            if delivery.state_key and delivery.state_value:
+                self.db.set_bot_state(delivery.state_key, delivery.state_value)

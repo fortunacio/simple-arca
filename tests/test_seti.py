@@ -8,6 +8,7 @@ from unittest import TestCase
 from contador_ai.db import Database
 from contador_ai.seti import (
     BrowserSetiConnector,
+    SetiAccessRequired,
     SetiPaymentsWorker,
     reconcile_seti_payments,
     reconcile_vep_with_ccma,
@@ -15,6 +16,57 @@ from contador_ai.seti import (
 
 
 class SetiReconciliationTest(TestCase):
+    @staticmethod
+    def _verified_database(directory: str) -> Database:
+        db = Database(Path(directory) / "test.sqlite3")
+        db.initialize()
+        db.ensure_user(1001)
+        db.set_pending_tax_identity(1001, "20383717419", "production")
+        db.mark_tax_identity_verified(1001)
+        return db
+
+    def test_missing_ccma_prerequisite_is_pending_not_an_internal_failure(self):
+        with TemporaryDirectory() as directory:
+            db = self._verified_database(directory)
+
+            with self.assertRaisesRegex(Exception, "Falta una consulta de CCMA"):
+                SetiPaymentsWorker(
+                    db,
+                    object(),
+                    snapshot_ttl=timedelta(hours=12),
+                ).sync_chat(1001)
+
+            connection = db.get_connections(1001)[0]
+            self.assertEqual(connection["status"], "PENDING")
+
+    def test_missing_seti_session_is_auth_required(self):
+        with TemporaryDirectory() as directory:
+            db = self._verified_database(directory)
+            db.upsert_live_snapshot(
+                1001,
+                "ARCA_CCMA",
+                "account_status",
+                "2026-08-06T12:00:00+00:00",
+                "2026-08-07T12:00:00+00:00",
+                json.dumps({"debtor_total": "0", "payments": []}),
+            )
+
+            class Connector:
+                @staticmethod
+                def sync(_chat_id, _cuit):
+                    raise SetiAccessRequired("sesión ausente")
+
+            with self.assertRaises(SetiAccessRequired):
+                SetiPaymentsWorker(
+                    db,
+                    Connector(),
+                    snapshot_ttl=timedelta(hours=12),
+                ).sync_chat(1001)
+
+            connection = db.get_connections(1001)[0]
+            self.assertEqual(connection["status"], "LOGIN_REQUIRED")
+            self.assertIn('"kind":"AUTH_REQUIRED"', connection["last_error"])
+
     def test_normalizes_paid_vep_returned_by_seti(self):
         result = BrowserSetiConnector._normalize_payment(
             {

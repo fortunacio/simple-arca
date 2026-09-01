@@ -4,6 +4,8 @@ from collections.abc import Callable, Collection
 
 import httpx
 
+from .health import FailureDetail
+
 
 TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429})
 
@@ -30,7 +32,20 @@ class ExternalUnavailable(ExternalDependencyError):
 
 
 class ExternalContractError(ExternalDependencyError):
-    kind = "INTEGRATION_CHANGED"
+    kind = "UNEXPECTED_RESPONSE"
+
+
+class ExternalRejected(ExternalDependencyError):
+    kind = "UPSTREAM_ERROR"
+
+
+def failure_detail(exc: ExternalDependencyError) -> FailureDetail:
+    return FailureDetail(
+        kind=exc.kind,
+        host=exc.host,
+        stage=exc.stage,
+        code=f"HTTP_{exc.status_code}" if exc.status_code is not None else "",
+    )
 
 
 def _exception_host(exc: httpx.HTTPError) -> str:
@@ -58,5 +73,5 @@ def checked_request(
     if status in TRANSIENT_HTTP_STATUSES or status >= 500:
         raise ExternalUnavailable(host=host, stage=stage, status_code=status)
     if status >= 400:
-        raise ExternalContractError(host=host, stage=stage, status_code=status)
+        raise ExternalRejected(host=host, stage=stage, status_code=status)
     return response

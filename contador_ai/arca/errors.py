@@ -9,6 +9,19 @@ class ArcaConfigurationError(ArcaError):
 class ArcaTransportError(ArcaError):
     """El organismo no respondió o devolvió una respuesta HTTP inválida."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        host: str = "",
+        stage: str = "soap_transport",
+        status_code: int | None = None,
+    ):
+        self.host = host
+        self.stage = stage
+        self.status_code = status_code
+        super().__init__(message)
+
 
 class ArcaSoapFault(ArcaError):
     """ARCA devolvió un SOAP Fault."""

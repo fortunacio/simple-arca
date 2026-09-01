@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -126,12 +126,13 @@ class IibbPaymentTest(TestCase):
         self.db.ensure_user(1001)
         self.db.set_pending_tax_identity(1001, "20123456786", "production")
         self.db.mark_tax_identity_verified(1001)
+        fetched_at = datetime.now(timezone.utc)
         self.db.upsert_live_snapshot(
             1001,
             "SANTA_FE_IIBB",
             "account_status",
-            "2026-08-06T12:00:00+00:00",
-            "2026-08-07T12:00:00+00:00",
+            fetched_at.isoformat(),
+            (fetched_at + timedelta(days=1)).isoformat(),
             json.dumps(
                 {
                     "account": "131-123456-7",
@@ -328,6 +329,41 @@ class IibbPaymentTest(TestCase):
     def test_unauthorized_chat_cannot_start(self):
         reply = self.bot.start(999)
         self.assertIn("no está habilitado", reply.text)
+
+    def test_stale_account_cannot_start_a_payment(self):
+        snapshot = self.db.get_live_snapshot(1001, "SANTA_FE_IIBB", "account_status")
+        stale_at = datetime.now(timezone.utc) - timedelta(hours=13)
+        self.db.upsert_live_snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            stale_at.isoformat(),
+            (stale_at + timedelta(days=1)).isoformat(),
+            snapshot["payload_json"],
+        )
+
+        reply = self.bot.start(1001)
+
+        self.assertIn("Primero necesito actualizar", reply.text)
+
+    def test_stale_account_cannot_confirm_an_already_quoted_vep(self):
+        row = self.request()
+        self.processor.process_one()
+        snapshot = self.db.get_live_snapshot(1001, "SANTA_FE_IIBB", "account_status")
+        stale_at = datetime.now(timezone.utc) - timedelta(hours=13)
+        self.db.upsert_live_snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            stale_at.isoformat(),
+            (stale_at + timedelta(days=1)).isoformat(),
+            snapshot["payload_json"],
+        )
+
+        reply = self.bot.handle_callback(f"iibbpay:confirm:{row['id']}", 1001)
+
+        self.assertIn("Primero necesito actualizar", reply.text)
+        self.assertEqual(self.store.get(row["id"])["status"], "QUOTED")
 
     def test_disconnected_chat_cannot_continue_an_old_payment_callback(self):
         with self.db.connect() as connection:

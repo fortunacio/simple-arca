@@ -557,6 +557,13 @@ class Database:
         with self.connect() as connection:
             connection.execute(
                 """
+                INSERT INTO bot_state(key, value) VALUES (?, '')
+                ON CONFLICT(key) DO UPDATE SET value = ''
+                """,
+                (f"portal_access:clear_after_notification:{chat_id}",),
+            )
+            connection.execute(
+                """
                 INSERT INTO portal_access(
                     chat_id, represented_cuit, verified_at, ready_at, notified_at
                 ) VALUES (?, ?, ?, NULL, NULL)
@@ -575,6 +582,22 @@ class Database:
             return connection.execute(
                 "SELECT * FROM portal_access WHERE chat_id = ?", (chat_id,)
             ).fetchone()
+
+    def portal_access_matches(self, chat_id: int, represented_cuit: str) -> bool:
+        with self.connect() as connection:
+            access = connection.execute(
+                "SELECT represented_cuit FROM portal_access WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            pending_clear = connection.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                (f"portal_access:clear_after_notification:{chat_id}",),
+            ).fetchone()
+        return (
+            access is not None
+            and access["represented_cuit"] == represented_cuit
+            and not (pending_clear is not None and pending_clear["value"])
+        )
 
     def clear_portal_access(self, chat_id: int) -> None:
         with self.connect() as connection:
@@ -620,6 +643,19 @@ class Database:
                 """,
                 (notified_at, chat_id),
             )
+            pending_clear = connection.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                (f"portal_access:clear_after_notification:{chat_id}",),
+            ).fetchone()
+            if pending_clear is not None and pending_clear["value"]:
+                connection.execute(
+                    "DELETE FROM portal_access WHERE chat_id = ?",
+                    (chat_id,),
+                )
+                connection.execute(
+                    "UPDATE bot_state SET value = '' WHERE key = ?",
+                    (f"portal_access:clear_after_notification:{chat_id}",),
+                )
 
     def upsert_connection(
         self,
@@ -642,6 +678,61 @@ class Database:
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (chat_id, provider, status, last_success_at, last_error),
+            )
+
+    def record_connection_success(
+        self,
+        chat_id: int,
+        provider: str,
+        last_success_at: str,
+        *,
+        status: str = "CONNECTED",
+        last_error: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO connections(
+                    chat_id, provider, status, last_success_at, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, provider) DO UPDATE SET
+                    status = excluded.status,
+                    last_success_at = excluded.last_success_at,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    chat_id,
+                    provider,
+                    status,
+                    last_success_at,
+                    last_error,
+                    last_success_at,
+                ),
+            )
+
+    def record_connection_failure(
+        self,
+        chat_id: int,
+        provider: str,
+        status: str,
+        failure_json: str,
+        *,
+        attempted_at: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO connections(
+                    chat_id, provider, status, last_success_at, last_error, updated_at
+                ) VALUES (?, ?, ?, NULL, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                ON CONFLICT(chat_id, provider) DO UPDATE SET
+                    status = excluded.status,
+                    last_success_at = connections.last_success_at,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (chat_id, provider, status, failure_json, attempted_at),
             )
 
     def upsert_live_snapshot(

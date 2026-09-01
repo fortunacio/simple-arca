@@ -9,9 +9,16 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from ..db import Database
+from ..health import FailureDetail
 from ..monotributo import last_complete_month
 from .dfe import DFE_SERVICE, DfeClient
-from .errors import ArcaError
+from .errors import (
+    ArcaConfigurationError,
+    ArcaError,
+    ArcaResponseError,
+    ArcaSoapFault,
+    ArcaTransportError,
+)
 from .models import IssuedInvoice
 from .padron import CONSTANCIA_SERVICE, ConstanciaInscripcionClient
 from .wsfe import WSFE_SERVICE, WsfeClient
@@ -19,6 +26,43 @@ from .wsaa import WsaaClient
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _record_arca_failure(
+    db: Database,
+    chat_id: int,
+    provider: str,
+    stage: str,
+    exc: ArcaError,
+) -> None:
+    if isinstance(exc, ArcaTransportError):
+        status_code = exc.status_code
+        transient = status_code is None or status_code in {408, 425, 429} or status_code >= 500
+        status = "EXTERNAL_UNAVAILABLE" if transient else "UPSTREAM_ERROR"
+        kind = "UPSTREAM_UNAVAILABLE" if transient else "UPSTREAM_ERROR"
+        detail = FailureDetail(
+            kind,
+            stage=exc.stage or stage,
+            host=exc.host,
+            code=f"HTTP_{status_code}" if status_code is not None else "",
+        )
+    elif isinstance(exc, ArcaSoapFault):
+        status = "UPSTREAM_ERROR"
+        detail = FailureDetail("UPSTREAM_ERROR", stage=stage, code="SOAP_FAULT")
+    elif isinstance(exc, ArcaResponseError):
+        status = "UNEXPECTED_RESPONSE"
+        detail = FailureDetail("UNEXPECTED_RESPONSE", stage=stage)
+    elif isinstance(exc, ArcaConfigurationError):
+        status = "INTERNAL_ERROR"
+        detail = FailureDetail("INTERNAL_ERROR", stage=stage, code="CONFIGURATION")
+    else:
+        status = "INTERNAL_ERROR"
+        detail = FailureDetail(
+            "INTERNAL_ERROR",
+            stage=stage,
+            code=exc.__class__.__name__,
+        )
+    db.record_connection_failure(chat_id, provider, status, detail.to_json())
 
 
 def _month_keys(window_from: date, window_to: date) -> tuple[str, ...]:
@@ -54,15 +98,16 @@ class ArcaProfileSynchronizer:
                 person_cuit=represented_cuit,
             )
             if profile.cuit != represented_cuit:
-                raise ArcaError("Padrón devolvió un CUIT distinto del autorizado")
+                raise ArcaResponseError("Padrón devolvió un CUIT distinto del autorizado")
         except ArcaError as exc:
             if identity["status"] != "VERIFIED":
                 self.db.mark_tax_identity_failed(chat_id, str(exc))
-            self.db.upsert_connection(
+            _record_arca_failure(
+                self.db,
                 chat_id,
                 "ARCA_PROFILE",
-                "ERROR",
-                last_error=str(exc),
+                "arca_profile_sync",
+                exc,
             )
             raise
 
@@ -76,11 +121,10 @@ class ArcaProfileSynchronizer:
             json.dumps(profile.to_payload(), ensure_ascii=False, separators=(",", ":")),
         )
         self.db.mark_tax_identity_verified(chat_id)
-        self.db.upsert_connection(
+        self.db.record_connection_success(
             chat_id,
             "ARCA_PROFILE",
-            "CONNECTED",
-            last_success_at=fetched_at.isoformat(),
+            fetched_at.isoformat(),
         )
         if self.on_verified is not None:
             try:
@@ -115,13 +159,16 @@ class ArcaDfeSynchronizer:
                 status=1,
             )
             if any(item.recipient_cuit != represented_cuit for item in communications):
-                raise ArcaError("WSCCOMU devolvió una comunicación de otro CUIT")
+                raise ArcaResponseError(
+                    "WSCCOMU devolvió una comunicación de otro CUIT"
+                )
         except ArcaError as exc:
-            self.db.upsert_connection(
+            _record_arca_failure(
+                self.db,
                 chat_id,
                 "ARCA_DFE",
-                "ERROR",
-                last_error=str(exc),
+                "arca_dfe_sync",
+                exc,
             )
             raise
 
@@ -140,11 +187,10 @@ class ArcaDfeSynchronizer:
             (fetched_at + self.snapshot_ttl).isoformat(),
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
-        self.db.upsert_connection(
+        self.db.record_connection_success(
             chat_id,
             "ARCA_DFE",
-            "CONNECTED",
-            last_success_at=fetched_at.isoformat(),
+            fetched_at.isoformat(),
         )
 
 
@@ -154,13 +200,16 @@ class ArcaInvoicesSynchronizer:
     wsaa: WsaaClient
     wsfe: WsfeClient
     snapshot_ttl: timedelta = timedelta(hours=36)
+    today: Callable[[], date] = lambda: datetime.now(
+        ZoneInfo("America/Argentina/Buenos_Aires")
+    ).date()
 
     def sync_chat(self, chat_id: int) -> None:
         identity = self.db.get_tax_identity(chat_id)
         if identity is None or identity["status"] != "VERIFIED":
             raise ValueError("La identidad tributaria debe estar verificada")
         represented_cuit = identity["represented_cuit"]
-        today = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).date()
+        today = self.today()
         date_from, date_to = last_complete_month(today)
         try:
             ticket = self.wsaa.request_ticket(WSFE_SERVICE)
@@ -171,11 +220,12 @@ class ArcaInvoicesSynchronizer:
                 date_to,
             )
         except ArcaError as exc:
-            self.db.upsert_connection(
+            _record_arca_failure(
+                self.db,
                 chat_id,
                 "ARCA_INVOICES",
-                "ERROR",
-                last_error=str(exc),
+                "arca_invoices_sync",
+                exc,
             )
             raise
 
@@ -320,9 +370,8 @@ class ArcaInvoicesSynchronizer:
             (fetched_at + self.snapshot_ttl).isoformat(),
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
-        self.db.upsert_connection(
+        self.db.record_connection_success(
             chat_id,
             "ARCA_INVOICES",
-            "CONNECTED",
-            last_success_at=fetched_at.isoformat(),
+            fetched_at.isoformat(),
         )

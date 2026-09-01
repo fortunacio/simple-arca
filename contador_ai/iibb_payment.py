@@ -9,6 +9,7 @@ from decimal import Decimal
 
 from .bot_reply import BotReply
 from .db import Database
+from .health import source_health
 from .santa_fe import (
     ARGENTINA_TIMEZONE,
     IibbGenerationUnknown,
@@ -526,11 +527,26 @@ class IibbPaymentBotService:
     def _authorized(self, chat_id: int) -> bool:
         return self.enabled and chat_id in self.allowed_chat_ids
 
+    def _fresh_iibb_snapshot(self, chat_id: int):
+        health = source_health(
+            self.store.db,
+            chat_id,
+            "SANTA_FE_IIBB",
+            datetime.now(timezone.utc),
+        )
+        if not health.snapshot.is_fresh:
+            return None
+        return self.store.db.get_live_snapshot(
+            chat_id,
+            "SANTA_FE_IIBB",
+            "account_status",
+        )
+
     def start(self, chat_id: int, *, replace: bool = False) -> BotReply:
         if not self._authorized(chat_id):
             return BotReply("El pago de Ingresos Brutos no está habilitado para este chat.", replace_message=replace)
         identity = self.store.db.get_tax_identity(chat_id)
-        snapshot = self.store.db.get_live_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
+        snapshot = self._fresh_iibb_snapshot(chat_id)
         if identity is None or identity["status"] != "VERIFIED" or snapshot is None:
             return BotReply("Primero necesito actualizar tu cuenta de Ingresos Brutos.", replace_message=replace)
         payload = json.loads(snapshot["payload_json"])
@@ -581,6 +597,11 @@ class IibbPaymentBotService:
         if len(parts) == 3 and parts[1] == "network":
             return self._choose_network(chat_id, parts[2])
         if len(parts) == 3 and parts[1] == "confirm":
+            if self._fresh_iibb_snapshot(chat_id) is None:
+                return BotReply(
+                    "Primero necesito actualizar tu cuenta de Ingresos Brutos.",
+                    replace_message=True,
+                )
             row = self.store.request_generation(parts[2], chat_id)
             if row is None:
                 return BotReply("Ese VEP ya no está disponible.", replace_message=True)
@@ -603,7 +624,7 @@ class IibbPaymentBotService:
 
     def _choose_network(self, chat_id: int, network_id: str) -> BotReply:
         identity = self.store.db.get_tax_identity(chat_id)
-        snapshot = self.store.db.get_live_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
+        snapshot = self._fresh_iibb_snapshot(chat_id)
         if identity is None or identity["status"] != "VERIFIED" or snapshot is None:
             return BotReply("Primero necesito actualizar tu cuenta de Ingresos Brutos.", replace_message=True)
         payload = json.loads(snapshot["payload_json"])

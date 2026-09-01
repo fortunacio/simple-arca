@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from contador_ai.arca.models import IssuedInvoice, TaxCategory, TaxpayerProfile
+from contador_ai.arca.errors import ArcaSoapFault, ArcaTransportError
 from contador_ai.arca.sync import ArcaInvoicesSynchronizer, ArcaProfileSynchronizer
 from contador_ai.db import Database
 from contador_ai.invoice_store import InvoiceStore
@@ -125,7 +126,46 @@ class ArcaSyncTest(TestCase):
         identity = self.db.get_tax_identity(1001)
         self.assertEqual(identity["status"], "PENDING")
         self.assertEqual(verified, [])
-        self.assertEqual(self.db.get_connections(1001)[0]["status"], "ERROR")
+        self.assertEqual(
+            self.db.get_connections(1001)[0]["status"],
+            "UNEXPECTED_RESPONSE",
+        )
+
+    def test_official_api_failures_use_the_common_health_kinds(self):
+        class FailingWsaa:
+            def __init__(self, error):
+                self.error = error
+
+            def request_ticket(self, _service):
+                raise self.error
+
+        cases = (
+            (
+                ArcaTransportError(
+                    "sin respuesta",
+                    host="wsaa.arca.gob.ar",
+                    status_code=503,
+                ),
+                "EXTERNAL_UNAVAILABLE",
+                "HTTP_503",
+            ),
+            (ArcaSoapFault("fault"), "UPSTREAM_ERROR", "SOAP_FAULT"),
+        )
+        self.db.mark_tax_identity_verified(1001)
+
+        for error, expected_status, expected_code in cases:
+            with self.subTest(expected_status=expected_status):
+                synchronizer = ArcaProfileSynchronizer(
+                    self.db,
+                    FailingWsaa(error),
+                    FakePadron("20123456786"),
+                )
+                with self.assertRaises(type(error)):
+                    synchronizer.sync_chat(1001)
+
+                connection = self.db.get_connections(1001)[0]
+                self.assertEqual(connection["status"], expected_status)
+                self.assertIn(expected_code, connection["last_error"])
 
     def test_verification_does_not_inject_personal_invoice_history(self):
         self.db.set_pending_tax_identity(1001, "20383717419", "production")
@@ -161,6 +201,7 @@ class ArcaSyncTest(TestCase):
             FakeWsaa(),
             FakeWsfe(),
             snapshot_ttl=timedelta(minutes=15),
+            today=lambda: date(2026, 8, 1),
         )
 
         synchronizer.sync_chat(1001)
@@ -277,6 +318,7 @@ class ArcaSyncTest(TestCase):
             FakeWsaa(),
             FakeWsfe(),
             snapshot_ttl=timedelta(minutes=15),
+            today=lambda: date(2026, 8, 1),
         )
 
         synchronizer.sync_chat(1001)

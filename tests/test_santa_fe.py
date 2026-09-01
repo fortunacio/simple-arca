@@ -78,6 +78,13 @@ class SantaFeParserTest(TestCase):
         self.assertEqual(result["payment_groups"][0]["total"], "115054.50")
         self.assertEqual(len(result["payment_groups"][0]["periods"]), 3)
 
+    def test_accepts_an_empty_vepai_result_by_its_table_shape(self):
+        result = parse_vepai(
+            "<table><tr><th>A</th><th>B</th><th>C</th><th>D</th></tr></table>"
+        )
+
+        self.assertEqual(result["payments"], [])
+
     def test_reconciles_only_periods_that_are_safely_due(self):
         payments = [
             {"period": f"2026-{month:02d}"}
@@ -170,7 +177,7 @@ class SantaFeWorkerTest(TestCase):
 
         connection = self.db.get_connections(1001)[0]
         self.assertEqual(connection["status"], "EXTERNAL_UNAVAILABLE")
-        self.assertIn("HTTP 503", connection["last_error"])
+        self.assertIn('"code":"HTTP_503"', connection["last_error"])
 
     def test_classifies_an_incompatible_external_contract(self):
         worker = SantaFeIibbWorker(
@@ -188,4 +195,4 @@ class SantaFeWorkerTest(TestCase):
             worker.sync_chat(1001)
 
         connection = self.db.get_connections(1001)[0]
-        self.assertEqual(connection["status"], "INTEGRATION_CHANGED")
+        self.assertEqual(connection["status"], "UNEXPECTED_RESPONSE")

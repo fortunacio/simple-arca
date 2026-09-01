@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from unittest import TestCase
 
 from contador_ai.bot_reply import BotReply
@@ -27,13 +28,37 @@ class FakeDatabase:
         self.portal_notified.append((chat_id, notified_at))
 
     def get_connections(self, _chat_id):
-        return self.connections
+        now = datetime.now(timezone.utc).isoformat()
+        return [
+            {
+                "last_success_at": now,
+                "last_error": None,
+                "updated_at": now,
+                **connection,
+            }
+            for connection in self.connections
+        ]
+
+    def get_live_snapshot(self, _chat_id, _provider, _kind):
+        now = datetime.now(timezone.utc).isoformat()
+        if any(
+            connection.get("provider") == _provider
+            and connection.get("status") in {"CONNECTED", "PARTIAL"}
+            for connection in self.connections
+        ):
+            return {
+                "payload_json": "{}",
+                "fetched_at": now,
+                "expires_at": now,
+            }
+        return None
 
 
 class FakeService:
     def __init__(self):
         self.dispatched = []
         self.navigated = []
+        self.live_synchronizers = {"SANTA_FE_IIBB": lambda _chat_id: None}
 
     def navigation(self, action, chat_id, replace=False):
         self.navigated.append((action, chat_id, replace))
@@ -187,6 +212,20 @@ class TelegramAccessTest(TestCase):
         self.assertEqual(client.fake_service.navigated, [("summary", 123, False)])
         self.assertEqual(client.sent[0][0], "sendMessage")
 
+    def test_estado_uses_the_status_navigation(self):
+        client = FakeTelegramClient(
+            [
+                {
+                    "update_id": 31,
+                    "message": {"chat": {"id": 123}, "text": "/estado"},
+                }
+            ],
+            {123},
+        )
+
+        self.assertEqual(client.poll_once(timeout=0), 1)
+        self.assertEqual(client.fake_service.navigated, [("status", 123, False)])
+
     def test_tax_callback_edits_the_existing_message(self):
         client = FakeTelegramClient(
             [
@@ -263,7 +302,7 @@ class TelegramAccessTest(TestCase):
 
         self.assertEqual(client.run_portal_access_notifications(), 1)
 
-        self.assertIn("Tu cuenta está lista", client.sent[0][1]["text"])
+        self.assertIn("Tu acceso quedó guardado", client.sent[0][1]["text"])
         self.assertEqual(client.fake_db.portal_notified[0][0], 123)
 
     def test_reports_external_iibb_outage_without_blaming_the_login(self):
@@ -276,8 +315,21 @@ class TelegramAccessTest(TestCase):
         self.assertEqual(client.run_portal_access_notifications(), 1)
 
         message = client.sent[0][1]["text"]
-        self.assertIn("temporalmente no disponible", message)
+        self.assertIn("no está disponible en el organismo", message)
         self.assertNotIn("clave", message)
+
+    def test_reports_a_partial_initial_sync_as_a_terminal_result(self):
+        client = FakeTelegramClient([], {123})
+        client.fake_db.portal_notifications = [{"chat_id": 123}]
+        client.fake_db.connections = [
+            {"provider": "SANTA_FE_IIBB", "status": "PARTIAL"}
+        ]
+
+        self.assertEqual(client.run_portal_access_notifications(), 1)
+
+        message = client.sent[0][1]["text"]
+        self.assertIn("Tu acceso quedó guardado", message)
+        self.assertIn("se actualizó parcialmente", message)
 
     def test_unauthorized_callback_is_silently_ignored(self):
         client = FakeTelegramClient(

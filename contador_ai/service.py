@@ -11,6 +11,14 @@ from zoneinfo import ZoneInfo
 
 from .bot_reply import BotReply
 from .db import Database
+from .health import (
+    SOURCE_POLICIES,
+    SourceCondition,
+    render_health_brief,
+    render_health_detail,
+    source_health,
+    stale_snapshot_warning,
+)
 from .arca.errors import WsfePointOfSaleUnavailable
 from .identity import is_valid_cuit, mask_cuit, normalize_cuit
 from .monotributo import (
@@ -171,6 +179,16 @@ class TaxMonitorService:
             return self._today_override
         return datetime.now(ARGENTINA_TIMEZONE).date()
 
+    @property
+    def now(self) -> datetime:
+        if self._today_override is not None:
+            return datetime.combine(
+                self._today_override,
+                datetime.min.time().replace(hour=12),
+                tzinfo=ARGENTINA_TIMEZONE,
+            ).astimezone(timezone.utc)
+        return datetime.now(timezone.utc)
+
     def help(self, chat_id: int) -> str:
         lines = ["¿Qué querés hacer?", ""]
         identity = self.db.get_tax_identity(chat_id)
@@ -239,7 +257,7 @@ class TaxMonitorService:
         if not self._portal_access_enabled():
             return verified
         access = self.db.get_portal_access(chat_id)
-        if access is not None and access["represented_cuit"] == cuit:
+        if self.db.portal_access_matches(chat_id, cuit):
             if access["ready_at"]:
                 return f"{verified}\n\nTu cuenta ya está lista para usar."
             return f"{verified}\n\nEl acceso ya está guardado. Estoy actualizando tu información."
@@ -256,34 +274,18 @@ class TaxMonitorService:
     def provider_status(self, chat_id: int, provider: str) -> str:
         if provider not in self.live_synchronizers:
             return f"⚪ {PROVIDERS[provider]} — todavía no disponible"
-        row = self.connection_map(chat_id).get(provider)
-        if not row:
+        health = source_health(self.db, chat_id, provider, self.now)
+        if health.condition == SourceCondition.PENDING:
             identity = self.db.get_tax_identity(chat_id)
-            if identity and identity["status"] == "VERIFIED":
-                command = PROVIDER_COMMANDS.get(provider, "/estado")
-                return f"🟡 {PROVIDERS[provider]} — usá {command} para consultar"
-            return f"⚪ {PROVIDERS[provider]} — falta conectar ARCA con /conectar"
-        if row["status"] == "LOGIN_REQUIRED":
-            return f"🟡 {PROVIDERS[provider]} — ARCA pidió una validación manual"
-        if row["status"] == "CREDENTIALS_REQUIRED":
-            return f"🔴 {PROVIDERS[provider]} — hay que actualizar la clave fiscal guardada"
-        if row["status"] == "EXTERNAL_UNAVAILABLE":
-            return f"🟡 {PROVIDERS[provider]} — el servicio externo no está disponible"
-        if row["status"] == "INTEGRATION_CHANGED":
-            return f"🔴 {PROVIDERS[provider]} — la integración necesita revisión"
-        if row["status"] == "INTERNAL_ERROR":
-            return f"🔴 {PROVIDERS[provider]} — ocurrió un error interno"
-        if row["status"] == "PARTIAL":
-            observed = format_datetime_argentina(row["last_success_at"])
-            detail = "la consulta quedó incompleta"
-            return f"🟡 {PROVIDERS[provider]} — {detail}\nActualizado: {observed}"
-        if row["status"] != "CONNECTED":
-            return f"🔴 {PROVIDERS[provider]} — hubo un problema en la última consulta"
-        observed = format_datetime_argentina(row["last_success_at"])
-        return f"🟢 {PROVIDERS[provider]}\nActualizado: {observed}"
+            if identity is None or identity["status"] != "VERIFIED":
+                return f"⚪ {PROVIDERS[provider]} — falta conectar ARCA con /conectar"
+        return render_health_detail(health)
 
     def status(self, chat_id: int) -> str:
         lines = ["Estado de tu cuenta"]
+        identity = self.db.get_tax_identity(chat_id)
+        if identity is None or identity["status"] != "VERIFIED":
+            lines.append("⚪ Cuenta ARCA — falta conectar y verificar con /conectar")
         lines.extend(
             self.provider_status(chat_id, provider)
             for provider in PROVIDERS
@@ -353,6 +355,17 @@ class TaxMonitorService:
         return self._complete_connection(chat_id, cuit)
 
     def valid_snapshot(self, chat_id: int, provider: str, kind: str) -> dict | None:
+        if provider in SOURCE_POLICIES:
+            health = source_health(self.db, chat_id, provider, self.now)
+            if not health.snapshot.is_fresh or health.snapshot.payload is None:
+                return None
+            payload = dict(health.snapshot.payload)
+            payload["fetched_at"] = (
+                health.snapshot.fetched_at.isoformat()
+                if health.snapshot.fetched_at is not None
+                else None
+            )
+            return payload
         row = self.db.get_live_snapshot(chat_id, provider, kind)
         if row is None:
             return None
@@ -368,11 +381,38 @@ class TaxMonitorService:
         payload["fetched_at"] = row["fetched_at"]
         return payload
 
+    def available_snapshot(self, chat_id: int, provider: str, kind: str) -> dict | None:
+        row = self.db.get_live_snapshot(chat_id, provider, kind)
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload["fetched_at"] = row["fetched_at"]
+        return payload
+
+    def source_warning(self, chat_id: int, provider: str) -> str | None:
+        if provider not in SOURCE_POLICIES:
+            return None
+        health = source_health(self.db, chat_id, provider, self.now)
+        stale_warning = stale_snapshot_warning(health)
+        if health.condition == SourceCondition.STALE:
+            return stale_warning
+        notices = []
+        if health.condition not in {SourceCondition.HEALTHY, SourceCondition.PENDING}:
+            notices.append(f"⚠️ {render_health_brief(health)}")
+        if stale_warning:
+            notices.append(stale_warning)
+        return "\n".join(notices) if notices else None
+
     def profile_snapshot(self, chat_id: int) -> dict | None:
-        return self.valid_snapshot(chat_id, "ARCA_PROFILE", "taxpayer_profile")
+        return self.available_snapshot(chat_id, "ARCA_PROFILE", "taxpayer_profile")
 
     def invoice_snapshot(self, chat_id: int) -> dict | None:
-        return self.valid_snapshot(chat_id, "ARCA_INVOICES", "issued_invoices")
+        return self.available_snapshot(chat_id, "ARCA_INVOICES", "issued_invoices")
 
     def projection_lines(self, snapshot: dict) -> list[str]:
         invoices = snapshot.get("invoices", [])
@@ -519,11 +559,9 @@ class TaxMonitorService:
 
     def category(self, chat_id: int) -> str:
         error = self.sync_provider(chat_id, "ARCA_PROFILE")
-        if error:
-            return error
         profile = self.profile_snapshot(chat_id)
         if profile is None:
-            return self.source_command(chat_id, "ARCA_PROFILE")
+            return error or self.source_command(chat_id, "ARCA_PROFILE")
         categories = [
             item
             for item in profile.get("categories", [])
@@ -540,7 +578,7 @@ class TaxMonitorService:
         ]
         if "ARCA_INVOICES" in self.live_synchronizers:
             invoice_error = self.sync_provider(chat_id, "ARCA_INVOICES")
-            invoice_snapshot = self.invoice_snapshot(chat_id) if not invoice_error else None
+            invoice_snapshot = self.invoice_snapshot(chat_id)
             if invoice_snapshot is not None:
                 projection = self.projection_lines(invoice_snapshot)
             elif invoice_error:
@@ -548,8 +586,7 @@ class TaxMonitorService:
                     "Categoría proyectada para recategorización",
                     invoice_error,
                 ]
-        return "\n".join(
-            [
+        lines = [
                 "Tu categoría de monotributo",
                 "",
                 *category_lines,
@@ -559,15 +596,17 @@ class TaxMonitorService:
                 "",
                 *projection,
             ]
-        )
+        for provider in ("ARCA_PROFILE", "ARCA_INVOICES"):
+            warning = self.source_warning(chat_id, provider)
+            if warning:
+                lines.extend(["", warning])
+        return "\n".join(lines)
 
     def invoicing(self, chat_id: int) -> str:
         error = self.sync_provider(chat_id, "ARCA_INVOICES")
-        if error:
-            return error
         snapshot = self.invoice_snapshot(chat_id)
         if snapshot is None:
-            return self.source_command(chat_id, "ARCA_INVOICES")
+            return error or self.source_command(chat_id, "ARCA_INVOICES")
         count = int(snapshot.get("invoice_count", 0))
         monthly_count = len(snapshot.get("monthly_totals", []))
         if count == 0 and monthly_count == 0:
@@ -579,8 +618,7 @@ class TaxMonitorService:
         ) is True
         divisor = 12 if history_complete else monthly_count
         average = total / divisor if divisor else None
-        return "\n".join(
-            [
+        lines = [
                 "Facturación",
                 "",
                 (
@@ -598,17 +636,18 @@ class TaxMonitorService:
                 f"Período: {format_date(snapshot.get('window_from'))} al {format_date(snapshot.get('window_to'))}",
                 f"Actualizado: {format_datetime_argentina(snapshot.get('fetched_at'))}",
             ]
-        )
+        warning = self.source_warning(chat_id, "ARCA_INVOICES")
+        if warning:
+            lines.extend(["", warning])
+        return "\n".join(lines)
 
     def inbox(self, chat_id: int) -> str:
         error = self.sync_provider(chat_id, "ARCA_DFE")
-        if error:
-            return error
-        snapshot = self.valid_snapshot(
+        snapshot = self.available_snapshot(
             chat_id, "ARCA_DFE", "unread_communications"
         )
         if snapshot is None:
-            return self.source_command(chat_id, "ARCA_DFE")
+            return error or self.source_command(chat_id, "ARCA_DFE")
         communications = snapshot.get("communications", [])
         if not communications:
             detail = "No tenés comunicaciones sin leer de los últimos 30 días."
@@ -623,15 +662,17 @@ class TaxMonitorService:
             if len(communications) > 20:
                 lines.append(f"… y {len(communications) - 20} más")
             detail = "\n".join(lines)
-        return "\n".join(
-            [
-                "Bandeja de ARCA",
-                "",
-                detail,
-                "",
-                f"Revisado: {format_datetime_argentina(snapshot.get('fetched_at'))}",
-            ]
-        )
+        result = [
+            "Bandeja de ARCA",
+            "",
+            detail,
+            "",
+            f"Revisado: {format_datetime_argentina(snapshot.get('fetched_at'))}",
+        ]
+        warning = self.source_warning(chat_id, "ARCA_DFE")
+        if warning:
+            result.extend(["", warning])
+        return "\n".join(result)
 
     @staticmethod
     def _period_totals(items: list[dict]) -> list[tuple[str, Decimal]]:
@@ -791,7 +832,7 @@ class TaxMonitorService:
     def monotributo_account(self, chat_id: int) -> str:
         if "ARCA_CCMA" not in self.live_synchronizers:
             return self.source_command(chat_id, "ARCA_CCMA")
-        snapshot = self.valid_snapshot(chat_id, "ARCA_CCMA", "account_status")
+        snapshot = self.available_snapshot(chat_id, "ARCA_CCMA", "account_status")
         connection = self.connection_map(chat_id).get("ARCA_CCMA")
         if snapshot is None:
             if connection and connection["status"] == "CREDENTIALS_REQUIRED":
@@ -922,16 +963,15 @@ class TaxMonitorService:
                 f"Consultado: {format_datetime_argentina(snapshot.get('fetched_at'))}",
             ]
         )
-        if connection and connection["status"] == "LOGIN_REQUIRED":
-            lines.append("ARCA pidió una validación manual después de esta consulta.")
-        if connection and connection["status"] == "CREDENTIALS_REQUIRED":
-            lines.append("ARCA rechazó la clave guardada; hay que volver a cargarla.")
+        warning = self.source_warning(chat_id, "ARCA_CCMA")
+        if warning:
+            lines.extend(["", warning])
         return "\n".join(lines)
 
     def iibb_account(self, chat_id: int) -> str:
         if "SANTA_FE_IIBB" not in self.live_synchronizers:
             return self.source_command(chat_id, "SANTA_FE_IIBB")
-        snapshot = self.valid_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
+        snapshot = self.available_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
         connection = self.connection_map(chat_id).get("SANTA_FE_IIBB")
         if snapshot is None:
             if connection and connection["status"] == "CREDENTIALS_REQUIRED":
@@ -1067,12 +1107,15 @@ class TaxMonitorService:
                     ]
                 )
         lines.extend(["", f"Consultado: {format_datetime_argentina(snapshot.get('fetched_at'))}"])
+        warning = self.source_warning(chat_id, "SANTA_FE_IIBB")
+        if warning:
+            lines.extend(["", warning])
         return "\n".join(lines)
 
     def arca_payments(self, chat_id: int) -> str:
         if "ARCA_SETI" not in self.live_synchronizers:
             return self.source_command(chat_id, "ARCA_SETI")
-        snapshot = self.valid_snapshot(chat_id, "ARCA_SETI", "payment_status")
+        snapshot = self.available_snapshot(chat_id, "ARCA_SETI", "payment_status")
         if snapshot is None:
             return self.source_command(chat_id, "ARCA_SETI")
 
@@ -1146,6 +1189,9 @@ class TaxMonitorService:
                     ]
                 )
         lines.extend(["", f"Consultado: {format_datetime_argentina(snapshot.get('fetched_at'))}"])
+        warning = self.source_warning(chat_id, "ARCA_SETI")
+        if warning:
+            lines.extend(["", warning])
         return "\n".join(lines)
 
     def _next_payment_items(self, chat_id: int) -> list[tuple[str, str, str, Decimal]]:
@@ -1224,83 +1270,37 @@ class TaxMonitorService:
         }
 
     def _plain_source_alerts(self, chat_id: int) -> list[str]:
-        labels = {
-            "ARCA_PROFILE": "Categoría y facturación",
-            "ARCA_DFE": "Mensajes de ARCA",
-            "ARCA_CCMA": "Monotributo",
-            "ARCA_SETI": "Monotributo",
-            "ARCA_INVOICES": "Categoría y facturación",
-            "SANTA_FE_IIBB": "Ingresos Brutos",
-        }
-        maximum_age = {
-            "ARCA_PROFILE": timedelta(hours=30),
-            "ARCA_DFE": timedelta(hours=30),
-            "ARCA_INVOICES": timedelta(hours=30),
-            "ARCA_CCMA": timedelta(hours=12),
-            "ARCA_SETI": timedelta(hours=12),
-            "SANTA_FE_IIBB": timedelta(hours=12),
-        }
-        now = datetime.now(timezone.utc)
-        alerts: set[str] = set()
-        connections = list(self.db.get_connections(chat_id))
-        portal_providers = {"ARCA_CCMA", "ARCA_SETI", "SANTA_FE_IIBB"}
+        now = self.now
         identity = self.db.get_tax_identity(chat_id)
-        access = self.db.get_portal_access(chat_id)
-        portal_access_matches = (
-            identity is not None
-            and access is not None
-            and access["represented_cuit"] == identity["represented_cuit"]
+        portal_access_matches = identity is not None and self.db.portal_access_matches(
+            chat_id,
+            str(identity["represented_cuit"]),
         )
         portal_needs_credentials = self._portal_access_enabled() and not portal_access_matches
         if portal_needs_credentials:
-            had_portal_access = any(
-                str(row["provider"]) in portal_providers and row["last_success_at"]
-                for row in connections
-            )
-            alerts.add(
-                "El acceso guardado a Monotributo e Ingresos Brutos dejó de funcionar. "
-                "Volvé a guardar tu clave fiscal una vez."
-                if had_portal_access
-                else "Para revisar Monotributo e Ingresos Brutos, falta guardar tu "
-                "clave fiscal una sola vez."
-            )
-        for row in connections:
-            provider = str(row["provider"])
-            if provider not in self.live_synchronizers or provider not in labels:
+            return [
+                "Falta completar el acceso a Monotributo e Ingresos Brutos. "
+                "Abrí /resumen y elegí Completar acceso."
+            ]
+        alerts: list[str] = []
+        for provider in SOURCE_POLICIES:
+            if provider not in self.live_synchronizers:
                 continue
-            status = str(row["status"])
-            if portal_needs_credentials and provider in portal_providers:
+            health = source_health(self.db, chat_id, provider, now)
+            if health.condition in {SourceCondition.HEALTHY, SourceCondition.PENDING}:
                 continue
-            last_success = None
-            try:
-                if row["last_success_at"]:
-                    last_success = datetime.fromisoformat(str(row["last_success_at"]))
-                    if last_success.tzinfo is None:
-                        last_success = last_success.replace(tzinfo=timezone.utc)
-            except ValueError:
-                pass
-            if status == "EXTERNAL_UNAVAILABLE":
-                alerts.add(f"{labels[provider]} está temporalmente no disponible.")
-            elif status == "INTEGRATION_CHANGED":
-                alerts.add(f"La integración con {labels[provider]} necesita revisión.")
-            elif status == "INTERNAL_ERROR":
-                alerts.add(f"Ocurrió un error interno al actualizar {labels[provider]}.")
-            elif status != "CONNECTED":
-                alerts.add(f"No pude actualizar {labels[provider]}.")
-            elif last_success is None or now - last_success > maximum_age[provider]:
-                alerts.add(f"{labels[provider]} lleva demasiado tiempo sin actualizarse.")
-        return sorted(alerts)
+            alerts.append(render_health_brief(health))
+        return alerts
 
     def _summary_keyboard(self, chat_id: int) -> tuple[tuple[tuple[str, str], ...], ...]:
         rows: list[tuple[tuple[str, str], ...]] = []
         identity = self.db.get_tax_identity(chat_id)
-        access = self.db.get_portal_access(chat_id)
         if (
             self._portal_access_enabled()
             and identity is not None
-            and (
-                access is None
-                or access["represented_cuit"] != identity["represented_cuit"]
+            and not self.db.portal_access_matches(
+                chat_id,
+                str(identity["represented_cuit"]),
             )
         ):
             rows.append((("Completar acceso", "tax:setup"),))
@@ -1642,12 +1642,14 @@ class TaxMonitorService:
     def category_overview(self, chat_id: int) -> str:
         profile_error = self.sync_provider(chat_id, "ARCA_PROFILE")
         invoice_error = self.sync_provider(chat_id, "ARCA_INVOICES")
-        if profile_error or invoice_error:
-            return "No pude actualizar tu categoría y facturación ahora. Probá nuevamente en unos minutos."
         profile = self.profile_snapshot(chat_id)
         invoices = self.invoice_snapshot(chat_id)
         if profile is None or invoices is None:
-            return "Todavía no pude obtener tu categoría y facturación."
+            return (
+                profile_error
+                or invoice_error
+                or "Todavía no pude obtener tu categoría y facturación."
+            )
 
         current_description = next(
             (
@@ -1744,8 +1746,7 @@ class TaxMonitorService:
             ),
             f"Meses con datos: {len(monthly_totals)} de 12",
         ]
-        return "\n".join(
-            [
+        lines = [
                 "Categoría y facturación",
                 "",
                 f"Categoría actual: {current_display}",
@@ -1761,7 +1762,11 @@ class TaxMonitorService:
                 *projection_context,
                 f"Próxima revisión: {format_date(next_recategorization(self.today).isoformat())}",
             ]
-        )
+        for provider in ("ARCA_PROFILE", "ARCA_INVOICES"):
+            warning = self.source_warning(chat_id, provider)
+            if warning:
+                lines.extend(["", warning])
+        return "\n".join(lines)
 
     def navigation(self, action: str, chat_id: int, *, replace: bool = False) -> BotReply:
         identity = self.db.get_tax_identity(chat_id)
@@ -1782,6 +1787,8 @@ class TaxMonitorService:
                 self._summary_keyboard(chat_id) if connected else (),
                 replace,
             )
+        if action == "status":
+            return BotReply(self.status(chat_id), self._back_keyboard(), replace)
         if not connected:
             return BotReply(
                 "Tu cuenta está desconectada. Usá /conectar seguido de tu CUIT.",
@@ -1988,12 +1995,12 @@ class TaxMonitorService:
     def source_command(self, chat_id: int, provider: str) -> str:
         if provider not in self.live_synchronizers:
             return f"{PROVIDERS[provider]} todavía no está disponible."
-        row = self.connection_map(chat_id).get(provider)
-        if not row or row["status"] != "CONNECTED":
-            identity = self.db.get_tax_identity(chat_id)
-            if not identity or identity["status"] != "VERIFIED":
-                return "Primero conectá tu cuenta de ARCA con /conectar."
-        return f"Todavía no pude obtener {PROVIDERS[provider].lower()}. Probá de nuevo."
+        identity = self.db.get_tax_identity(chat_id)
+        if not identity or identity["status"] != "VERIFIED":
+            return "Primero conectá tu cuenta de ARCA con /conectar."
+        return render_health_brief(
+            source_health(self.db, chat_id, provider, self.now)
+        )
 
     def disconnect(self, chat_id: int) -> str:
         with self.db.connect() as connection:
@@ -2023,8 +2030,10 @@ class TaxMonitorService:
             return self.help(chat_id)
         if command == "/conectar":
             return self.connect(chat_id, argument)
-        if command in {"/resumen", "/estado"}:
+        if command == "/resumen":
             return self.summary(chat_id)
+        if command == "/estado":
+            return self.status(chat_id)
         if command == "/bandeja":
             return self.inbox(chat_id)
         if command == "/monotributo":

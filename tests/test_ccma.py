@@ -7,15 +7,21 @@ from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from contador_ai.ccma import CcmaError, CcmaSessionRequired, parse_ccma_account
+from contador_ai.ccma import (
+    CcmaCredentialsRejected,
+    CcmaError,
+    CcmaSessionRequired,
+    parse_ccma_account,
+)
 from contador_ai.ccma_worker import (
     CcmaBrowserConnector,
     CcmaWorker,
     EncryptedArcaCredentials,
     EncryptedBrowserState,
-    sync_portal_sources,
+    sync_initial_portal_sources,
 )
 from contador_ai.db import Database
+from contador_ai.external import ExternalUnavailable
 from contador_ai.iibb_payment import IibbPaymentStore
 
 
@@ -59,6 +65,27 @@ ROWS = (
 
 
 class CcmaParserTest(TestCase):
+    def test_playwright_timeout_is_structured_as_external_unavailability(self):
+        import sys
+        from types import ModuleType
+
+        class PlaywrightTimeoutError(Exception):
+            pass
+
+        sync_api = ModuleType("playwright.sync_api")
+        sync_api.TimeoutError = PlaywrightTimeoutError
+
+        class Context:
+            @staticmethod
+            def expect_page(**_kwargs):
+                raise PlaywrightTimeoutError("timeout")
+
+        with patch.dict(sys.modules, {"playwright.sync_api": sync_api}):
+            with self.assertRaises(ExternalUnavailable) as raised:
+                CcmaBrowserConnector._open_account(Context(), object())
+
+        self.assertEqual(raised.exception.stage, "ccma_account_popup")
+
     def test_automatic_login_can_use_a_visible_browser_inside_xvfb(self):
         calls = []
 
@@ -212,7 +239,7 @@ class CcmaParserTest(TestCase):
             )
             ccma, seti, santa_fe = Worker(), Worker(), Worker()
 
-            ready = sync_portal_sources(
+            ready = sync_initial_portal_sources(
                 1001,
                 db,
                 ccma,
@@ -248,7 +275,7 @@ class CcmaParserTest(TestCase):
                 1001, "20383717419", datetime.now(timezone.utc).isoformat()
             )
 
-            ready = sync_portal_sources(
+            ready = sync_initial_portal_sources(
                 1001,
                 db,
                 Worker(),
@@ -261,6 +288,85 @@ class CcmaParserTest(TestCase):
             access = db.get_portal_access(1001)
             self.assertIsNotNone(access)
             self.assertIsNotNone(access["ready_at"])
+
+    def test_initial_sync_finishes_even_when_the_first_refresh_fails(self):
+        class FailingWorker:
+            def sync_chat(self, _chat_id):
+                raise ExternalUnavailable(
+                    host="monotributo.afip.gob.ar",
+                    stage="ccma_navigation",
+                )
+
+        with TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.ensure_user(1001)
+            db.set_pending_tax_identity(1001, "20383717419", "production")
+            db.mark_tax_identity_verified(1001)
+            db.mark_portal_access_verified(
+                1001,
+                "20383717419",
+                datetime.now(timezone.utc).isoformat(),
+            )
+
+            ready = sync_initial_portal_sources(
+                1001,
+                db,
+                FailingWorker(),
+                None,
+                None,
+                IibbPaymentStore(db),
+            )
+
+            self.assertFalse(ready)
+            self.assertIsNotNone(db.get_portal_access(1001)["ready_at"])
+
+    def test_rejected_credentials_still_produce_one_terminal_notification(self):
+        with TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.ensure_user(1001)
+            db.set_pending_tax_identity(1001, "20383717419", "production")
+            db.mark_tax_identity_verified(1001)
+            db.mark_portal_access_verified(
+                1001,
+                "20383717419",
+                datetime.now(timezone.utc).isoformat(),
+            )
+
+            class RejectedWorker:
+                def sync_chat(self, _chat_id):
+                    db.record_connection_failure(
+                        1001,
+                        "ARCA_CCMA",
+                        "CREDENTIALS_REQUIRED",
+                        '{"kind":"CREDENTIALS_REJECTED","stage":"authentication","host":"","code":""}',
+                    )
+                    raise CcmaCredentialsRejected("rechazada")
+
+            ready = sync_initial_portal_sources(
+                1001,
+                db,
+                RejectedWorker(),
+                None,
+                None,
+                IibbPaymentStore(db),
+            )
+
+            self.assertFalse(ready)
+            self.assertIsNotNone(db.get_portal_access(1001)["ready_at"])
+            self.assertFalse(db.portal_access_matches(1001, "20383717419"))
+            self.assertEqual(
+                len(db.pending_portal_access_notifications(frozenset({1001}))),
+                1,
+            )
+
+            db.mark_portal_access_notified(
+                1001,
+                datetime.now(timezone.utc).isoformat(),
+            )
+
+            self.assertIsNone(db.get_portal_access(1001))
 
     def test_worker_keeps_each_ccma_observation_in_history(self):
         payloads = [

@@ -49,11 +49,39 @@ class ServiceTest(TestCase):
 
     def test_new_user_never_receives_seeded_tax_data(self):
         output = self.service.dispatch("/estado", 1001)
-        self.assertIn("conectá y verificá tu cuenta", output)
+        self.assertIn("falta conectar y verificar", output)
         self.assertNotIn("EN VIVO", output)
         self.assertNotIn("datos históricos ni simulados", output)
         for forbidden in ("150.784", "672.973", "Categoría F", "categoría 3"):
             self.assertNotIn(forbidden, output)
+
+    def test_estado_uses_the_diagnostic_presenter_instead_of_resumen(self):
+        self._verified_user()
+        fetched_at = self.service.now
+        self.db.upsert_live_snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            fetched_at.isoformat(),
+            (fetched_at + timedelta(days=1)).isoformat(),
+            "{}",
+        )
+        self.db.record_connection_success(
+            1001,
+            "SANTA_FE_IIBB",
+            fetched_at.isoformat(),
+        )
+        service = TaxMonitorService(
+            self.db,
+            today=date(2026, 8, 4),
+            live_synchronizers={"SANTA_FE_IIBB": lambda _chat_id: None},
+        )
+
+        output = service.dispatch("/estado", 1001)
+
+        self.assertIn("Estado de tu cuenta", output)
+        self.assertIn("Último intento", output)
+        self.assertNotIn("Resumen", output)
 
     def test_current_date_is_not_frozen_at_service_startup(self):
         service = TaxMonitorService(self.db)
@@ -96,6 +124,9 @@ class ServiceTest(TestCase):
     def test_users_are_isolated(self):
         self.db.ensure_user(1001)
         self.db.ensure_user(2002)
+        self.db.set_pending_tax_identity(1001, "20383717419", "production")
+        self.db.mark_tax_identity_verified(1001)
+        fetched_at = "2026-08-04T20:00:00-03:00"
         with self.db.connect() as connection:
             connection.execute(
                 """
@@ -103,8 +134,17 @@ class ServiceTest(TestCase):
                 VALUES (1001, 'ARCA_DFE', 'CONNECTED', '2026-08-04T20:00:00-03:00')
                 """
             )
+        self.db.upsert_live_snapshot(
+            1001,
+            "ARCA_DFE",
+            "unread_communications",
+            fetched_at,
+            "2026-08-05T20:00:00-03:00",
+            json.dumps({"communications": []}),
+        )
         service = TaxMonitorService(
             self.db,
+            today=date(2026, 8, 4),
             live_synchronizers={"ARCA_DFE": lambda _chat_id: None},
         )
         self.assertIn("🟢 Bandeja de ARCA", service.status(1001))
@@ -484,6 +524,44 @@ class ServiceTest(TestCase):
         self.assertIn("no puedo confirmar", output)
         self.assertNotIn("No registra deuda", output)
         self.assertIn("la consulta quedó incompleta", service.status(1001))
+
+    def test_iibb_keeps_stale_data_visible_with_a_safety_warning(self):
+        self.db.ensure_user(1001)
+        stale_at = datetime(2026, 8, 5, 1, tzinfo=timezone.utc)
+        self.db.upsert_live_snapshot(
+            1001,
+            "SANTA_FE_IIBB",
+            "account_status",
+            stale_at.isoformat(),
+            (stale_at + timedelta(days=1)).isoformat(),
+            json.dumps(
+                {
+                    "regime": "Régimen Simplificado",
+                    "status": "ACTIVO",
+                    "category": "III",
+                    "monthly_amount": "42882.00",
+                    "account": "131-123456-7",
+                    "vepai": {"status": "AVAILABLE", "payments": []},
+                }
+            ),
+        )
+        self.db.upsert_connection(
+            1001,
+            "SANTA_FE_IIBB",
+            "CONNECTED",
+            stale_at.isoformat(),
+        )
+        service = TaxMonitorService(
+            self.db,
+            today=date(2026, 8, 6),
+            live_synchronizers={"SANTA_FE_IIBB": lambda _chat_id: None},
+        )
+
+        output = service.iibb_account(1001)
+
+        self.assertIn("Categoría III", output)
+        self.assertIn("últimos datos disponibles", output)
+        self.assertIn("No se usarán para pagos", output)
 
     def test_iibb_reports_a_conciliated_grouped_payment(self):
         self.db.ensure_user(1001)
@@ -1178,8 +1256,7 @@ class ServiceTest(TestCase):
 
         reply = service.navigation("summary", 1001)
 
-        self.assertEqual(reply.text.count("falta guardar tu clave fiscal una sola vez"), 1)
-        self.assertNotIn("vuelvas a validar", reply.text)
+        self.assertEqual(reply.text.count("Falta completar el acceso"), 1)
         self.assertIn(
             ("Completar acceso", "tax:setup"),
             [button for row in reply.keyboard for button in row],
@@ -1223,8 +1300,9 @@ class ServiceTest(TestCase):
 
         output = service.summary(1001)
 
-        self.assertEqual(output.count("No pude actualizar Monotributo"), 1)
-        self.assertEqual(output.count("No pude actualizar Ingresos Brutos"), 1)
+        self.assertIn("Deuda de Monotributo falló por una causa", output)
+        self.assertIn("Pagos de ARCA falló por una causa", output)
+        self.assertIn("Ingresos Brutos falló por una causa", output)
         for forbidden in ("SETI", "CCMA", "VEPAI", "VEP", "imputación"):
             self.assertNotIn(forbidden, output)
 
@@ -1247,9 +1325,9 @@ class ServiceTest(TestCase):
 
         output = service.summary(1001)
 
-        self.assertIn("error interno al actualizar Monotributo", output)
-        self.assertIn("integración con Monotributo necesita revisión", output)
-        self.assertIn("Ingresos Brutos está temporalmente no disponible", output)
+        self.assertIn("Deuda de Monotributo falló dentro del sistema", output)
+        self.assertIn("Pagos de ARCA respondió de una forma inesperada", output)
+        self.assertIn("Ingresos Brutos no está disponible en el organismo", output)
 
     def test_failed_live_sync_never_falls_back_to_snapshot(self):
         def fail(_chat_id):

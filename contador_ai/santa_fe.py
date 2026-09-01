@@ -14,7 +14,14 @@ import httpx
 from .arca_http_auth import ArcaHttpAuthenticator, ArcaHttpLogin, _visible_text
 from .ccma import CcmaCredentialsRejected, CcmaSessionRequired
 from .db import Database
-from .external import ExternalContractError, ExternalUnavailable, checked_request
+from .external import (
+    ExternalContractError,
+    ExternalRejected,
+    ExternalUnavailable,
+    checked_request,
+    failure_detail,
+)
+from .health import FailureDetail
 
 
 REGSIM_URL = "https://www.santafe.gob.ar/e-regsim/index.php"
@@ -274,13 +281,15 @@ def parse_regsim(html_text: str, expected_cuit: str) -> dict[str, object]:
 
 
 def parse_vepai(html_text: str) -> dict[str, object]:
-    text = _normalized(_visible_text(html_text))
-    lowered = text.lower()
+    tables = _TableParser()
+    tables.feed(html_text)
     payments, groups = _parse_vepai_payments(html_text)
-    if not payments and not any(
-        phrase in lowered
-        for phrase in ("no se encontraron", "sin pagos", "no registra pagos")
-    ):
+    has_expected_shape = any(
+        len(row) >= 4
+        for table in tables.tables
+        for row in table
+    )
+    if not payments and not has_expected_shape:
         raise ExternalContractError(
             host="www.santafe.gob.ar",
             stage="vepai_contract",
@@ -307,8 +316,6 @@ def parse_period_quote(html_text: str, period: str) -> dict[str, object]:
 
 def parse_interest(value: str) -> str:
     text = _normalized(_visible_text(value))
-    if "error" in text.lower():
-        raise SantaFeIibbError(text[:240])
     return _money(text)
 
 
@@ -705,43 +712,58 @@ class SantaFeIibbWorker:
         try:
             payload = self.connector.sync(chat_id, identity["represented_cuit"])
         except CcmaCredentialsRejected as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "SANTA_FE_IIBB",
                 "CREDENTIALS_REQUIRED",
-                last_error=str(exc),
+                FailureDetail(
+                    "CREDENTIALS_REJECTED",
+                    stage="santa_fe_authentication",
+                ).to_json(),
             )
             raise
         except CcmaSessionRequired as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "SANTA_FE_IIBB",
                 "LOGIN_REQUIRED",
-                last_error=str(exc),
+                FailureDetail("AUTH_REQUIRED", stage="santa_fe_session").to_json(),
             )
             raise
         except ExternalUnavailable as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "SANTA_FE_IIBB",
                 "EXTERNAL_UNAVAILABLE",
-                last_error=str(exc),
+                failure_detail(exc).to_json(),
+            )
+            raise
+        except ExternalRejected as exc:
+            self.db.record_connection_failure(
+                chat_id,
+                "SANTA_FE_IIBB",
+                "UPSTREAM_ERROR",
+                failure_detail(exc).to_json(),
             )
             raise
         except ExternalContractError as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "SANTA_FE_IIBB",
-                "INTEGRATION_CHANGED",
-                last_error=str(exc),
+                "UNEXPECTED_RESPONSE",
+                failure_detail(exc).to_json(),
             )
             raise
         except Exception as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "SANTA_FE_IIBB",
                 "INTERNAL_ERROR",
-                last_error=str(exc),
+                FailureDetail(
+                    "INTERNAL_ERROR",
+                    stage="santa_fe_sync",
+                    code=exc.__class__.__name__,
+                ).to_json(),
             )
             raise
         fetched_at = datetime.now(timezone.utc)
@@ -754,14 +776,17 @@ class SantaFeIibbWorker:
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
         vepai_status = str(payload.get("vepai", {}).get("status", ""))
-        self.db.upsert_connection(
+        self.db.record_connection_success(
             chat_id,
             "SANTA_FE_IIBB",
-            "CONNECTED" if vepai_status == "AVAILABLE" else "PARTIAL",
-            last_success_at=fetched_at.isoformat(),
+            fetched_at.isoformat(),
+            status="CONNECTED" if vepai_status == "AVAILABLE" else "PARTIAL",
             last_error=(
                 None
                 if vepai_status == "AVAILABLE"
-                else "La consulta provincial quedó incompleta"
+                else FailureDetail(
+                    "PARTIAL",
+                    stage="santa_fe_payments",
+                ).to_json()
             ),
         )

@@ -76,10 +76,16 @@ class HttpxSoapTransport:
             )
         except httpx.HTTPStatusError as exc:
             raise ArcaTransportError(
-                f"ARCA respondió HTTP {exc.response.status_code}: {exc.response.text[:500]}"
+                f"ARCA respondió HTTP {exc.response.status_code}",
+                host=exc.request.url.host,
+                status_code=exc.response.status_code,
             ) from exc
         except httpx.HTTPError as exc:
-            raise ArcaTransportError(f"No se pudo conectar con ARCA: {exc}") from exc
+            request = getattr(exc, "request", None)
+            raise ArcaTransportError(
+                "No se pudo conectar con ARCA",
+                host=request.url.host if request is not None else "",
+            ) from exc
 
     def close(self) -> None:
         self._client.close()

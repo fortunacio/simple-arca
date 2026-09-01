@@ -398,9 +398,9 @@ def main() -> None:
                 refresh_interval=timedelta(
                     seconds=int(os.environ.get("AUTOMATIC_SYNC_INTERVAL_SECONDS", "21600"))
                 ),
-                broken_reminder_interval=timedelta(
+                auth_reminder_interval=timedelta(
                     seconds=int(
-                        os.environ.get("AUTOMATIC_BROKEN_REMINDER_SECONDS", "3600")
+                        os.environ.get("AUTOMATIC_AUTH_REMINDER_SECONDS", "86400")
                     )
                 ),
             )

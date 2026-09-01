@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 
 from .db import Database
+from .health import SourceCondition, render_health_brief, source_health
 from .bot_reply import BotReply
 from .invoice_bot import InvoiceBotService
 from .iibb_payment import IibbPaymentBotService
@@ -243,7 +244,7 @@ class TelegramClient:
             navigation_action = {
                 "/start": "start",
                 "/resumen": "summary",
-                "/estado": "summary",
+                "/estado": "status",
                 "/ayuda": "help",
                 "/help": "help",
             }.get(command)
@@ -313,33 +314,30 @@ class TelegramClient:
         for row in self.db.pending_portal_access_notifications(self.allowed_chat_ids):
             chat_id = int(row["chat_id"])
             try:
-                connections = {
-                    str(connection["provider"]): str(connection["status"])
-                    for connection in self.db.get_connections(chat_id)
-                }
-                santa_fe_status = connections.get("SANTA_FE_IIBB")
-                if santa_fe_status in {"CONNECTED", "PARTIAL"}:
+                now = datetime.now(timezone.utc)
+                healths = [
+                    source_health(self.db, chat_id, provider, now)
+                    for provider in ("ARCA_CCMA", "ARCA_SETI", "SANTA_FE_IIBB")
+                    if provider in self.service.live_synchronizers
+                ]
+                problems = [
+                    health
+                    for health in healths
+                    if health.condition != SourceCondition.HEALTHY
+                ]
+                if not problems:
                     message = (
-                        "Tu cuenta está lista. Ya actualicé Monotributo e Ingresos "
-                        "Brutos."
-                    )
-                elif santa_fe_status == "EXTERNAL_UNAVAILABLE":
-                    message = (
-                        "Tu cuenta está lista y Monotributo ya está actualizado. "
-                        "Ingresos Brutos está temporalmente no disponible y se "
-                        "reintentará automáticamente."
-                    )
-                elif santa_fe_status == "INTEGRATION_CHANGED":
-                    message = (
-                        "Tu cuenta está lista y Monotributo ya está actualizado. "
-                        "La integración con Ingresos Brutos necesita revisión."
+                        "Tu acceso quedó guardado y la primera actualización terminó "
+                        "correctamente. Ya podés usar /resumen."
                     )
                 else:
-                    message = (
-                        "Tu cuenta está lista y Monotributo ya está actualizado. "
-                        "Ingresos Brutos quedó pendiente y se reintentará "
-                        "automáticamente."
-                    )
+                    lines = [
+                        "Tu acceso quedó guardado. La primera actualización terminó "
+                        "con novedades:",
+                        "",
+                    ]
+                    lines.extend(f"• {render_health_brief(health)}" for health in problems)
+                    message = "\n".join(lines)
                 self.send_message(
                     chat_id,
                     message,

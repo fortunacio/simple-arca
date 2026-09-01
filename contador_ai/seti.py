@@ -11,7 +11,14 @@ from typing import Protocol
 from urllib.parse import urlencode
 
 from .db import Database
-from .external import ExternalContractError, ExternalUnavailable
+from .external import (
+    TRANSIENT_HTTP_STATUSES,
+    ExternalContractError,
+    ExternalRejected,
+    ExternalUnavailable,
+    failure_detail,
+)
+from .health import FailureDetail
 
 
 SANTA_FE_IIBB_DESCRIPTION = re.compile(
@@ -21,6 +28,10 @@ SANTA_FE_IIBB_DESCRIPTION = re.compile(
 
 
 class SetiError(RuntimeError):
+    pass
+
+
+class SetiAccessRequired(SetiError):
     pass
 
 
@@ -97,64 +108,146 @@ class BrowserSetiConnector:
         return f"{BrowserSetiConnector.PAYMENTS_API}?{urlencode(params)}"
 
     def sync(self, chat_id: int, represented_cuit: str) -> dict[str, object]:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
 
         credentials = self.credentials.load(chat_id)
         if credentials is None:
-            raise SetiError("Falta guardar la clave fiscal para consultar SETI")
+            raise SetiAccessRequired("Falta guardar el acceso de ARCA")
         if credentials["cuit"] != represented_cuit:
-            raise SetiError("La clave guardada corresponde a otro CUIT")
+            raise SetiAccessRequired("El acceso guardado corresponde a otro CUIT")
 
         with self.operation_lock, sync_playwright() as playwright:
             browser = self._launch(playwright)
             context = browser.new_context()
             page = context.new_page()
             try:
-                page.goto(
-                    "https://auth.afip.gov.ar/contribuyente_/login.xhtml",
-                    wait_until="domcontentloaded",
-                    timeout=60_000,
-                )
-                page.locator('input[name="F1:username"]').fill(credentials["cuit"])
-                page.locator('input[name="F1:btnSiguiente"]').click()
-                password = page.locator('input[name="F1:password"]')
-                password.wait_for(timeout=30_000)
-                password.fill(credentials["password"])
-                page.locator('input[name="F1:btnIngresar"]').click()
-                page.wait_for_url("**/portal/app/**", wait_until="domcontentloaded", timeout=60_000)
-                search = page.locator("#buscadorInput")
-                search.wait_for(timeout=30_000)
-                search.fill("Presentación de DDJJ y Pagos")
-                result = page.locator("p.small.text-muted").filter(
-                    has_text=re.compile("Presentaci.n de DDJJ y Pagos", re.IGNORECASE)
-                ).first
-                result.wait_for(timeout=30_000)
-                with context.expect_page(timeout=30_000) as popup:
-                    result.click()
-                seti = popup.value
-                seti.wait_for_url("**/setiweb/**", wait_until="domcontentloaded", timeout=60_000)
-                if "Unauthorized" in seti.title():
-                    raise SetiError("SETI rechazó la autorización emitida por el portal")
+                try:
+                    page.goto(
+                        "https://auth.afip.gov.ar/contribuyente_/login.xhtml",
+                        wait_until="domcontentloaded",
+                        timeout=60_000,
+                    )
+                    page.locator('input[name="F1:username"]').fill(credentials["cuit"])
+                    page.locator('input[name="F1:btnSiguiente"]').click()
+                    password = page.locator('input[name="F1:password"]')
+                    password.wait_for(timeout=30_000)
+                    password.fill(credentials["password"])
+                    page.locator('input[name="F1:btnIngresar"]').click()
+                except PlaywrightTimeoutError as exc:
+                    raise ExternalUnavailable(
+                        host="auth.afip.gov.ar",
+                        stage="seti_authentication",
+                    ) from exc
+                try:
+                    page.wait_for_url(
+                        "**/portal/app/**",
+                        wait_until="domcontentloaded",
+                        timeout=60_000,
+                    )
+                except PlaywrightTimeoutError as exc:
+                    if page.locator('input[name="F1:password"]').count():
+                        raise SetiAccessRequired(
+                            "ARCA requiere completar la validación del acceso"
+                        ) from exc
+                    raise ExternalUnavailable(
+                        host="portalcf.cloud.afip.gob.ar",
+                        stage="seti_portal_navigation",
+                    ) from exc
+                try:
+                    search = page.locator("#buscadorInput")
+                    search.wait_for(timeout=30_000)
+                    search.fill("Presentación de DDJJ y Pagos")
+                    result = page.locator("p.small.text-muted").filter(
+                        has_text=re.compile("Presentaci.n de DDJJ y Pagos", re.IGNORECASE)
+                    ).first
+                    result.wait_for(timeout=30_000)
+                    with context.expect_page(timeout=30_000) as popup:
+                        result.click()
+                    seti = popup.value
+                    seti.wait_for_url(
+                        "**/setiweb/**",
+                        wait_until="domcontentloaded",
+                        timeout=60_000,
+                    )
+                except PlaywrightTimeoutError as exc:
+                    raise ExternalUnavailable(
+                        host="seti.afip.gob.ar",
+                        stage="seti_navigation",
+                    ) from exc
 
-                response = seti.request.get(self._query_url(represented_cuit))
-                if not response.ok:
-                    raise SetiError(f"SETI no respondió la consulta de pagos ({response.status})")
-                envelope = response.json()
-                if not envelope.get("success"):
-                    raise SetiError(str(envelope.get("error") or "SETI rechazó la consulta"))
-                data = envelope.get("data", {})
+                try:
+                    response = seti.request.get(self._query_url(represented_cuit))
+                except PlaywrightError as exc:
+                    raise ExternalUnavailable(
+                        host="seti.afip.gob.ar",
+                        stage="seti_payments",
+                    ) from exc
+                if response.status == 401:
+                    raise SetiAccessRequired("SETI no recibió una sesión autenticada")
+                if response.status in TRANSIENT_HTTP_STATUSES or response.status >= 500:
+                    raise ExternalUnavailable(
+                        host="seti.afip.gob.ar",
+                        stage="seti_payments",
+                        status_code=response.status,
+                    )
+                if response.status >= 400:
+                    raise ExternalRejected(
+                        host="seti.afip.gob.ar",
+                        stage="seti_payments",
+                        status_code=response.status,
+                    )
+                try:
+                    envelope = response.json()
+                except (TypeError, ValueError) as exc:
+                    raise ExternalContractError(
+                        host="seti.afip.gob.ar",
+                        stage="seti_payments_contract",
+                    ) from exc
+                if not isinstance(envelope, dict):
+                    raise ExternalContractError(
+                        host="seti.afip.gob.ar",
+                        stage="seti_payments_contract",
+                    )
+                if envelope.get("success") is not True:
+                    raise ExternalRejected(
+                        host="seti.afip.gob.ar",
+                        stage="seti_payments",
+                    )
+                data = envelope.get("data")
+                if not isinstance(data, dict) or not isinstance(
+                    data.get("vepsConsultados"), list
+                ):
+                    raise ExternalContractError(
+                        host="seti.afip.gob.ar",
+                        stage="seti_payments_contract",
+                    )
+                items = data["vepsConsultados"]
+                if any(not isinstance(item, dict) for item in items):
+                    raise ExternalContractError(
+                        host="seti.afip.gob.ar",
+                        stage="seti_payments_contract",
+                    )
                 observed_cuit = {
                     re.sub(r"\D", "", str(item.get("cuit", "")))
-                    for item in data.get("vepsConsultados", [])
+                    for item in items
                 }
                 if observed_cuit and observed_cuit != {represented_cuit}:
-                    raise SetiError("SETI devolvió un CUIT distinto del vinculado al chat")
+                    raise ExternalContractError(
+                        host="seti.afip.gob.ar",
+                        stage="seti_identity_contract",
+                    )
+                try:
+                    veps = [self._normalize_payment(item) for item in items]
+                except (SetiError, TypeError, ValueError) as exc:
+                    raise ExternalContractError(
+                        host="seti.afip.gob.ar",
+                        stage="seti_payments_contract",
+                    ) from exc
                 return {
                     "window_months": 12,
-                    "veps": [
-                        self._normalize_payment(item)
-                        for item in data.get("vepsConsultados", [])
-                    ],
+                    "veps": veps,
                 }
             finally:
                 context.close()
@@ -288,6 +381,12 @@ class SetiPaymentsWorker:
             raise SetiError("El chat no tiene un CUIT verificado")
         ccma_row = self.db.get_live_snapshot(chat_id, "ARCA_CCMA", "account_status")
         if ccma_row is None:
+            self.db.record_connection_failure(
+                chat_id,
+                "ARCA_SETI",
+                "PENDING",
+                FailureDetail("PENDING", stage="ccma_prerequisite").to_json(),
+            )
             raise SetiError("Falta una consulta de CCMA para comparar los pagos")
         try:
             ccma = json.loads(ccma_row["payload_json"])
@@ -304,28 +403,48 @@ class SetiPaymentsWorker:
                     vep["tax_type"] = "SANTA_FE_IIBB"
                     vep["tax_period"] = period
             payload["ccma_reconciliation"] = reconcile_seti_payments(veps, ccma)
+        except SetiAccessRequired:
+            self.db.record_connection_failure(
+                chat_id,
+                "ARCA_SETI",
+                "LOGIN_REQUIRED",
+                FailureDetail("AUTH_REQUIRED", stage="seti_session").to_json(),
+            )
+            raise
         except ExternalUnavailable as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "ARCA_SETI",
                 "EXTERNAL_UNAVAILABLE",
-                last_error=str(exc),
+                failure_detail(exc).to_json(),
+            )
+            raise
+        except ExternalRejected as exc:
+            self.db.record_connection_failure(
+                chat_id,
+                "ARCA_SETI",
+                "UPSTREAM_ERROR",
+                failure_detail(exc).to_json(),
             )
             raise
         except ExternalContractError as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "ARCA_SETI",
-                "INTEGRATION_CHANGED",
-                last_error=str(exc),
+                "UNEXPECTED_RESPONSE",
+                failure_detail(exc).to_json(),
             )
             raise
         except Exception as exc:
-            self.db.upsert_connection(
+            self.db.record_connection_failure(
                 chat_id,
                 "ARCA_SETI",
                 "INTERNAL_ERROR",
-                last_error=str(exc),
+                FailureDetail(
+                    "INTERNAL_ERROR",
+                    stage="seti_sync",
+                    code=exc.__class__.__name__,
+                ).to_json(),
             )
             raise
 
@@ -338,9 +457,8 @@ class SetiPaymentsWorker:
             (fetched_at + self.snapshot_ttl).isoformat(),
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
-        self.db.upsert_connection(
+        self.db.record_connection_success(
             chat_id,
             "ARCA_SETI",
-            "CONNECTED",
-            last_success_at=fetched_at.isoformat(),
+            fetched_at.isoformat(),
         )

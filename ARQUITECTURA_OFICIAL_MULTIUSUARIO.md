@@ -120,10 +120,10 @@ Los eventos se deduplican en SQLite mediante clave y huella. La regla de concili
 de pagos se aplica antes de generar deuda: un pago confirmado pendiente de reflejarse
 suprime la alerta contradictoria de deuda para ese mismo saldo.
 
-Los estados rotos son la excepción a la deduplicación permanente: una pérdida de
-acceso o una fuente desactualizada se recuerda cada hora hasta que la condición se
-resuelva. La hora de la última entrega queda persistida, por lo que reiniciar el bot no
-adelanta ni elimina el próximo recordatorio.
+El monitor persiste la última condición notificada por fuente. Avisa cuando comienza
+un problema, cuando cambia su causa y cuando la fuente se recupera. Sólo los incidentes
+que requieren completar o validar el acceso se recuerdan una vez por día; las fallas
+externas o técnicas sin acción del usuario no generan mensajes repetidos.
 
 La evaluación frecuente trabaja sobre datos locales. Como máximo cada seis horas
 dispara la actualización de perfil, mensajes y facturación por API oficial. Los

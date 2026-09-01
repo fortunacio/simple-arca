@@ -418,7 +418,6 @@ def sync_portal_sources(
     iibb_payment_store: IibbPaymentStore,
 ) -> bool:
     ccma_ready = False
-    santa_fe_ready = santa_fe_worker is None
     try:
         ccma_worker.sync_chat(chat_id)
         ccma_ready = True
@@ -440,11 +439,10 @@ def sync_portal_sources(
     if santa_fe_worker is not None:
         try:
             santa_fe_worker.sync_chat(chat_id)
-            santa_fe_ready = True
         except (CcmaCredentialsRejected, CcmaSessionRequired):
-            database.clear_portal_access(chat_id)
             LOGGER.warning(
-                "Ingresos Brutos necesita configurar el acceso para chat_id=%s",
+                "Ingresos Brutos no pudo completar el ingreso para chat_id=%s; "
+                "se conserva el acceso de ARCA verificado",
                 chat_id,
             )
         except Exception:
@@ -455,7 +453,7 @@ def sync_portal_sources(
 
     iibb_payment_store.reconcile_paid(chat_id)
 
-    ready = ccma_ready and santa_fe_ready
+    ready = ccma_ready
     if ready and database.get_portal_access(chat_id) is not None:
         database.mark_portal_access_ready(chat_id, datetime.now(timezone.utc).isoformat())
     return ready

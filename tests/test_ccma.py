@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from contador_ai.ccma import CcmaError, parse_ccma_account
+from contador_ai.ccma import CcmaError, CcmaSessionRequired, parse_ccma_account
 from contador_ai.ccma_worker import (
     CcmaBrowserConnector,
     CcmaWorker,
@@ -238,6 +238,41 @@ class CcmaParserTest(TestCase):
             self.assertEqual(seti.calls, [1001])
             self.assertEqual(santa_fe.calls, [1001])
             self.assertIsNotNone(db.get_portal_access(1001)["ready_at"])
+
+    def test_initial_sync_keeps_verified_access_when_santa_fe_login_fails(self):
+        class Worker:
+            def sync_chat(self, _chat_id):
+                return None
+
+        class SantaFeWorker:
+            def sync_chat(self, _chat_id):
+                raise CcmaSessionRequired(
+                    "ARCA no respondió correctamente durante el ingreso"
+                )
+
+        with TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.ensure_user(1001)
+            db.set_pending_tax_identity(1001, "20383717419", "production")
+            db.mark_tax_identity_verified(1001)
+            db.mark_portal_access_verified(
+                1001, "20383717419", datetime.now(timezone.utc).isoformat()
+            )
+
+            ready = sync_portal_sources(
+                1001,
+                db,
+                Worker(),
+                Worker(),
+                SantaFeWorker(),
+                IibbPaymentStore(db),
+            )
+
+            self.assertTrue(ready)
+            access = db.get_portal_access(1001)
+            self.assertIsNotNone(access)
+            self.assertIsNotNone(access["ready_at"])
 
     def test_worker_keeps_each_ccma_observation_in_history(self):
         payloads = [

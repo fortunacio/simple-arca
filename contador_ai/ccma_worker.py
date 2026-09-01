@@ -21,6 +21,7 @@ from .ccma import (
     parse_ccma_account,
 )
 from .db import Database
+from .external import ExternalContractError, ExternalUnavailable
 from .iibb_payment import IibbPaymentProcessor, IibbPaymentStore
 from .santa_fe import ARGENTINA_TIMEZONE, SantaFeIibbConnector, SantaFeIibbWorker
 from .seti import BrowserSetiConnector, SetiPaymentsWorker
@@ -185,20 +186,6 @@ class CcmaBrowserConnector:
         account.get_by_role("button", name="CALCULO DE DEUDA").click()
         account.wait_for_url(re.compile(r"/P04_ctacte\.asp"), timeout=60_000)
 
-    @staticmethod
-    def _credentials_were_rejected(text: str) -> bool:
-        normalized = " ".join(text.lower().split())
-        return bool(
-            re.search(
-                r"(clave|contrase(?:ñ|n)a).{0,80}(incorrect|inv[aá]lid|err[oó]ne)",
-                normalized,
-            )
-            or re.search(
-                r"(incorrect|inv[aá]lid|err[oó]ne).{0,80}(clave|contrase(?:ñ|n)a)",
-                normalized,
-            )
-        )
-
     def _authenticate(self, page, cuit: str, password: str) -> None:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -208,6 +195,12 @@ class CcmaBrowserConnector:
         page.context.add_cookies(cookies)
         try:
             page.goto(MONOTRIBUTO_URL, wait_until="domcontentloaded", timeout=60_000)
+        except PlaywrightTimeoutError as exc:
+            raise ExternalUnavailable(
+                host="monotributo.afip.gob.ar",
+                stage="monotributo_navigation",
+            ) from exc
+        try:
             account_button = page.get_by_role("button", name="Ver Saldo / Pagar")
             account_button.wait_for(state="visible", timeout=20_000)
         except PlaywrightTimeoutError as exc:
@@ -221,8 +214,9 @@ class CcmaBrowserConnector:
                 safe_url,
                 title,
             )
-            raise CcmaSessionRequired(
-                "ARCA no aceptó la sesión HTTP en Monotributo"
+            raise ExternalContractError(
+                host="monotributo.afip.gob.ar",
+                stage="monotributo_account_action",
             ) from exc
 
     def verify_and_store_credentials(
@@ -370,8 +364,29 @@ class CcmaWorker:
         except CcmaSessionRequired as exc:
             self.db.upsert_connection(chat_id, "ARCA_CCMA", "LOGIN_REQUIRED", last_error=str(exc))
             raise
+        except ExternalUnavailable as exc:
+            self.db.upsert_connection(
+                chat_id,
+                "ARCA_CCMA",
+                "EXTERNAL_UNAVAILABLE",
+                last_error=str(exc),
+            )
+            raise
+        except ExternalContractError as exc:
+            self.db.upsert_connection(
+                chat_id,
+                "ARCA_CCMA",
+                "INTEGRATION_CHANGED",
+                last_error=str(exc),
+            )
+            raise
         except Exception as exc:
-            self.db.upsert_connection(chat_id, "ARCA_CCMA", "ERROR", last_error=str(exc))
+            self.db.upsert_connection(
+                chat_id,
+                "ARCA_CCMA",
+                "INTERNAL_ERROR",
+                last_error=str(exc),
+            )
             raise
         fetched_at = datetime.now(timezone.utc)
         payload_json = json.dumps(
@@ -427,6 +442,18 @@ def sync_portal_sources(
     except CcmaSessionRequired:
         database.clear_portal_access(chat_id)
         LOGGER.warning("CCMA necesita configurar el acceso para chat_id=%s", chat_id)
+    except ExternalUnavailable as exc:
+        LOGGER.warning(
+            "Una dependencia externa no está disponible para chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
+    except ExternalContractError as exc:
+        LOGGER.error(
+            "La integración externa devolvió un contrato inesperado para chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
     except Exception:
         LOGGER.exception("Falló la sincronización CCMA para chat_id=%s", chat_id)
 
@@ -444,6 +471,18 @@ def sync_portal_sources(
                 "Ingresos Brutos no pudo completar el ingreso para chat_id=%s; "
                 "se conserva el acceso de ARCA verificado",
                 chat_id,
+            )
+        except ExternalUnavailable as exc:
+            LOGGER.warning(
+                "Ingresos Brutos no está disponible para chat_id=%s: %s",
+                chat_id,
+                exc,
+            )
+        except ExternalContractError as exc:
+            LOGGER.error(
+                "La integración de Ingresos Brutos cambió para chat_id=%s: %s",
+                chat_id,
+                exc,
             )
         except Exception:
             LOGGER.exception(

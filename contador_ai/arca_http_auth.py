@@ -9,6 +9,7 @@ from urllib.parse import urlencode, urljoin
 import httpx
 
 from .ccma import CcmaCredentialsRejected, CcmaSessionRequired
+from .external import ExternalContractError, checked_request
 
 
 ARCA_LOGIN_BASE_URL = "https://auth.afip.gov.ar/contribuyente_/login.xhtml"
@@ -57,13 +58,29 @@ class _FormParser(HTMLParser):
             self.current = None
 
 
-def _form_with(html_text: str, field_name: str) -> _Form:
+def _form_with(
+    html_text: str,
+    field_name: str,
+    *,
+    host: str,
+    stage: str,
+) -> _Form:
     parser = _FormParser()
     parser.feed(html_text)
     for form in parser.forms:
         if any(field.get("name") == field_name for field in form.inputs):
             return form
-    raise CcmaSessionRequired(f"ARCA no devolvió el campo esperado: {field_name}")
+    raise ExternalContractError(host=host, stage=stage)
+
+
+def _has_form_field(html_text: str, field_name: str) -> bool:
+    parser = _FormParser()
+    parser.feed(html_text)
+    return any(
+        field.get("name") == field_name
+        for form in parser.forms
+        for field in form.inputs
+    )
 
 
 def _submit(
@@ -122,8 +139,9 @@ def _follow_sso_relay(
         relay = relays[0]
         target = urljoin(str(current.url), html.unescape(relay.action))
         if not _official_host(target):
-            raise CcmaSessionRequired(
-                "ARCA intentó continuar el ingreso fuera de un dominio oficial"
+            raise ExternalContractError(
+                host=httpx.URL(target).host,
+                stage="sso_relay_host",
             )
         data = {
             field["name"]: html.unescape(field.get("value", ""))
@@ -131,47 +149,29 @@ def _follow_sso_relay(
             if field.get("name") and field.get("type", "").lower() == "hidden"
         }
         if relay.method == "post":
-            current = client.post(
-                target,
-                data=data,
-                headers={"Referer": str(current.url)},
+            current = checked_request(
+                lambda: client.post(
+                    target,
+                    data=data,
+                    headers={"Referer": str(current.url)},
+                ),
+                stage="sso_relay",
             )
         else:
-            current = client.get(
-                target,
-                params=data,
-                headers={"Referer": str(current.url)},
+            current = checked_request(
+                lambda: client.get(
+                    target,
+                    params=data,
+                    headers={"Referer": str(current.url)},
+                ),
+                stage="sso_relay",
             )
-        current.raise_for_status()
     return current
 
 
 def _visible_text(html_text: str) -> str:
     without_tags = re.sub(r"<[^>]+>", " ", html_text)
     return " ".join(html.unescape(without_tags).split())
-
-
-def _login_feedback(html_text: str) -> str:
-    match = re.search(
-        r"<(?:span|div|p)\b[^>]*\bid=[\"']F1:msg[\"'][^>]*>(.*?)</(?:span|div|p)>",
-        html_text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    return _visible_text(match.group(1))[:240] if match else ""
-
-
-def _credentials_were_rejected(text: str) -> bool:
-    normalized = " ".join(text.lower().split())
-    return bool(
-        re.search(
-            r"(clave|contrase(?:ñ|n)a).{0,80}(incorrect|inv[aá]lid|err[oó]ne|no es correcta)",
-            normalized,
-        )
-        or re.search(
-            r"(incorrect|inv[aá]lid|err[oó]ne).{0,80}(clave|contrase(?:ñ|n)a)",
-            normalized,
-        )
-    )
 
 
 class ArcaHttpAuthenticator:
@@ -198,11 +198,18 @@ class ArcaHttpAuthenticator:
             transport=self.transport,
             headers={"User-Agent": "Mozilla/5.0"},
         ) as client:
-            try:
-                first = client.get(login_url)
-                first.raise_for_status()
-                username_form = _form_with(first.text, "F1:username")
-                second = _submit(
+            first = checked_request(
+                lambda: client.get(login_url),
+                stage="auth_entry",
+            )
+            username_form = _form_with(
+                first.text,
+                "F1:username",
+                host=first.url.host,
+                stage="auth_username_form",
+            )
+            second = checked_request(
+                lambda: _submit(
                     client,
                     first,
                     username_form,
@@ -210,10 +217,17 @@ class ArcaHttpAuthenticator:
                         "F1:username": cuit,
                         "F1:btnSiguiente": "Siguiente",
                     },
-                )
-                second.raise_for_status()
-                password_form = _form_with(second.text, "F1:password")
-                third = _submit(
+                ),
+                stage="auth_username_submit",
+            )
+            password_form = _form_with(
+                second.text,
+                "F1:password",
+                host=second.url.host,
+                stage="auth_password_form",
+            )
+            third = checked_request(
+                lambda: _submit(
                     client,
                     second,
                     password_form,
@@ -222,30 +236,26 @@ class ArcaHttpAuthenticator:
                         "F1:password": password,
                         "F1:btnIngresar": "Ingresar",
                     },
-                )
-                third.raise_for_status()
-                third = _follow_sso_relay(
-                    client,
-                    third,
-                    stop_host=ARCA_SYSTEM_TARGETS[system],
-                )
-            except httpx.HTTPError as exc:
-                raise CcmaSessionRequired(
-                    "ARCA no respondió correctamente durante el ingreso"
-                ) from exc
-            text = _visible_text(third.text)
-            feedback = _login_feedback(third.text)
-            if _credentials_were_rejected(feedback or text):
+                ),
+                stage="auth_password_submit",
+                allow_statuses={401},
+            )
+            if third.status_code == 401:
                 raise CcmaCredentialsRejected("ARCA rechazó la clave fiscal")
-            if 'name="F1:password"' in third.text:
-                detail = f" ARCA informó: {feedback}" if feedback else ""
+            third = _follow_sso_relay(
+                client,
+                third,
+                stop_host=ARCA_SYSTEM_TARGETS[system],
+            )
+            if _has_form_field(third.text, "F1:password"):
                 raise CcmaSessionRequired(
-                    "ARCA mantuvo abierto el formulario de clave fiscal." + detail
+                    "ARCA no completó el ingreso con las credenciales proporcionadas"
                 )
-            if (
-                not _official_host(str(third.url))
-            ):
-                raise CcmaSessionRequired("ARCA no finalizó el ingreso en un dominio oficial")
+            if third.url.host != ARCA_SYSTEM_TARGETS[system]:
+                raise ExternalContractError(
+                    host=third.url.host,
+                    stage="sso_destination",
+                )
             cookies = [
                 {
                     "name": cookie.name,
@@ -263,12 +273,4 @@ class ArcaHttpAuthenticator:
 
     def authenticate(self, cuit: str, password: str) -> list[dict[str, object]]:
         login = self.login(cuit, password, "admin_mono")
-        text = _visible_text(login.html)
-        if (
-            httpx.URL(login.url).host != "monotributo.afip.gob.ar"
-            or "Ver Saldo / Pagar" not in text
-        ):
-            raise CcmaSessionRequired(
-                "ARCA no redirigió el ingreso hacia Monotributo"
-            )
         return login.cookies

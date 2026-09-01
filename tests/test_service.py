@@ -483,7 +483,7 @@ class ServiceTest(TestCase):
         self.assertIn("VEPAI está en mantenimiento", output)
         self.assertIn("no puedo confirmar", output)
         self.assertNotIn("No registra deuda", output)
-        self.assertIn("VEPAI está en mantenimiento", service.status(1001))
+        self.assertIn("la consulta quedó incompleta", service.status(1001))
 
     def test_iibb_reports_a_conciliated_grouped_payment(self):
         self.db.ensure_user(1001)
@@ -1227,6 +1227,29 @@ class ServiceTest(TestCase):
         self.assertEqual(output.count("No pude actualizar Ingresos Brutos"), 1)
         for forbidden in ("SETI", "CCMA", "VEPAI", "VEP", "imputación"):
             self.assertNotIn(forbidden, output)
+
+    def test_summary_distinguishes_external_contract_and_internal_failures(self):
+        self._verified_user()
+        self.db.mark_portal_access_verified(
+            1001, "20383717419", datetime.now(timezone.utc).isoformat()
+        )
+        self.db.upsert_connection(1001, "ARCA_CCMA", "INTERNAL_ERROR")
+        self.db.upsert_connection(1001, "ARCA_SETI", "INTEGRATION_CHANGED")
+        self.db.upsert_connection(1001, "SANTA_FE_IIBB", "EXTERNAL_UNAVAILABLE")
+        service = TaxMonitorService(
+            self.db,
+            live_synchronizers={
+                "ARCA_CCMA": lambda _chat_id: None,
+                "ARCA_SETI": lambda _chat_id: None,
+                "SANTA_FE_IIBB": lambda _chat_id: None,
+            },
+        )
+
+        output = service.summary(1001)
+
+        self.assertIn("error interno al actualizar Monotributo", output)
+        self.assertIn("integración con Monotributo necesita revisión", output)
+        self.assertIn("Ingresos Brutos está temporalmente no disponible", output)
 
     def test_failed_live_sync_never_falls_back_to_snapshot(self):
         def fail(_chat_id):

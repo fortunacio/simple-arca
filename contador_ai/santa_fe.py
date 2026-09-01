@@ -6,7 +6,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
-from typing import Protocol
+from typing import Callable, Protocol, TypeVar
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -14,6 +14,7 @@ import httpx
 from .arca_http_auth import ArcaHttpAuthenticator, ArcaHttpLogin, _visible_text
 from .ccma import CcmaCredentialsRejected, CcmaSessionRequired
 from .db import Database
+from .external import ExternalContractError, ExternalUnavailable, checked_request
 
 
 REGSIM_URL = "https://www.santafe.gob.ar/e-regsim/index.php"
@@ -30,10 +31,6 @@ class SantaFeIibbError(RuntimeError):
     pass
 
 
-class SantaFeMaintenance(SantaFeIibbError):
-    pass
-
-
 class IibbGenerationUnknown(SantaFeIibbError):
     """La solicitud pudo haber llegado a Santa Fe y no debe repetirse."""
 
@@ -46,6 +43,25 @@ class IibbQuoteChanged(SantaFeIibbError):
 
 class CredentialsStore(Protocol):
     def load(self, chat_id: int) -> dict[str, str] | None: ...
+
+
+ParsedPayload = TypeVar("ParsedPayload")
+
+
+def _external_payload(
+    parser: Callable[[], ParsedPayload],
+    *,
+    stage: str,
+) -> ParsedPayload:
+    try:
+        return parser()
+    except ExternalContractError:
+        raise
+    except SantaFeIibbError as exc:
+        raise ExternalContractError(
+            host="www.santafe.gob.ar",
+            stage=stage,
+        ) from exc
 
 
 class _TableParser(HTMLParser):
@@ -259,18 +275,16 @@ def parse_regsim(html_text: str, expected_cuit: str) -> dict[str, object]:
 
 def parse_vepai(html_text: str) -> dict[str, object]:
     text = _normalized(_visible_text(html_text))
-    if "horario reservado para tareas de mantenimiento" in text.lower():
-        raise SantaFeMaintenance("VEPAI está en mantenimiento")
     lowered = text.lower()
-    if "error:" in lowered and not _parse_payment_rows(html_text):
-        error = text[lowered.index("error:") :][:240]
-        raise SantaFeIibbError(error)
     payments, groups = _parse_vepai_payments(html_text)
     if not payments and not any(
         phrase in lowered
         for phrase in ("no se encontraron", "sin pagos", "no registra pagos")
     ):
-        raise SantaFeIibbError("VEPAI no devolvió un detalle de pagos reconocible")
+        raise ExternalContractError(
+            host="www.santafe.gob.ar",
+            stage="vepai_contract",
+        )
     return {"status": "AVAILABLE", "payments": payments, "payment_groups": groups}
 
 
@@ -413,13 +427,17 @@ class SantaFeIibbConnector:
 
     @staticmethod
     def _open_regsim(client: httpx.Client, represented_cuit: str) -> str:
-        menu = client.post(
-            REGSIM_URL,
-            data={"action": "Ingreso::menu", "cuit": represented_cuit},
+        checked_request(
+            lambda: client.post(
+                REGSIM_URL,
+                data={"action": "Ingreso::menu", "cuit": represented_cuit},
+            ),
+            stage="regsim_menu",
         )
-        menu.raise_for_status()
-        form = client.get(REGSIM_FORM_URL)
-        form.raise_for_status()
+        form = checked_request(
+            lambda: client.get(REGSIM_FORM_URL),
+            stage="regsim_form",
+        )
         return form.text
 
     @staticmethod
@@ -428,28 +446,38 @@ class SantaFeIibbConnector:
         period: str,
         payment_date: date,
     ) -> tuple[dict[str, str], dict[str, str]]:
-        period_response = client.post(
-            f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarPeriodoVep",
-            data={"periodo_osiris": period.replace("-", "")},
-            headers=REGSIM_AJAX_HEADERS,
+        period_response = checked_request(
+            lambda: client.post(
+                f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarPeriodoVep",
+                data={"periodo_osiris": period.replace("-", "")},
+                headers=REGSIM_AJAX_HEADERS,
+            ),
+            stage="regsim_period_quote",
         )
-        period_response.raise_for_status()
-        base = parse_period_quote(period_response.text, period)
+        base = _external_payload(
+            lambda: parse_period_quote(period_response.text, period),
+            stage="regsim_period_contract",
+        )
         period_fields = _InputParser()
         period_fields.feed(period_response.text)
-        interest_response = client.post(
-            f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarInteres",
-            data={
-                "vencimi_periodo": datetime.strptime(
-                    str(base["due_date"]), "%Y-%m-%d"
-                ).strftime("%d/%m/%Y"),
-                "fecha_pago": payment_date.strftime("%d/%m/%Y"),
-                "importe": str(base["amount"]).replace(".", ","),
-            },
-            headers=REGSIM_AJAX_HEADERS,
+        interest_response = checked_request(
+            lambda: client.post(
+                f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarInteres",
+                data={
+                    "vencimi_periodo": datetime.strptime(
+                        str(base["due_date"]), "%Y-%m-%d"
+                    ).strftime("%d/%m/%Y"),
+                    "fecha_pago": payment_date.strftime("%d/%m/%Y"),
+                    "importe": str(base["amount"]).replace(".", ","),
+                },
+                headers=REGSIM_AJAX_HEADERS,
+            ),
+            stage="regsim_interest_quote",
         )
-        interest_response.raise_for_status()
-        interest = parse_interest(interest_response.text)
+        interest = _external_payload(
+            lambda: parse_interest(interest_response.text),
+            stage="regsim_interest_contract",
+        )
         principal = str(base["amount"])
         quote = {
             "period": period,
@@ -563,17 +591,31 @@ class SantaFeIibbConnector:
         login = self._login(chat_id, represented_cuit, "santafe_regsim")
         with self._client(login) as client:
             self._open_regsim(client, represented_cuit)
-            response = client.get(f"{REGSIM_URL}?action=Registro::boletasPago")
-            response.raise_for_status()
+            response = checked_request(
+                lambda: client.get(f"{REGSIM_URL}?action=Registro::boletasPago"),
+                stage="regsim_account",
+            )
             quotes = []
             for period in (_period_offset(current, -1), _period_offset(current, 0)):
-                quote = client.post(
-                    f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarPeriodoVep",
-                    data={"periodo_osiris": period.replace("-", "")},
+                quote = checked_request(
+                    lambda period=period: client.post(
+                        f"{REGSIM_URL}?header=AJAX&action=Registro::actualizarPeriodoVep",
+                        data={"periodo_osiris": period.replace("-", "")},
+                    ),
+                    stage="regsim_period_quote",
                 )
-                quote.raise_for_status()
-                quotes.append(parse_period_quote(quote.text, period))
-        result = parse_regsim(response.text, represented_cuit)
+                quotes.append(
+                    _external_payload(
+                        lambda quote=quote, period=period: parse_period_quote(
+                            quote.text, period
+                        ),
+                        stage="regsim_period_contract",
+                    )
+                )
+        result = _external_payload(
+            lambda: parse_regsim(response.text, represented_cuit),
+            stage="regsim_account_contract",
+        )
         result["period_quotes"] = quotes
         return result
 
@@ -588,35 +630,37 @@ class SantaFeIibbConnector:
     ) -> dict[str, object]:
         login = self._login(chat_id, represented_cuit, "santafe_vepai")
         with self._client(login) as client:
-            response = client.post(
-                VEPAI_URL,
-                data={
-                    "action": "Ingreso::valido",
-                    "cuit": represented_cuit,
-                    "tipo_de_pago": "B",
-                    "nupartida": re.sub(r"\D", "", account),
-                    "solicitud": "",
-                    "tipo": "mau",
-                    "fechaDesde": from_date.strftime("%d/%m/%Y"),
-                    "fechaHasta": to_date.strftime("%d/%m/%Y"),
-                },
+            response = checked_request(
+                lambda: client.post(
+                    VEPAI_URL,
+                    data={
+                        "action": "Ingreso::valido",
+                        "cuit": represented_cuit,
+                        "tipo_de_pago": "B",
+                        "nupartida": re.sub(r"\D", "", account),
+                        "solicitud": "",
+                        "tipo": "mau",
+                        "fechaDesde": from_date.strftime("%d/%m/%Y"),
+                        "fechaHasta": to_date.strftime("%d/%m/%Y"),
+                    },
+                ),
+                stage="vepai_account",
             )
-            response.raise_for_status()
-        return parse_vepai(response.text)
+        return _external_payload(
+            lambda: parse_vepai(response.text),
+            stage="vepai_contract",
+        )
 
     def sync(self, chat_id: int, represented_cuit: str, *, today: date | None = None) -> dict[str, object]:
         current = today or datetime.now(ARGENTINA_TIMEZONE).date()
         profile = self.fetch_regsim(chat_id, represented_cuit, current=current)
-        try:
-            vepai = self.fetch_vepai(
-                chat_id,
-                represented_cuit,
-                str(profile["account"]),
-                from_date=date.fromisoformat(str(profile["activity_start"])),
-                to_date=current,
-            )
-        except SantaFeMaintenance:
-            vepai = {"status": "MAINTENANCE", "payments": []}
+        vepai = self.fetch_vepai(
+            chat_id,
+            represented_cuit,
+            str(profile["account"]),
+            from_date=date.fromisoformat(str(profile["activity_start"])),
+            to_date=current,
+        )
         if vepai.get("status") == "AVAILABLE":
             vepai["reconciliation"] = reconcile_vepai(
                 str(profile["effective_period"]),
@@ -676,8 +720,29 @@ class SantaFeIibbWorker:
                 last_error=str(exc),
             )
             raise
+        except ExternalUnavailable as exc:
+            self.db.upsert_connection(
+                chat_id,
+                "SANTA_FE_IIBB",
+                "EXTERNAL_UNAVAILABLE",
+                last_error=str(exc),
+            )
+            raise
+        except ExternalContractError as exc:
+            self.db.upsert_connection(
+                chat_id,
+                "SANTA_FE_IIBB",
+                "INTEGRATION_CHANGED",
+                last_error=str(exc),
+            )
+            raise
         except Exception as exc:
-            self.db.upsert_connection(chat_id, "SANTA_FE_IIBB", "ERROR", last_error=str(exc))
+            self.db.upsert_connection(
+                chat_id,
+                "SANTA_FE_IIBB",
+                "INTERNAL_ERROR",
+                last_error=str(exc),
+            )
             raise
         fetched_at = datetime.now(timezone.utc)
         self.db.upsert_live_snapshot(
@@ -694,5 +759,9 @@ class SantaFeIibbWorker:
             "SANTA_FE_IIBB",
             "CONNECTED" if vepai_status == "AVAILABLE" else "PARTIAL",
             last_success_at=fetched_at.isoformat(),
-            last_error=None if vepai_status == "AVAILABLE" else "VEPAI está en mantenimiento",
+            last_error=(
+                None
+                if vepai_status == "AVAILABLE"
+                else "La consulta provincial quedó incompleta"
+            ),
         )

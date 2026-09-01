@@ -11,6 +11,7 @@ from typing import Protocol
 from urllib.parse import urlencode
 
 from .db import Database
+from .external import ExternalContractError, ExternalUnavailable
 
 
 SANTA_FE_IIBB_DESCRIPTION = re.compile(
@@ -303,8 +304,29 @@ class SetiPaymentsWorker:
                     vep["tax_type"] = "SANTA_FE_IIBB"
                     vep["tax_period"] = period
             payload["ccma_reconciliation"] = reconcile_seti_payments(veps, ccma)
+        except ExternalUnavailable as exc:
+            self.db.upsert_connection(
+                chat_id,
+                "ARCA_SETI",
+                "EXTERNAL_UNAVAILABLE",
+                last_error=str(exc),
+            )
+            raise
+        except ExternalContractError as exc:
+            self.db.upsert_connection(
+                chat_id,
+                "ARCA_SETI",
+                "INTEGRATION_CHANGED",
+                last_error=str(exc),
+            )
+            raise
         except Exception as exc:
-            self.db.upsert_connection(chat_id, "ARCA_SETI", "ERROR", last_error=str(exc))
+            self.db.upsert_connection(
+                chat_id,
+                "ARCA_SETI",
+                "INTERNAL_ERROR",
+                last_error=str(exc),
+            )
             raise
 
         fetched_at = datetime.now(timezone.utc)

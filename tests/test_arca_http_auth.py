@@ -5,6 +5,7 @@ import httpx
 
 from contador_ai.arca_http_auth import ArcaHttpAuthenticator
 from contador_ai.ccma import CcmaCredentialsRejected, CcmaSessionRequired
+from contador_ai.external import ExternalContractError, ExternalUnavailable
 
 
 USERNAME_FORM = """
@@ -87,10 +88,7 @@ class ArcaHttpAuthenticatorTest(TestCase):
             (
                 httpx.Response(200, text=USERNAME_FORM),
                 httpx.Response(200, text=PASSWORD_FORM),
-                httpx.Response(
-                    200,
-                    text=PASSWORD_FORM + "<p>La clave ingresada es incorrecta</p>",
-                ),
+                httpx.Response(401),
             )
         )
         authenticator = ArcaHttpAuthenticator(
@@ -165,7 +163,7 @@ class ArcaHttpAuthenticatorTest(TestCase):
         self.assertIn("VEPAI", login.html)
         self.assertEqual(len(requests), 4)
 
-    def test_preserves_safe_feedback_from_arca(self):
+    def test_does_not_infer_failure_kind_from_feedback_text(self):
         responses = iter(
             (
                 httpx.Response(200, text=USERNAME_FORM),
@@ -181,8 +179,59 @@ class ArcaHttpAuthenticatorTest(TestCase):
             transport=httpx.MockTransport(lambda _request: next(responses))
         )
 
-        with self.assertRaisesRegex(
-            CcmaSessionRequired,
-            "Intentá nuevamente más tarde",
-        ):
+        with self.assertRaisesRegex(CcmaSessionRequired, "no completó el ingreso"):
             authenticator.authenticate("20383717419", "cualquiera")
+
+    def test_classifies_an_upstream_503_without_reading_its_body(self):
+        responses = iter(
+            (
+                httpx.Response(200, text=USERNAME_FORM),
+                httpx.Response(200, text=PASSWORD_FORM),
+                httpx.Response(
+                    200,
+                    text="""
+                    <form method="post"
+                          action="https://www.santafe.gob.ar/e-regsim/index.php">
+                      <input type="hidden" name="token" value="sso-token">
+                    </form>
+                    """,
+                ),
+                httpx.Response(503, text="contenido arbitrario"),
+            )
+        )
+        authenticator = ArcaHttpAuthenticator(
+            transport=httpx.MockTransport(lambda _request: next(responses))
+        )
+
+        with self.assertRaises(ExternalUnavailable) as raised:
+            authenticator.login(
+                "20383717419",
+                "clave-secreta",
+                "santafe_regsim",
+            )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.stage, "sso_relay")
+
+    def test_classifies_a_transport_timeout_as_external_unavailability(self):
+        def timeout(request):
+            raise httpx.ReadTimeout("timeout", request=request)
+
+        authenticator = ArcaHttpAuthenticator(transport=httpx.MockTransport(timeout))
+
+        with self.assertRaises(ExternalUnavailable) as raised:
+            authenticator.login("20383717419", "clave-secreta", "admin_mono")
+
+        self.assertEqual(raised.exception.stage, "auth_entry")
+
+    def test_classifies_a_successful_but_incompatible_page_as_contract_change(self):
+        authenticator = ArcaHttpAuthenticator(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, text="<main>página nueva</main>")
+            )
+        )
+
+        with self.assertRaises(ExternalContractError) as raised:
+            authenticator.login("20383717419", "clave-secreta", "admin_mono")
+
+        self.assertEqual(raised.exception.stage, "auth_username_form")

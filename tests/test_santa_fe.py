@@ -7,9 +7,9 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from contador_ai.db import Database
+from contador_ai.external import ExternalContractError, ExternalUnavailable
 from contador_ai.santa_fe import (
     SantaFeIibbWorker,
-    SantaFeMaintenance,
     parse_regsim,
     parse_period_quote,
     parse_interest,
@@ -54,8 +54,8 @@ class SantaFeParserTest(TestCase):
         with self.assertRaisesRegex(Exception, "CUIT distinto"):
             parse_regsim(REGSIM_HTML, "20999999999")
 
-    def test_detects_vepai_maintenance(self):
-        with self.assertRaises(SantaFeMaintenance):
+    def test_classifies_an_unrecognized_vepai_page_as_contract_change(self):
+        with self.assertRaises(ExternalContractError):
             parse_vepai("<p>Error: Horario reservado para tareas de mantenimiento del sistema.</p>")
 
     def test_parses_vepai_payment_table(self):
@@ -116,6 +116,14 @@ class _Connector:
         return self.payload
 
 
+class _FailingConnector:
+    def __init__(self, error):
+        self.error = error
+
+    def sync(self, _chat_id, _represented_cuit):
+        raise self.error
+
+
 class SantaFeWorkerTest(TestCase):
     def setUp(self):
         self.tempdir = TemporaryDirectory()
@@ -143,3 +151,41 @@ class SantaFeWorkerTest(TestCase):
         self.assertEqual(json.loads(snapshot["payload_json"])["category"], "III")
         connection = self.db.get_connections(1001)[0]
         self.assertEqual(connection["status"], "PARTIAL")
+
+    def test_classifies_external_unavailability_without_invalidating_login(self):
+        worker = SantaFeIibbWorker(
+            self.db,
+            _FailingConnector(
+                ExternalUnavailable(
+                    host="www.santafe.gob.ar",
+                    stage="sso_relay",
+                    status_code=503,
+                )
+            ),
+            snapshot_ttl=timedelta(hours=1),
+        )
+
+        with self.assertRaises(ExternalUnavailable):
+            worker.sync_chat(1001)
+
+        connection = self.db.get_connections(1001)[0]
+        self.assertEqual(connection["status"], "EXTERNAL_UNAVAILABLE")
+        self.assertIn("HTTP 503", connection["last_error"])
+
+    def test_classifies_an_incompatible_external_contract(self):
+        worker = SantaFeIibbWorker(
+            self.db,
+            _FailingConnector(
+                ExternalContractError(
+                    host="www.santafe.gob.ar",
+                    stage="regsim_account",
+                )
+            ),
+            snapshot_ttl=timedelta(hours=1),
+        )
+
+        with self.assertRaises(ExternalContractError):
+            worker.sync_chat(1001)
+
+        connection = self.db.get_connections(1001)[0]
+        self.assertEqual(connection["status"], "INTEGRATION_CHANGED")

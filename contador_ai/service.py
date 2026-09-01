@@ -267,13 +267,15 @@ class TaxMonitorService:
             return f"🟡 {PROVIDERS[provider]} — ARCA pidió una validación manual"
         if row["status"] == "CREDENTIALS_REQUIRED":
             return f"🔴 {PROVIDERS[provider]} — hay que actualizar la clave fiscal guardada"
+        if row["status"] == "EXTERNAL_UNAVAILABLE":
+            return f"🟡 {PROVIDERS[provider]} — el servicio externo no está disponible"
+        if row["status"] == "INTEGRATION_CHANGED":
+            return f"🔴 {PROVIDERS[provider]} — la integración necesita revisión"
+        if row["status"] == "INTERNAL_ERROR":
+            return f"🔴 {PROVIDERS[provider]} — ocurrió un error interno"
         if row["status"] == "PARTIAL":
             observed = format_datetime_argentina(row["last_success_at"])
-            detail = (
-                "VEPAI está en mantenimiento"
-                if provider == "SANTA_FE_IIBB"
-                else "la consulta quedó incompleta"
-            )
+            detail = "la consulta quedó incompleta"
             return f"🟡 {PROVIDERS[provider]} — {detail}\nActualizado: {observed}"
         if row["status"] != "CONNECTED":
             return f"🔴 {PROVIDERS[provider]} — hubo un problema en la última consulta"
@@ -1277,7 +1279,13 @@ class TaxMonitorService:
                         last_success = last_success.replace(tzinfo=timezone.utc)
             except ValueError:
                 pass
-            if status != "CONNECTED":
+            if status == "EXTERNAL_UNAVAILABLE":
+                alerts.add(f"{labels[provider]} está temporalmente no disponible.")
+            elif status == "INTEGRATION_CHANGED":
+                alerts.add(f"La integración con {labels[provider]} necesita revisión.")
+            elif status == "INTERNAL_ERROR":
+                alerts.add(f"Ocurrió un error interno al actualizar {labels[provider]}.")
+            elif status != "CONNECTED":
                 alerts.add(f"No pude actualizar {labels[provider]}.")
             elif last_success is None or now - last_success > maximum_age[provider]:
                 alerts.add(f"{labels[provider]} lleva demasiado tiempo sin actualizarse.")

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .ccma import CcmaCredentialsRejected, CcmaError, CcmaSessionRequired
 from .db import Database
+from .external import ExternalContractError, ExternalUnavailable
 
 if TYPE_CHECKING:
     from .ccma_worker import CcmaBrowserConnector
@@ -248,6 +249,28 @@ Verificando tus datos con ARCA. Puede tardar hasta dos minutos; no cierres esta 
             self._send(
                 502,
                 _page("ARCA no respondió", "<p>No se guardó la clave. Probá nuevamente más tarde.</p>"),
+            )
+            return
+        except ExternalUnavailable:
+            LOGGER.warning("Una dependencia externa no está disponible durante el alta")
+            self._send(
+                503,
+                _page(
+                    "Servicio temporalmente no disponible",
+                    "<p>ARCA o uno de sus servicios no está respondiendo. "
+                    "Probá nuevamente más tarde.</p>",
+                ),
+            )
+            return
+        except ExternalContractError:
+            LOGGER.exception("Una integración externa cambió durante el alta")
+            self._send(
+                502,
+                _page(
+                    "La integración necesita revisión",
+                    "<p>El servicio externo respondió de una forma inesperada. "
+                    "No se guardó la clave.</p>",
+                ),
             )
             return
         except Exception:

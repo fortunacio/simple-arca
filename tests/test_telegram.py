@@ -10,6 +10,7 @@ class FakeDatabase:
         self.state = {}
         self.portal_notifications = []
         self.portal_notified = []
+        self.connections = []
 
     def get_bot_state(self, key, default=None):
         return self.state.get(key, default)
@@ -24,6 +25,9 @@ class FakeDatabase:
 
     def mark_portal_access_notified(self, chat_id, notified_at):
         self.portal_notified.append((chat_id, notified_at))
+
+    def get_connections(self, _chat_id):
+        return self.connections
 
 
 class FakeService:
@@ -253,11 +257,27 @@ class TelegramAccessTest(TestCase):
     def test_notifies_when_the_initial_account_sync_is_ready(self):
         client = FakeTelegramClient([], {123})
         client.fake_db.portal_notifications = [{"chat_id": 123}]
+        client.fake_db.connections = [
+            {"provider": "SANTA_FE_IIBB", "status": "CONNECTED"}
+        ]
 
         self.assertEqual(client.run_portal_access_notifications(), 1)
 
         self.assertIn("Tu cuenta está lista", client.sent[0][1]["text"])
         self.assertEqual(client.fake_db.portal_notified[0][0], 123)
+
+    def test_reports_external_iibb_outage_without_blaming_the_login(self):
+        client = FakeTelegramClient([], {123})
+        client.fake_db.portal_notifications = [{"chat_id": 123}]
+        client.fake_db.connections = [
+            {"provider": "SANTA_FE_IIBB", "status": "EXTERNAL_UNAVAILABLE"}
+        ]
+
+        self.assertEqual(client.run_portal_access_notifications(), 1)
+
+        message = client.sent[0][1]["text"]
+        self.assertIn("temporalmente no disponible", message)
+        self.assertNotIn("clave", message)
 
     def test_unauthorized_callback_is_silently_ignored(self):
         client = FakeTelegramClient(

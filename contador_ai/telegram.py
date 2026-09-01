@@ -313,10 +313,36 @@ class TelegramClient:
         for row in self.db.pending_portal_access_notifications(self.allowed_chat_ids):
             chat_id = int(row["chat_id"])
             try:
+                connections = {
+                    str(connection["provider"]): str(connection["status"])
+                    for connection in self.db.get_connections(chat_id)
+                }
+                santa_fe_status = connections.get("SANTA_FE_IIBB")
+                if santa_fe_status in {"CONNECTED", "PARTIAL"}:
+                    message = (
+                        "Tu cuenta está lista. Ya actualicé Monotributo e Ingresos "
+                        "Brutos."
+                    )
+                elif santa_fe_status == "EXTERNAL_UNAVAILABLE":
+                    message = (
+                        "Tu cuenta está lista y Monotributo ya está actualizado. "
+                        "Ingresos Brutos está temporalmente no disponible y se "
+                        "reintentará automáticamente."
+                    )
+                elif santa_fe_status == "INTEGRATION_CHANGED":
+                    message = (
+                        "Tu cuenta está lista y Monotributo ya está actualizado. "
+                        "La integración con Ingresos Brutos necesita revisión."
+                    )
+                else:
+                    message = (
+                        "Tu cuenta está lista y Monotributo ya está actualizado. "
+                        "Ingresos Brutos quedó pendiente y se reintentará "
+                        "automáticamente."
+                    )
                 self.send_message(
                     chat_id,
-                    "Tu cuenta está lista. Ya actualicé Monotributo e Ingresos "
-                    "Brutos.",
+                    message,
                     ((("Ver resumen", "tax:summary"),),),
                 )
                 self.db.mark_portal_access_notified(

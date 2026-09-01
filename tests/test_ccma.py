@@ -193,18 +193,6 @@ class CcmaParserTest(TestCase):
                 {"cuit": "20383717419", "password": "clave-fiscal-secreta"},
             )
 
-    def test_detects_only_explicitly_rejected_credentials(self):
-        self.assertTrue(
-            CcmaBrowserConnector._credentials_were_rejected(
-                "La clave ingresada es incorrecta"
-            )
-        )
-        self.assertFalse(
-            CcmaBrowserConnector._credentials_were_rejected(
-                "Complete la validación de seguridad"
-            )
-        )
-
     def test_initial_sync_marks_the_portal_access_ready(self):
         class Worker:
             def __init__(self):
@@ -247,7 +235,7 @@ class CcmaParserTest(TestCase):
         class SantaFeWorker:
             def sync_chat(self, _chat_id):
                 raise CcmaSessionRequired(
-                    "ARCA no respondió correctamente durante el ingreso"
+                    "ARCA no completó el ingreso con las credenciales proporcionadas"
                 )
 
         with TemporaryDirectory() as directory:

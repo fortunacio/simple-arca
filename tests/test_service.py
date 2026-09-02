@@ -7,6 +7,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from contador_ai.db import Database
+from contador_ai.commands import CommandCatalog
 from contador_ai.arca.errors import WsfePointOfSaleUnavailable
 from contador_ai.monotributo import CategoryLimits
 from contador_ai.service import PROVIDERS, TaxMonitorService
@@ -1229,7 +1230,21 @@ class ServiceTest(TestCase):
 
     def test_navigation_contains_only_clear_user_actions(self):
         self._verified_user()
-        reply = TaxMonitorService(self.db).navigation("summary", 1001)
+        catalog = CommandCatalog(
+            self.db,
+            enabled_sources={
+                "ARCA_PROFILE",
+                "ARCA_DFE",
+                "ARCA_CCMA",
+                "ARCA_INVOICES",
+                "SANTA_FE_IIBB",
+            },
+            invoice_module_enabled=True,
+        )
+        reply = TaxMonitorService(
+            self.db,
+            command_catalog=catalog,
+        ).navigation("summary", 1001)
 
         labels = [button[0] for row in reply.keyboard for button in row]
         self.assertEqual(
@@ -1239,6 +1254,7 @@ class ServiceTest(TestCase):
                 "Categoría y facturación",
                 "Mensajes de ARCA",
                 "Facturas",
+                "Estado de fuentes",
             ],
         )
 
@@ -1252,6 +1268,7 @@ class ServiceTest(TestCase):
                 "ARCA_CCMA": lambda _chat_id: None,
                 "SANTA_FE_IIBB": lambda _chat_id: None,
             },
+            arca_enrollment_base_url="http://localhost:8090",
         )
 
         reply = service.navigation("summary", 1001)
@@ -1280,6 +1297,26 @@ class ServiceTest(TestCase):
 
         self.assertIn("conectá y verificá", reply.text)
         self.assertEqual(reply.keyboard, ())
+
+    def test_connected_summary_does_not_offer_unconfigured_callbacks(self):
+        self._verified_user()
+
+        reply = TaxMonitorService(self.db).navigation("summary", 1001)
+
+        self.assertEqual(
+            [button[0] for row in reply.keyboard for button in row],
+            ["Estado de fuentes"],
+        )
+
+    def test_help_keyboard_uses_the_same_runtime_capabilities(self):
+        self._verified_user()
+
+        reply = TaxMonitorService(self.db).navigation("help", 1001)
+
+        self.assertEqual(
+            [button[0] for row in reply.keyboard for button in row],
+            ["Ver resumen", "Estado de fuentes"],
+        )
 
     def test_summary_names_failed_sources_in_plain_language(self):
         self._verified_user()

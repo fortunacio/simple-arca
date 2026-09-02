@@ -3,14 +3,13 @@
 Bot personal de Telegram para consultar obligaciones tributarias de ARCA y Santa Fe,
 recibir avisos útiles y emitir Facturas C mediante la API oficial WSFEv1.
 
-La interfaz visible tiene tres comandos:
+El menú de Telegram se adapta a cada chat. Antes de conectar una cuenta muestra
+`/resumen`, `/estado`, `/conectar` y `/ayuda`; después agrega únicamente las consultas,
+comprobantes y acciones que están configuradas y autorizadas para ese chat.
 
-- `/resumen`: pagos, deuda que requiere atención, mensajes y riesgo de recategorización.
-- `/facturas`: historial, PDF, repetición como borrador y nueva Factura C.
-- `/ayuda`: explicación breve y acceso a la configuración privada.
-
-Los comandos técnicos anteriores siguen disponibles como alias ocultos para auditoría,
-pero no aparecen en el menú de Telegram.
+`/ayuda` documenta todos los comandos aceptados, agrupados por tarea, e indica por qué
+una función todavía no está disponible. Los alias compatibles y los comandos
+contextuales siguen funcionando, pero no ocupan espacio en el menú rápido.
 
 ## Qué consulta
 
@@ -30,8 +29,9 @@ oficiales con un worker aislado para los portales que requieren CUIT y clave fis
 
 - Actualización de APIs oficiales cada seis horas.
 - Actualización de Monotributo, pagos e Ingresos Brutos cada seis horas.
-- Evaluación de alertas cada cinco minutos. Los servicios rotos se recuerdan cada
-  hora hasta recuperarse; el resto de los eventos conserva deduplicación persistente.
+- Evaluación de alertas cada cinco minutos. Los problemas externos o técnicos no se
+  repiten mientras no cambie su causa; sólo el acceso que requiere una acción del
+  usuario se recuerda una vez por día.
 - Verificación diaria de la tabla oficial de topes de Monotributo.
 - Recordatorios de vencimiento a 14, 7, 3, 1 y 0 días.
 - Avisos si una fuente deja de actualizarse.
@@ -110,8 +110,8 @@ La conexión tiene dos mecanismos internos, pero el usuario completa un solo flu
 El enlace es de un solo uso y dura diez minutos. El
 formulario manda el CUIT y la clave directamente a `portal-worker`; esos datos no
 pasan por Telegram. La clave se valida contra ARCA y sólo se conserva cifrada.
-`/configurar_arca` queda disponible como comando oculto para reemplazar una clave que
-haya cambiado o haya sido rechazada.
+`/configurar_arca` queda disponible para reemplazar una clave que haya cambiado o haya
+sido rechazada cuando el alta web está configurada.
 
 `/desconectar` deja de consultar y mostrar la cuenta inmediatamente. Las facturas
 emitidas y la clave cifrada se conservan para permitir una reconexión sin repetir toda

@@ -22,6 +22,7 @@ from .arca.wsaa import (
     WsaaClient,
 )
 from .db import Database
+from .commands import CommandCatalog
 from .invoice_bot import InvoiceBotService
 from .invoice_gateway import InvoiceGateway
 from .invoice_store import InvoiceStore
@@ -334,12 +335,14 @@ def main() -> None:
         return
 
     arca_environment = build_arca_environment()
+    live_synchronizers = build_live_synchronizers(db)
+    enrollment_base_url = arca_enrollment_base_url()
     service = TaxMonitorService(
         db,
         operator_cuit=os.environ.get("ARCA_OPERATOR_CUIT", ""),
         certificate_alias=os.environ.get("ARCA_CERTIFICATE_ALIAS", ""),
         arca_environment=arca_environment.value,
-        live_synchronizers=build_live_synchronizers(db),
+        live_synchronizers=live_synchronizers,
         category_limits_provider=ArcaCategoryLimitsProvider(
             db,
             refresh_after=timedelta(
@@ -349,7 +352,7 @@ def main() -> None:
             ),
         ).current,
         ccma_login_url=os.environ.get("CCMA_LOGIN_URL", ""),
-        arca_enrollment_base_url=arca_enrollment_base_url(),
+        arca_enrollment_base_url=enrollment_base_url,
     )
     if args.print_status:
         print(service.status(args.chat_id))
@@ -384,13 +387,28 @@ def main() -> None:
     )
     if not allowed_chat_ids:
         raise SystemExit("BOT_ALLOWED_CHAT_IDS es obligatorio; vacío bloquea el inicio del bot.")
+    invoice_bot = build_invoice_bot(db)
+    iibb_payment_bot = build_iibb_payment_bot(db)
+    command_catalog = CommandCatalog(
+        db,
+        enabled_sources=live_synchronizers,
+        invoice_module_enabled=invoice_bot is not None,
+        invoice_emission_chat_ids=(
+            invoice_bot.emission_chat_ids if invoice_bot is not None else ()
+        ),
+        arca_enrollment_enabled=bool(enrollment_base_url),
+        invoice_flow_active=(
+            invoice_bot.has_active_flow if invoice_bot is not None else None
+        ),
+    )
+    service.command_catalog = command_catalog
     client = TelegramClient(
         token,
         db,
         service,
         allowed_chat_ids=allowed_chat_ids,
-        invoice_bot=build_invoice_bot(db),
-        iibb_payment_bot=build_iibb_payment_bot(db),
+        invoice_bot=invoice_bot,
+        iibb_payment_bot=iibb_payment_bot,
         notification_monitor=(
             TaxNotificationMonitor(
                 db,
@@ -411,6 +429,7 @@ def main() -> None:
         monitor_interval_seconds=int(
             os.environ.get("AUTOMATIC_MONITOR_CHECK_SECONDS", "300")
         ),
+        command_catalog=command_catalog,
     )
     if args.poll_once:
         handled = client.poll_once(timeout=1)

@@ -8,6 +8,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .bot_reply import BotReply
+from .commands import INVOICE_COMMAND_NAMES
 from .identity import is_valid_cuit, normalize_cuit
 from .invoice_gateway import InvoiceGateway
 from .invoice_pdf import build_invoice_pdf, invoice_filename
@@ -56,7 +57,7 @@ def _parse_amount(value: str) -> str:
 
 
 class InvoiceBotService:
-    COMMANDS = {"/facturas", "/nueva_factura", "/nuevo_cliente", "/cancelar"}
+    COMMANDS = frozenset(f"/{name}" for name in INVOICE_COMMAND_NAMES)
 
     def __init__(
         self,
@@ -67,6 +68,13 @@ class InvoiceBotService:
         self.store = store
         self.gateway = gateway
         self.today_provider = today_provider
+
+    @property
+    def emission_chat_ids(self) -> frozenset[int]:
+        return self.gateway.allowed_chat_ids
+
+    def has_active_flow(self, chat_id: int) -> bool:
+        return self.store.get_state(chat_id) is not None
 
     def handles(self, text: str, chat_id: int) -> bool:
         command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower() if text.strip() else ""

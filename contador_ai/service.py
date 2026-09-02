@@ -10,6 +10,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .bot_reply import BotReply
+from .commands import INVOICE_COMMAND_NAMES, CommandCatalog
 from .db import Database
 from .health import (
     SOURCE_POLICIES,
@@ -158,6 +159,7 @@ class TaxMonitorService:
         ccma_login_url: str = "",
         arca_enrollment_base_url: str = "",
         arca_enrollment_ttl: timedelta = timedelta(minutes=10),
+        command_catalog: CommandCatalog | None = None,
     ):
         self.db = db
         # Keep an explicit date only for deterministic tests. In the running bot
@@ -172,6 +174,11 @@ class TaxMonitorService:
         self.ccma_login_url = ccma_login_url.strip()
         self.arca_enrollment_base_url = arca_enrollment_base_url.rstrip("/")
         self.arca_enrollment_ttl = arca_enrollment_ttl
+        self.command_catalog = command_catalog or CommandCatalog(
+            db,
+            enabled_sources=self.live_synchronizers,
+            arca_enrollment_enabled=bool(self.arca_enrollment_base_url),
+        )
 
     @property
     def today(self) -> date:
@@ -190,33 +197,7 @@ class TaxMonitorService:
         return datetime.now(timezone.utc)
 
     def help(self, chat_id: int) -> str:
-        lines = ["¿Qué querés hacer?", ""]
-        identity = self.db.get_tax_identity(chat_id)
-        if identity is None:
-            lines.extend(["/conectar — vincular tu cuenta de ARCA", ""])
-        lines.extend(
-            [
-                "/resumen — qué requiere atención y qué tenés que pagar",
-                "/facturas — ver, descargar o preparar una factura",
-                "/ayuda — volver a ver esta explicación",
-                "",
-                "El bot también te avisa automáticamente cuando aparece algo importante.",
-                "",
-                "Actualmente reviso Monotributo, facturación, mensajes de ARCA e "
-                "Ingresos Brutos de Santa Fe. Otros impuestos nacionales todavía "
-                "no están incorporados.",
-            ]
-        )
-        if identity is not None:
-            lines.extend(
-                [
-                    "",
-                    "Configuración",
-                    "/configurar_arca — guardar o actualizar la clave fiscal",
-                    "/desconectar — dejar de consultar y mostrar la cuenta",
-                ]
-            )
-        return "\n".join(lines)
+        return self.command_catalog.render_help(chat_id)
 
     def configure_arca(self, chat_id: int) -> str:
         identity = self.db.get_tax_identity(chat_id)
@@ -1297,6 +1278,7 @@ class TaxMonitorService:
         identity = self.db.get_tax_identity(chat_id)
         if (
             self._portal_access_enabled()
+            and self.command_catalog.is_available("configurar_arca", chat_id)
             and identity is not None
             and not self.db.portal_access_matches(
                 chat_id,
@@ -1304,12 +1286,18 @@ class TaxMonitorService:
             )
         ):
             rows.append((("Completar acceso", "tax:setup"),))
-        rows.extend((
-            (("Pagos y vencimientos", "tax:payments"),),
-            (("Categoría y facturación", "tax:category"),),
-            (("Mensajes de ARCA", "tax:inbox"),),
-            (("Facturas", "inv:list:0"),),
-        ))
+        if self.command_catalog.is_available("vencimientos", chat_id):
+            rows.append((("Pagos y vencimientos", "tax:payments"),))
+        if any(
+            self.command_catalog.is_available(command, chat_id)
+            for command in ("categoria", "facturacion")
+        ):
+            rows.append((("Categoría y facturación", "tax:category"),))
+        if self.command_catalog.is_available("bandeja", chat_id):
+            rows.append((("Mensajes de ARCA", "tax:inbox"),))
+        if self.command_catalog.is_available("facturas", chat_id):
+            rows.append((("Facturas", "inv:list:0"),))
+        rows.append((("Estado de fuentes", "tax:status"),))
         return tuple(rows)
 
     @staticmethod
@@ -1776,10 +1764,15 @@ class TaxMonitorService:
                 return BotReply(self.summary(chat_id), self._summary_keyboard(chat_id), replace)
             return BotReply(self.help(chat_id), replace_message=replace)
         if action == "help":
-            keyboard = (
+            rows: list[tuple[tuple[str, str], ...]] = [
                 (("Ver resumen", "tax:summary"),),
-                (("Facturas", "inv:list:0"),),
-            )
+                (("Estado de fuentes", "tax:status"),),
+            ]
+            if self.command_catalog.is_available("facturas", chat_id):
+                rows.append((("Facturas", "inv:list:0"),))
+            if self.command_catalog.is_available("configurar_arca", chat_id):
+                rows.append((("Configurar acceso a ARCA", "tax:setup"),))
+            keyboard = tuple(rows)
             return BotReply(self.help(chat_id), keyboard, replace)
         if action == "summary":
             return BotReply(
@@ -2020,7 +2013,10 @@ class TaxMonitorService:
         self.db.ensure_user(chat_id)
         parts = text.strip().split(maxsplit=1)
         command = parts[0].split("@", 1)[0].lower()
+        command_name = command.removeprefix("/")
         argument = parts[1].strip() if len(parts) > 1 else ""
+        if command_name not in self.command_catalog.command_names:
+            return "Comando no reconocido. Usá /ayuda."
         if command == "/start":
             identity = self.db.get_tax_identity(chat_id)
             if identity is not None and identity["status"] == "VERIFIED":
@@ -2063,4 +2059,9 @@ class TaxMonitorService:
             return self.due_dates(chat_id)
         if command == "/desconectar":
             return self.disconnect(chat_id)
+        if command_name in INVOICE_COMMAND_NAMES:
+            reason = self.command_catalog.reason_for(command_name, chat_id)
+            if reason:
+                return f"/{command_name} {reason}."
+            return f"/{command_name} está disponible únicamente desde Telegram."
         return "Comando no reconocido. Usá /ayuda."

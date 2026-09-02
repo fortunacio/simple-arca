@@ -2,16 +2,30 @@
 
 ## Interfaz vigente
 
-El menú de Telegram muestra exactamente tres comandos:
+El menú rápido se configura por chat y muestra únicamente funciones utilizables. Un
+chat desconectado ve `/resumen`, `/estado`, `/conectar` y `/ayuda`. Una cuenta conectada
+con todas las funciones habilitadas ve, en este orden:
 
-| Comando | Función |
+| Grupo | Comandos del menú rápido |
 |---|---|
-| `/resumen` | Explica qué requiere atención y qué hay que pagar |
-| `/facturas` | Lista facturas, permite descargar, repetir y emitir |
-| `/ayuda` | Explica el alcance y ofrece la configuración privada |
+| Vista general | `/resumen`, `/estado` |
+| Pagos e impuestos | `/vencimientos`, `/monotributo`, `/iibb`, `/pagos_arca` |
+| Categoría y facturación | `/categoria`, `/facturacion` |
+| Comunicaciones | `/bandeja` |
+| Comprobantes | `/facturas`, `/nueva_factura`, `/nuevo_cliente` |
+| Cuenta y acceso | `/configurar_arca`, `/desconectar` |
+| Ayuda | `/ayuda` |
 
-`/start` abre el resumen cuando la cuenta ya está vinculada. Los comandos técnicos
-anteriores se mantienen ocultos para diagnóstico y compatibilidad.
+Las descripciones llevan el nombre del grupo porque el menú nativo de Telegram es
+plano. Si falta una fuente, el módulo de comprobantes o el permiso de emisión, sus
+comandos no aparecen. El menú se recalcula al iniciar el bot, conectar o desconectar
+una cuenta y al terminar el primer intento del alta web.
+
+`/ayuda` conserva el catálogo completo agrupado e indica la causa concreta de cada
+función no habilitada. `/start` es la entrada inicial, `/help` es alias de `/ayuda`,
+`/deuda_arca` es alias compatible de `/monotributo` y `/cancelar` sólo es válido durante
+una carga de factura. Estos cuatro comandos funcionan y se explican, pero no ocupan
+espacio en el menú rápido.
 
 ## Resumen
 
@@ -34,6 +48,10 @@ Botones del resumen:
 - `Categoría y facturación`
 - `Mensajes de ARCA`
 - `Facturas`
+- `Estado de fuentes`
+
+Cada botón se muestra sólo cuando la función correspondiente está configurada; el
+estado de fuentes queda siempre disponible.
 
 La navegación edita el mismo mensaje para no llenar el chat y valida que cada callback
 pertenezca a un chat autorizado.

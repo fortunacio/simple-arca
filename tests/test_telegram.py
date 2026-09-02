@@ -3,7 +3,7 @@ from unittest import TestCase
 
 from contador_ai.bot_reply import BotReply
 from contador_ai.notifications import NotificationBatch, NotificationDelivery
-from contador_ai.telegram import BOT_COMMANDS, TelegramClient
+from contador_ai.telegram import TelegramClient
 
 
 class FakeDatabase:
@@ -12,6 +12,7 @@ class FakeDatabase:
         self.portal_notifications = []
         self.portal_notified = []
         self.connections = []
+        self.identities = {}
 
     def get_bot_state(self, key, default=None):
         return self.state.get(key, default)
@@ -52,6 +53,9 @@ class FakeDatabase:
                 "expires_at": now,
             }
         return None
+
+    def get_tax_identity(self, chat_id):
+        return self.identities.get(chat_id)
 
 
 class FakeService:
@@ -103,6 +107,13 @@ class FakeTelegramClient(TelegramClient):
         return {}
 
 
+class FailingMenuTelegramClient(FakeTelegramClient):
+    def request(self, method, payload):
+        if method == "setMyCommands":
+            raise RuntimeError("Telegram no respondió")
+        return super().request(method, payload)
+
+
 class FakeMonitor:
     def __init__(self):
         self.marked = []
@@ -139,21 +150,27 @@ class FakePaymentBot:
 
 
 class TelegramAccessTest(TestCase):
-    def test_registers_a_short_command_menu_for_private_chats(self):
+    def test_replaces_the_old_private_menu_with_a_chat_scoped_menu(self):
         client = FakeTelegramClient([], {123})
 
         client.set_commands()
 
         method, payload = client.sent[0]
+        self.assertEqual(method, "deleteMyCommands")
+        self.assertEqual(
+            __import__("json").loads(payload["scope"]),
+            {"type": "all_private_chats"},
+        )
+        method, payload = client.sent[1]
         self.assertEqual(method, "setMyCommands")
         commands = __import__("json").loads(payload["commands"])
         self.assertEqual(
             [item["command"] for item in commands],
-            ["resumen", "facturas", "ayuda"],
+            ["resumen", "estado", "conectar", "ayuda"],
         )
         self.assertEqual(
             __import__("json").loads(payload["scope"]),
-            {"type": "all_private_chats"},
+            {"type": "chat", "chat_id": 123},
         )
 
     def test_sends_and_marks_an_automatic_summary(self):
@@ -292,6 +309,47 @@ class TelegramAccessTest(TestCase):
             button["url"],
             "http://localhost:8090/arca/setup/token-conexion",
         )
+        self.assertEqual([method for method, _payload in client.sent], [
+            "sendMessage",
+            "setMyCommands",
+        ])
+
+    def test_disconnect_refreshes_the_chat_menu_after_replying(self):
+        client = FakeTelegramClient(
+            [
+                {
+                    "update_id": 33,
+                    "message": {"chat": {"id": 123}, "text": "/desconectar"},
+                }
+            ],
+            {123},
+        )
+
+        self.assertEqual(client.poll_once(timeout=0), 1)
+
+        self.assertEqual([method for method, _payload in client.sent], [
+            "sendMessage",
+            "setMyCommands",
+        ])
+
+    def test_menu_refresh_failure_never_blocks_the_user_reply(self):
+        client = FailingMenuTelegramClient(
+            [
+                {
+                    "update_id": 34,
+                    "message": {
+                        "chat": {"id": 123},
+                        "text": "/conectar 20383717419",
+                    },
+                }
+            ],
+            {123},
+        )
+
+        with self.assertLogs("contador_ai.telegram", level="ERROR"):
+            self.assertEqual(client.poll_once(timeout=0), 1)
+
+        self.assertEqual(client.sent[0][0], "sendMessage")
 
     def test_notifies_when_the_initial_account_sync_is_ready(self):
         client = FakeTelegramClient([], {123})
@@ -304,6 +362,7 @@ class TelegramAccessTest(TestCase):
 
         self.assertIn("Tu acceso quedó guardado", client.sent[0][1]["text"])
         self.assertEqual(client.fake_db.portal_notified[0][0], 123)
+        self.assertEqual(client.sent[1][0], "setMyCommands")
 
     def test_reports_external_iibb_outage_without_blaming_the_login(self):
         client = FakeTelegramClient([], {123})

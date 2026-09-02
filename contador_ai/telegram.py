@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 
 from .db import Database
+from .commands import CommandCatalog
 from .health import SourceCondition, render_health_brief, source_health
 from .bot_reply import BotReply
 from .invoice_bot import InvoiceBotService
@@ -19,12 +20,6 @@ from .service import TaxMonitorService
 
 
 LOGGER = logging.getLogger(__name__)
-
-BOT_COMMANDS = (
-    ("resumen", "Qué requiere atención y qué tenés que pagar"),
-    ("facturas", "Ver, descargar o preparar una factura"),
-    ("ayuda", "Cómo usar el bot"),
-)
 
 
 class TelegramClient:
@@ -38,6 +33,7 @@ class TelegramClient:
         iibb_payment_bot: IibbPaymentBotService | None = None,
         notification_monitor: TaxNotificationMonitor | None = None,
         monitor_interval_seconds: int = 300,
+        command_catalog: CommandCatalog | None = None,
     ):
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.db = db
@@ -47,6 +43,14 @@ class TelegramClient:
         self.iibb_payment_bot = iibb_payment_bot
         self.notification_monitor = notification_monitor
         self.monitor_interval_seconds = max(60, monitor_interval_seconds)
+        if command_catalog is not None:
+            self.command_catalog = command_catalog
+        elif hasattr(service, "command_catalog"):
+            self.command_catalog = service.command_catalog
+        else:
+            self.command_catalog = CommandCatalog(
+                db, enabled_sources=service.live_synchronizers
+            )
 
     def request(self, method: str, payload: dict) -> dict:
         data = urllib.parse.urlencode(payload).encode()
@@ -92,24 +96,49 @@ class TelegramClient:
             payload["reply_markup"] = self._reply_markup(keyboard)
         self.request("sendMessage", payload)
 
-    def set_commands(self) -> None:
+    def _set_chat_commands(self, chat_id: int) -> None:
         self.request(
             "setMyCommands",
             {
                 "commands": json.dumps(
                     [
                         {"command": command, "description": description}
-                        for command, description in BOT_COMMANDS
+                        for command, description in self.command_catalog.menu_commands(
+                            chat_id
+                        )
                     ],
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
                 "scope": json.dumps(
-                    {"type": "all_private_chats"},
+                    {"type": "chat", "chat_id": chat_id},
                     separators=(",", ":"),
                 ),
             },
         )
+
+    def _refresh_commands_safely(self, chat_id: int) -> None:
+        try:
+            self._set_chat_commands(chat_id)
+        except Exception:
+            LOGGER.exception(
+                "No pude actualizar el menú de comandos para el chat %s", chat_id
+            )
+
+    def set_commands(self) -> None:
+        try:
+            self.request(
+                "deleteMyCommands",
+                {
+                    "scope": json.dumps(
+                        {"type": "all_private_chats"}, separators=(",", ":")
+                    )
+                },
+            )
+        except Exception:
+            LOGGER.exception("No pude eliminar el menú privado global anterior")
+        for chat_id in self.allowed_chat_ids:
+            self._refresh_commands_safely(chat_id)
 
     def edit_message(self, chat_id: int, message_id: int, text: str, keyboard=()) -> None:
         payload = {
@@ -277,6 +306,8 @@ class TelegramClient:
                     )
                     keyboard = (((label, setup_url),),)
             self.send_message(chat_id, response, keyboard)
+            if command in {"/conectar", "/desconectar"}:
+                self._refresh_commands_safely(chat_id)
             handled += 1
         return handled
 
@@ -346,6 +377,7 @@ class TelegramClient:
                 self.db.mark_portal_access_notified(
                     chat_id, datetime.now(timezone.utc).isoformat()
                 )
+                self._refresh_commands_safely(chat_id)
                 sent += 1
             except Exception:
                 LOGGER.exception("No pude confirmar que la cuenta quedó lista")

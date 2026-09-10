@@ -497,46 +497,50 @@ class TaxNotificationMonitor:
                     )
 
         iibb = self._snapshot(chat_id, "SANTA_FE_IIBB")
+        payload = iibb[0] if iibb is not None else {}
+        paid_periods = {
+            str(item.get("period", ""))
+            for item in payload.get("vepai", {}).get("payments", [])
+        }
+        for vep, period in paid_iibb_veps:
+            number = str(vep.get("number", ""))
+            if period and period in paid_periods:
+                if number and self.db.has_notification_event(
+                    chat_id, f"seti:iibb:{number}"
+                ):
+                    add(
+                        "Pagos",
+                        f"confirmed:iibb:{number}",
+                        f"POSTED:{period}",
+                        (
+                            "• Tu pago de Ingresos Brutos ya quedó reflejado "
+                            "en la cuenta provincial."
+                        ),
+                    )
+                continue
+            if not number:
+                continue
+            period_label = ""
+            try:
+                year, month = (int(part) for part in period.split("-"))
+                period_label = f" de {format_month_year(date(year, month, 1))}"
+            except (TypeError, ValueError):
+                pass
+            add(
+                "Pagos",
+                f"seti:iibb:{number}",
+                f"PAID:{period}:{vep.get('amount')}:{vep.get('paid_on')}",
+                (
+                    f"• Tu pago de Ingresos Brutos{period_label} está confirmado"
+                    + (
+                        ", pero la cuenta provincial todavía no terminó de actualizarse. "
+                        if iibb is not None
+                        else ". No pude verificar todavía su registro en la cuenta provincial. "
+                    )
+                    + "No vuelvas a pagarlo."
+                ),
+            )
         if iibb is not None:
-            payload, _fetched_at = iibb
-            paid_periods = {
-                str(item.get("period", ""))
-                for item in payload.get("vepai", {}).get("payments", [])
-            }
-            for vep, period in paid_iibb_veps:
-                number = str(vep.get("number", ""))
-                if period and period in paid_periods:
-                    if number and self.db.has_notification_event(
-                        chat_id, f"seti:iibb:{number}"
-                    ):
-                        add(
-                            "Pagos",
-                            f"confirmed:iibb:{number}",
-                            f"POSTED:{period}",
-                            (
-                                "• Tu pago de Ingresos Brutos ya quedó reflejado "
-                                "en la cuenta provincial."
-                            ),
-                        )
-                    continue
-                if not number:
-                    continue
-                period_label = ""
-                try:
-                    year, month = (int(part) for part in period.split("-"))
-                    period_label = f" de {format_month_year(date(year, month, 1))}"
-                except (TypeError, ValueError):
-                    pass
-                add(
-                    "Pagos",
-                    f"seti:iibb:{number}",
-                    f"PAID:{period}:{vep.get('amount')}:{vep.get('paid_on')}",
-                    (
-                        f"• Tu pago de Ingresos Brutos{period_label} está confirmado, "
-                        "pero la cuenta provincial todavía no terminó de actualizarse. "
-                        "No vuelvas a pagarlo."
-                    ),
-                )
             reconciliation = payload.get("vepai", {}).get("reconciliation", {})
             missing = tuple(
                 str(item)

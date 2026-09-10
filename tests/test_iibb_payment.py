@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 import httpx
 
@@ -226,10 +227,47 @@ class IibbPaymentTest(TestCase):
         self.assertEqual(result["status"], "QUOTED")
         self.assertEqual(result["total"], "42982.00")
 
+    def test_unknown_preserves_pdf_without_enabling_a_second_emission(self):
+        row = self.request()
+        self.processor.process_one()
+        self.connector.generation_error = IibbGenerationUnknown('PDF no validado', pdf=b'%PDF-original')
+        self.store.request_generation(row['id'], 1001)
+        self.processor.process_one()
+        result = self.store.get(row['id'])
+        self.assertEqual(result['status'], 'UNKNOWN')
+        self.assertEqual(result['official_pdf'], b'%PDF-original')
+        self.store.request_generation(row['id'], 1001)
+        self.assertFalse(self.processor.process_one())
+        self.assertEqual(self.connector.generation_calls, 1)
+
+    def test_storage_failure_after_emission_never_returns_to_quoted(self):
+        row = self.request()
+        self.processor.process_one()
+        self.store.request_generation(row['id'], 1001)
+        with patch.object(self.store, 'generation_succeeded', side_effect=RuntimeError('storage')):
+            self.processor.process_one()
+        result = self.store.get(row['id'])
+        self.assertEqual(result['status'], 'UNKNOWN')
+        self.assertEqual(result['official_pdf'], b'%PDF-test')
+        self.assertEqual(result['vep_number'], '1234567890')
+        self.assertFalse(self.processor.process_one())
+
     def test_same_period_is_idempotent(self):
         first = self.request()
         second = self.request()
         self.assertEqual(first["id"], second["id"])
+
+    def test_preserves_siat_expiration_instead_of_payment_preparation_date(self):
+        self.connector.quote_result['vep_expires_on'] = '2026-08-20'
+        row = self.request()
+        self.processor.process_one()
+        self.assertEqual(self.store.get(row['id'])['vep_expires_on'], '2026-08-20')
+        reply = self.bot.render(self.store.get(row['id']))
+        self.assertIn('Vencimiento del VEP informado por Santa Fe: 20/08/2026', reply.text)
+        self.store.request_generation(row['id'], 1001)
+        self.processor.process_one()
+        self.assertEqual(self.store.get(row['id'])['vep_expires_on'], '2026-08-20')
+        self.assertEqual(self.store.expire_generated(date(2026, 8, 7)), 0)
 
     def test_only_vepai_marks_a_generated_vep_paid(self):
         row = self.request()

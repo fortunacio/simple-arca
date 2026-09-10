@@ -1056,7 +1056,14 @@ class TaxMonitorService:
         if payments_as_of and not vepai_payments:
             lines.append(f"Registro de pagos actualizado al {format_date(str(payments_as_of))}.")
 
-        if isinstance(vepai, dict) and vepai.get("status") == "MAINTENANCE":
+        if isinstance(vepai, dict) and vepai.get("status") == "UNAVAILABLE":
+            lines.extend(
+                [
+                    "",
+                    "No pude consultar VEPAI. Los importes y pagos mostrados corresponden a SIAT; falta el cruce con el registro de pagos.",
+                ]
+            )
+        elif isinstance(vepai, dict) and vepai.get("status") == "MAINTENANCE":
             lines.extend(
                 [
                     "",

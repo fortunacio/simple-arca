@@ -29,7 +29,8 @@ from .external import (
 )
 from .health import FailureDetail
 from .iibb_payment import IibbPaymentProcessor, IibbPaymentStore
-from .santa_fe import ARGENTINA_TIMEZONE, SantaFeIibbConnector, SantaFeIibbWorker
+from .santa_fe import ARGENTINA_TIMEZONE, SantaFeIibbWorker
+from .siat import SiatIibbConnector
 from .seti import BrowserSetiConnector, SetiPaymentsWorker
 
 
@@ -644,7 +645,7 @@ def main() -> None:
     }:
         santa_fe_worker = SantaFeIibbWorker(
             database,
-            SantaFeIibbConnector(credentials),
+            SiatIibbConnector(credentials),
             snapshot_ttl=timedelta(
                 seconds=int(os.environ.get("SANTA_FE_IIBB_SNAPSHOT_TTL_SECONDS", "86400"))
             ),
@@ -663,7 +664,7 @@ def main() -> None:
             if payment_chat_ids:
                 iibb_payment_processor = IibbPaymentProcessor(
                     iibb_payment_store,
-                    SantaFeIibbConnector(credentials),
+                    SiatIibbConnector(credentials),
                     payment_chat_ids,
                 )
             else:

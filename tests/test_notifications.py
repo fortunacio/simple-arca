@@ -537,6 +537,22 @@ class NotificationMonitorTest(TestCase):
         monitor.mark_sent(1001, batch)
         self.assertIsNone(monitor.check_chat(1001))
 
+    def test_seti_payment_is_notified_even_when_siat_has_no_fresh_snapshot(self):
+        self.db.upsert_live_snapshot(
+            1001, 'ARCA_SETI', 'payment_status', self.now.isoformat(),
+            (self.now + timedelta(hours=1)).isoformat(),
+            json.dumps({'veps': [{'number': '1234565295', 'status': 'PAID',
+                                 'description': 'SF-RGS07/26', 'amount': '42882.00',
+                                 'paid_on': '2026-08-06'}]}),
+        )
+        monitor = TaxNotificationMonitor(self.db, self.service, now=lambda: self.now)
+        batch = monitor.check_chat(1001)
+        self.assertIn('pago de Ingresos Brutos de julio de 2026 está confirmado', batch.text)
+        self.assertIn('No pude verificar todavía su registro', batch.text)
+        self.assertIn('No vuelvas a pagarlo', batch.text)
+        monitor.mark_sent(1001, batch)
+        self.assertIsNone(monitor.check_chat(1001))
+
     def test_iibb_warning_is_not_sent_after_vepai_reflects_the_period(self):
         self.snapshot(
             "SANTA_FE_IIBB",

@@ -526,6 +526,24 @@ class ServiceTest(TestCase):
         self.assertNotIn("No registra deuda", output)
         self.assertIn("la consulta quedó incompleta", service.status(1001))
 
+    def test_iibb_discloses_vepai_outage_while_showing_siat_account(self):
+        self.db.ensure_user(1001)
+        fetched_at = datetime.now(timezone.utc)
+        self.db.upsert_live_snapshot(
+            1001, "SANTA_FE_IIBB", "account_status", fetched_at.isoformat(),
+            (fetched_at + timedelta(hours=1)).isoformat(),
+            json.dumps({"source": "SIAT", "category": "3", "monthly_amount": "42882.00",
+                        "vepai": {"status": "UNAVAILABLE"}}),
+        )
+        service = TaxMonitorService(
+            self.db, live_synchronizers={"SANTA_FE_IIBB": lambda _chat_id: None},
+        )
+        output = service.dispatch("/iibb", 1001)
+        self.assertIn("Categoría 3 — $42.882,00 por mes", output)
+        self.assertIn("No pude consultar VEPAI", output)
+        self.assertIn("corresponden a SIAT", output)
+        self.assertNotIn("Deuda vencida en Régimen Simplificado: no", output)
+
     def test_iibb_keeps_stale_data_visible_with_a_safety_warning(self):
         self.db.ensure_user(1001)
         stale_at = datetime(2026, 8, 5, 1, tzinfo=timezone.utc)

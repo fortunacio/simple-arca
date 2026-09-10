@@ -20,7 +20,7 @@ from .service import format_date, format_money, format_month_year
 
 
 LOGGER = logging.getLogger(__name__)
-PAYMENT_URL = "https://seti.afip.gob.ar/setiweb/#/pago/veps-a-enviar"
+PAYMENT_URL = "https://seti.afip.gob.ar/setiweb/#/pago/consulta-veps"
 SANTANDER_VEP_HELP_URL = (
     "https://ayuda.santander.com.ar/3WR6AZDV3B-1/article/"
     "KFCQ44ND0R-que-es-vep-como-pagarlo/"
@@ -314,7 +314,7 @@ class IibbPaymentStore:
                 """
                 UPDATE iibb_payment_drafts SET
                     status = 'QUOTED', obligation_due_date = ?, principal = ?,
-                    interest = ?, total = ?, last_error = NULL,
+                    interest = ?, total = ?, vep_expires_on = ?, last_error = NULL,
                     notification_pending = 1, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
@@ -323,6 +323,7 @@ class IibbPaymentStore:
                     quote["principal"],
                     quote["interest"],
                     quote["total"],
+                    quote.get("vep_expires_on"),
                     row_id,
                 ),
             )
@@ -353,15 +354,18 @@ class IibbPaymentStore:
             ).fetchone()
             self._event(connection, row_id, int(row["chat_id"]), "ERROR", {"message": message[:500]})
 
-    def generation_unknown(self, row_id: str, message: str) -> None:
+    def generation_unknown(self, row_id: str, message: str, *, pdf: bytes | None = None,
+                           vep_number: str | None = None) -> None:
         with self.db.connect() as connection:
             connection.execute(
                 """
                 UPDATE iibb_payment_drafts
                 SET status = 'UNKNOWN', last_error = ?, notification_pending = 1,
+                    official_pdf = COALESCE(?, official_pdf),
+                    vep_number = COALESCE(?, vep_number),
                     updated_at = CURRENT_TIMESTAMP WHERE id = ?
                 """,
-                (message[:500], row_id),
+                (message[:500], pdf, vep_number, row_id),
             )
             row = connection.execute(
                 "SELECT chat_id FROM iibb_payment_drafts WHERE id = ?", (row_id,)
@@ -374,11 +378,12 @@ class IibbPaymentStore:
                 """
                 UPDATE iibb_payment_drafts
                 SET status = 'GENERATED', vep_number = ?, official_pdf = ?,
-                    vep_expires_on = payment_date, last_error = NULL,
+                    vep_expires_on = COALESCE(?, payment_date), last_error = NULL,
                     notification_pending = 1, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (str(result["vep_number"]), bytes(result["pdf"]), row_id),
+                (str(result["vep_number"]), bytes(result["pdf"]),
+                 result.get("quote", {}).get("vep_expires_on"), row_id),
             )
             row = connection.execute(
                 "SELECT chat_id FROM iibb_payment_drafts WHERE id = ?", (row_id,)
@@ -495,13 +500,22 @@ class IibbPaymentProcessor:
                         "principal": str(row["principal"]),
                         "interest": str(row["interest"]),
                         "total": str(row["total"]),
+                        "vep_expires_on": str(row["vep_expires_on"] or ""),
                     },
                 )
-                self.store.generation_succeeded(str(row["id"]), result)
+                try:
+                    self.store.generation_succeeded(str(row["id"]), result)
+                except Exception as exc:
+                    raise IibbGenerationUnknown(
+                        "El VEP fue emitido, pero falló su registro; no se reintentará",
+                        pdf=bytes(result["pdf"]), vep_number=str(result["vep_number"]),
+                    ) from exc
         except IibbQuoteChanged as exc:
             self.store.quote_succeeded(str(row["id"]), exc.quote, changed=True)
         except IibbGenerationUnknown as exc:
-            self.store.generation_unknown(str(row["id"]), str(exc))
+            self.store.generation_unknown(
+                str(row["id"]), str(exc), pdf=exc.pdf, vep_number=exc.vep_number,
+            )
         except Exception as exc:
             LOGGER.exception("Falló una operación de pago de Ingresos Brutos")
             self.store.failed(
@@ -667,6 +681,8 @@ class IibbPaymentBotService:
                     f"Intereses: {format_money(row['interest'])}",
                     f"Total: {format_money(row['total'])}",
                     f"Fecha de pago: {format_date(row['payment_date'])}",
+                    *([f"Vencimiento del VEP informado por Santa Fe: {format_date(row['vep_expires_on'])}"]
+                      if row["vep_expires_on"] else []),
                     f"Red: {row['network_name']}",
                     "",
                     NETWORK_GUIDANCE[str(row["network_id"])],

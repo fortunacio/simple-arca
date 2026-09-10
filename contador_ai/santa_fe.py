@@ -41,6 +41,11 @@ class SantaFeIibbError(RuntimeError):
 class IibbGenerationUnknown(SantaFeIibbError):
     """La solicitud pudo haber llegado a Santa Fe y no debe repetirse."""
 
+    def __init__(self, message: str, *, pdf: bytes | None = None, vep_number: str | None = None):
+        super().__init__(message)
+        self.pdf = pdf
+        self.vep_number = vep_number
+
 
 class IibbQuoteChanged(SantaFeIibbError):
     def __init__(self, quote: dict[str, str]):

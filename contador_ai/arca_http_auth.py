@@ -18,6 +18,7 @@ ARCA_SYSTEM_TARGETS = {
     "portal": "portalcf.cloud.afip.gob.ar",
     "santafe_vepai": "www.santafe.gob.ar",
     "santafe_regsim": "www.santafe.gob.ar",
+    "santafe_pwlocal": "www.santafe.gob.ar",
 }
 
 

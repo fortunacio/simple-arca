@@ -112,9 +112,23 @@ clave. Una caída o timeout después de enviar la solicitud deja el resultado co
 incierto y bloquea reintentos automáticos. Si el interés cambia entre la revisión y la
 confirmación, el bot muestra la nueva cotización y exige otra confirmación.
 
+Antes de emitir consulta los VEP existentes en ARCA. Si la respuesta de emisión se
+pierde, verifica el resultado inmediatamente y vuelve a consultarlo con intervalos de 30, 60,
+120, 240 y luego cada 300 segundos, sin repetir la generación. Sólo recupera un VEP
+con coincidencia de CUIT, período, importe y red; ante varios candidatos conserva
+el bloqueo. La consulta recorre todas las páginas, debe estar completa y ser reciente.
+Esta verificación requiere SETI y puede ejecutarse aunque CCMA no esté disponible.
+
+Si ARCA confirma el VEP pero falta el PDF validado, muestra el número y el acceso a
+ARCA para consultar el comprobante y su vigencia. No usa la fecha de la cotización
+como vencimiento confirmado del VEP recuperado. Los errores conservan etapa, código
+HTTP y características de la respuesta, sin guardar HTML, cookies ni credenciales.
+Las notificaciones se confirman por versión para no perder una recuperación que
+ocurra mientras se entrega el aviso anterior.
+
 El bot no considera pagado un VEP por haberlo generado ni por haber abierto ARCA. El
-estado cambia a pagado únicamente cuando la consulta posterior de Santa Fe registra
-el período. No se almacenan datos bancarios.
+estado cambia a pagado cuando Santa Fe registra el período o SETI confirma el pago
+del VEP. No se almacenan datos bancarios.
 
 ## Categoría y facturación
 

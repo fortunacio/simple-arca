@@ -41,10 +41,12 @@ class SantaFeIibbError(RuntimeError):
 class IibbGenerationUnknown(SantaFeIibbError):
     """La solicitud pudo haber llegado a Santa Fe y no debe repetirse."""
 
-    def __init__(self, message: str, *, pdf: bytes | None = None, vep_number: str | None = None):
+    def __init__(self, message: str, *, pdf: bytes | None = None,
+                 vep_number: str | None = None, diagnostic: dict | None = None):
         super().__init__(message)
         self.pdf = pdf
         self.vep_number = vep_number
+        self.diagnostic = diagnostic or {}
 
 
 class IibbQuoteChanged(SantaFeIibbError):
@@ -534,6 +536,7 @@ class SantaFeIibbConnector:
         payment_date: date,
         network_id: str,
         expected_quote: dict[str, str],
+        before_emit: Callable[[], None] | None = None,
     ) -> dict[str, object]:
         if network_id not in {"1001", "1002", "1003"}:
             raise SantaFeIibbError("La red de pago no es válida")
@@ -545,6 +548,8 @@ class SantaFeIibbConnector:
             comparable = ("due_date", "principal", "interest", "total")
             if any(str(quote[key]) != str(expected_quote.get(key, "")) for key in comparable):
                 raise IibbQuoteChanged(quote)
+            if before_emit is not None:
+                before_emit()
             try:
                 response = client.post(
                     f"{REGSIM_URL}?header=AJAX&action=Registro::liquidar_VEP",

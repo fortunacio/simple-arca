@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -42,12 +43,17 @@ class FakeConnector:
         self.generation_calls = 0
         self.quote_result = dict(QUOTE)
         self.generation_error = None
+        self.preparation_error = None
 
     def quote_payment(self, *args, **kwargs):
         self.quote_calls += 1
         return dict(self.quote_result)
 
     def generate_vep(self, *args, **kwargs):
+        if self.preparation_error:
+            raise self.preparation_error
+        if kwargs.get("before_emit"):
+            kwargs["before_emit"]()
         self.generation_calls += 1
         if self.generation_error:
             raise self.generation_error
@@ -150,6 +156,7 @@ class IibbPaymentTest(TestCase):
         self.connector = FakeConnector()
         self.processor = IibbPaymentProcessor(self.store, self.connector)
         self.bot = IibbPaymentBotService(self.store, frozenset({1001}), enabled=True)
+        self.seti_snapshot([])
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -163,6 +170,33 @@ class IibbPaymentTest(TestCase):
             network_id="1002",
             payment_date=date(2026, 8, 6),
         )
+
+    def seti_snapshot(self, items, **overrides):
+        now = datetime.now(timezone.utc)
+        payload = {"represented_cuit": "20123456786", "complete": True,
+                   "query_started_at": now.isoformat(), "veps": items}
+        payload.update(overrides)
+        self.db.upsert_live_snapshot(
+            1001, "ARCA_SETI", "payment_status", now.isoformat(),
+            (now + timedelta(hours=1)).isoformat(), json.dumps(payload),
+        )
+
+    @staticmethod
+    def existing_vep(**overrides):
+        result = {"number": "1234567890", "status": "UNKNOWN", "seti_state": 1,
+                  "description": "SF-RGS07/26", "tax_type": "SANTA_FE_IIBB",
+                  "tax_period": "2026-07", "amount": "42882.00", "payment_entity": "BANELCO"}
+        result.update(overrides)
+        return result
+
+    def uncertain_draft(self, **kwargs):
+        row = self.request()
+        self.processor.process_one()
+        self.store.request_generation(row["id"], 1001)
+        claimed = self.store.claim_next()
+        self.assertEqual(claimed["status"], "GENERATING")
+        self.store.generation_unknown(row["id"], "respuesta perdida", **kwargs)
+        return row
 
     def test_complete_flow_requires_quote_and_explicit_confirmation(self):
         row = self.request()
@@ -185,6 +219,260 @@ class IibbPaymentTest(TestCase):
         self.assertEqual(reply.document, b"%PDF-test")
         self.assertIn(PAYMENT_URL, str(reply.keyboard))
         self.assertIn("puede tardar al menos 3 horas", reply.text)
+
+    def test_recovers_missing_pdf_from_seti_without_reissuing_or_inventing_expiration(self):
+        row = self.uncertain_draft()
+        self.seti_snapshot([self.existing_vep()])
+        self.assertEqual(self.store.reconcile_generation(1001), 1)
+        recovered = self.store.get(row["id"])
+        self.assertEqual(recovered["status"], "GENERATED")
+        self.assertEqual(recovered["vep_number"], "1234567890")
+        self.assertIsNone(recovered["vep_expires_on"])
+        reply = self.bot.render(recovered)
+        self.assertIn("confirmado en ARCA", reply.text)
+        self.assertIn("1234567890", reply.text)
+        self.assertIn("vigencia", reply.text)
+        self.assertIsNone(reply.document)
+        self.assertEqual(self.store.expire_generated(date(2030, 1, 1)), 0)
+        self.store.request_generation(row["id"], 1001)
+        self.assertFalse(self.processor.process_one())
+        self.assertEqual(self.connector.generation_calls, 0)
+        self.assertEqual(self.store.reconcile_generation(1001), 0)
+        with self.db.connect() as connection:
+            count = connection.execute(
+                "SELECT count(*) FROM iibb_payment_events WHERE event_type='GENERATION_RECONCILED'"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_existing_vep_is_reused_before_sending_a_generation(self):
+        row = self.request()
+        self.processor.process_one()
+        self.seti_snapshot([self.existing_vep()])
+        self.store.request_generation(row["id"], 1001)
+        self.processor.process_one()
+        self.assertEqual(self.store.get(row["id"])["status"], "GENERATED")
+        self.assertEqual(self.connector.generation_calls, 0)
+
+    def test_preflight_blocks_existing_veps_with_other_values(self):
+        row = self.request()
+        self.processor.process_one()
+        self.seti_snapshot([self.existing_vep(amount="1.00")])
+        self.store.request_generation(row["id"], 1001)
+        self.processor.process_one()
+        self.assertEqual(self.store.get(row["id"])["status"], "UNKNOWN")
+        self.assertEqual(self.connector.generation_calls, 0)
+
+    def test_recovery_rejects_wrong_or_ambiguous_official_values(self):
+        row = self.uncertain_draft()
+        cases = [
+            {"amount": "1.00"}, {"amount": "NaN"}, {"amount": "not-money"},
+            {"description": "MONOTRIBUTO"}, {"number": "invalid"},
+            {"tax_period": "2026-08"}, {"tax_type": "ARCA"},
+            {"payment_entity": "LINK"}, {"seti_state": 3},
+            {"status": "PAID"}, {"is_consolidated": True}, {"is_sub_vep": True},
+        ]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.seti_snapshot([self.existing_vep(**changes)])
+                self.assertEqual(self.store.reconcile_generation(1001), 0)
+                self.assertEqual(self.store.get(row["id"])["status"], "UNKNOWN")
+        self.seti_snapshot([self.existing_vep(), self.existing_vep(number="1234567891", amount="1.00")])
+        self.assertEqual(self.store.reconcile_generation(1001), 0)
+
+    def test_recovery_requires_fresh_complete_identity_scoped_data_after_the_attempt(self):
+        row = self.uncertain_draft()
+        for changes in [
+            {"complete": False}, {"represented_cuit": "20999999999"},
+            {"query_started_at": "2026-01-01T00:00:00+00:00"},
+            {"query_started_at": datetime.now().isoformat()},
+            {"query_started_at": "broken"}, {"veps": [None]},
+            {"query_started_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()},
+        ]:
+            with self.subTest(changes=changes):
+                self.seti_snapshot([self.existing_vep()], **changes)
+                self.assertEqual(self.store.reconcile_generation(1001), 0)
+        # A still-fresh query taken before emission cannot resolve its outcome.
+        self.seti_snapshot([self.existing_vep()], query_started_at=(
+            datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat())
+        self.assertEqual(self.store.reconcile_generation(1001), 0)
+        self.db.set_pending_tax_identity(1001, "20999999999", "production")
+        self.db.mark_tax_identity_verified(1001)
+        self.seti_snapshot([self.existing_vep()], represented_cuit="20999999999")
+        self.assertEqual(self.store.reconcile_generation(1001), 0)
+        self.assertEqual(self.store.get(row["id"])["status"], "UNKNOWN")
+
+    def test_recovery_preserves_unvalidated_pdf_as_evidence_without_delivering_it(self):
+        document = b"%PDF-invalid\n%%EOF"
+        row = self.uncertain_draft(pdf=document)
+        self.seti_snapshot([self.existing_vep()])
+        self.assertEqual(self.store.reconcile_generation(1001), 1)
+        recovered = self.store.get(row["id"])
+        self.assertEqual(recovered["official_pdf"], document)
+        self.assertIsNone(self.bot.render(recovered).document)
+
+    def test_seti_can_confirm_payment_when_both_pdf_and_local_number_are_missing(self):
+        row = self.uncertain_draft()
+        self.seti_snapshot([self.existing_vep(seti_state=2, status="PAID")])
+        self.assertEqual(self.store.reconcile_generation(1001), 1)
+        self.assertEqual(self.store.get(row["id"])["status"], "PAID")
+
+    def test_delayed_visibility_is_rechecked_with_backoff_without_another_post(self):
+        row = self.request()
+        self.processor.process_one()
+        self.connector.generation_error = IibbGenerationUnknown("respuesta perdida")
+        queries = []
+        def refresh(chat_id):
+            queries.append(chat_id)
+            self.seti_snapshot([self.existing_vep()] if len(queries) >= 3 else [])
+        processor = IibbPaymentProcessor(self.store, self.connector, seti_sync=refresh)
+        self.store.request_generation(row["id"], 1001)
+        with patch("contador_ai.iibb_payment.time.monotonic", return_value=100):
+            processor.process_one()
+            self.assertEqual(len(queries), 2)
+            self.assertEqual(self.store.get(row["id"])["status"], "UNKNOWN")
+            for _ in range(5):
+                processor.process_one()
+            self.assertEqual(len(queries), 2)
+        with patch("contador_ai.iibb_payment.time.monotonic", return_value=131):
+            processor.process_one()
+        self.assertEqual(self.store.get(row["id"])["status"], "GENERATED")
+        self.assertEqual(self.connector.generation_calls, 1)
+
+    def test_seti_outage_before_emission_does_not_send_a_post(self):
+        row = self.request()
+        self.processor.process_one()
+        def unavailable(chat_id):
+            raise RuntimeError("SETI unavailable")
+        processor = IibbPaymentProcessor(self.store, self.connector, seti_sync=unavailable)
+        self.store.request_generation(row["id"], 1001)
+        processor.process_one()
+        self.assertEqual(self.store.get(row["id"])["status"], "QUOTED")
+        self.assertEqual(self.connector.generation_calls, 0)
+
+    def test_unexpected_error_during_generation_never_reenables_confirmation(self):
+        row = self.request()
+        self.processor.process_one()
+        self.connector.generation_error = RuntimeError("interrupted")
+        self.store.request_generation(row["id"], 1001)
+        self.processor.process_one()
+        self.assertEqual(self.store.get(row["id"])["status"], "UNKNOWN")
+        self.store.request_generation(row["id"], 1001)
+        self.processor.process_one()
+        self.assertEqual(self.connector.generation_calls, 1)
+
+    def test_preparation_failure_before_post_allows_a_safe_new_confirmation(self):
+        row = self.request()
+        self.processor.process_one()
+        self.connector.preparation_error = RuntimeError("failed before submission")
+        self.store.request_generation(row["id"], 1001)
+        self.processor.process_one()
+        self.assertEqual(self.store.get(row["id"])["status"], "QUOTED")
+        self.assertEqual(self.connector.generation_calls, 0)
+        self.connector.preparation_error = None
+        self.store.request_generation(row["id"], 1001)
+        self.processor.process_one()
+        self.assertEqual(self.store.get(row["id"])["status"], "GENERATED")
+        self.assertEqual(self.connector.generation_calls, 1)
+
+    def test_a_stale_worker_cannot_emit_after_its_generation_was_recovered(self):
+        row = self.request()
+        self.processor.process_one()
+        self.store.request_generation(row["id"], 1001)
+        def recovered_elsewhere(row_id):
+            self.store.generation_unknown(row_id, "another worker recovered the job")
+            raise RuntimeError("not owned anymore")
+        with patch.object(self.store, "emission_started", side_effect=recovered_elsewhere):
+            self.processor.process_one()
+        self.assertEqual(self.connector.generation_calls, 0)
+        self.assertEqual(self.store.get(row["id"])["status"], "UNKNOWN")
+
+    def test_restart_recovers_stale_generation_even_after_the_first_worker_iteration(self):
+        row = self.request()
+        self.processor.process_one()
+        self.store.request_generation(row["id"], 1001)
+        self.store.claim_next()
+        with self.db.connect() as connection:
+            connection.execute("UPDATE iibb_payment_drafts SET updated_at=datetime('now','-11 minutes') WHERE id=?",
+                               (row["id"],))
+        processor = IibbPaymentProcessor(
+            self.store, self.connector,
+            seti_sync=lambda chat_id: self.seti_snapshot([self.existing_vep()]),
+        )
+        processor.process_one()
+        self.assertEqual(self.store.get(row["id"])["status"], "GENERATED")
+        self.assertEqual(self.connector.generation_calls, 0)
+
+    def test_account_format_and_paid_records_cannot_bypass_duplicate_protection(self):
+        row = self.request()
+        same = self.store.request_quote(
+            chat_id=1001, represented_cuit="20123456786", account="1311234567",
+            period="2026-07", network_id="1001", payment_date=date(2026, 8, 6),
+        )
+        self.assertEqual(row["id"], same["id"])
+        with self.db.connect() as connection:
+            connection.execute("UPDATE iibb_payment_drafts SET status='PAID' WHERE id=?", (row["id"],))
+        self.assertEqual(self.store.active_for_period(1001, "131-123456-7", "2026-07")["id"], row["id"])
+
+    def test_a_late_notification_ack_cannot_hide_the_recovered_vep(self):
+        row = self.uncertain_draft()
+        _, _, _, old_version = self.bot.pending_replies()[0]
+        self.seti_snapshot([self.existing_vep()])
+        self.store.reconcile_generation(1001)
+        self.store.mark_notified(row["id"], old_version)
+        pending = self.bot.pending_replies()
+        self.assertEqual(len(pending), 1)
+        _, _, reply, version = pending[0]
+        self.assertIn("confirmado en ARCA", reply.text)
+        self.store.mark_notified(row["id"], version)
+        self.assertEqual(self.bot.pending_replies(), [])
+
+    def test_ambiguous_recovery_requests_review_once_without_repeated_notifications(self):
+        row = self.uncertain_draft()
+        self.seti_snapshot([self.existing_vep(), self.existing_vep(number="1234567891")])
+        self.assertEqual(self.store.reconcile_generation(1001), 0)
+        self.assertIn("no puedo asociarlos con seguridad", self.bot.render(self.store.get(row["id"])).text)
+        _, _, _, version = self.bot.pending_replies()[0]
+        self.store.mark_notified(row["id"], version)
+        self.store.reconcile_generation(1001)
+        self.assertEqual(self.bot.pending_replies(), [])
+
+    def test_concurrent_recovery_records_the_confirmation_only_once(self):
+        row = self.uncertain_draft()
+        self.seti_snapshot([self.existing_vep()])
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: self.store.reconcile_generation(1001), range(2)))
+        self.assertEqual(sorted(results), [0, 1])
+        self.assertEqual(self.store.get(row["id"])["status"], "GENERATED")
+
+    def test_timeout_is_recovered_immediately_when_seti_already_has_the_vep(self):
+        row = self.request()
+        self.processor.process_one()
+        self.connector.generation_error = IibbGenerationUnknown(
+            "response lost", diagnostic={"stage": "emission_transport", "error": "ReadTimeout"},
+        )
+        queries = []
+        def refresh(chat_id):
+            queries.append(chat_id)
+            self.seti_snapshot([self.existing_vep()] if len(queries) > 1 else [])
+        processor = IibbPaymentProcessor(self.store, self.connector, seti_sync=refresh)
+        self.store.request_generation(row["id"], 1001)
+        processor.process_one()
+        self.assertEqual(self.store.get(row["id"])["status"], "GENERATED")
+        self.assertEqual(self.connector.generation_calls, 1)
+        with self.db.connect() as connection:
+            error = connection.execute(
+                "SELECT payload_json FROM iibb_payment_events WHERE draft_id=? AND event_type='UNKNOWN'",
+                (row["id"],),
+            ).fetchone()[0]
+        self.assertEqual(json.loads(error)["diagnostic"]["error"], "ReadTimeout")
+
+    def test_payment_reconciliation_cannot_confirm_a_previous_identitys_draft(self):
+        row = self.uncertain_draft(vep_number="1234567890")
+        self.db.set_pending_tax_identity(1001, "20999999999", "production")
+        self.db.mark_tax_identity_verified(1001)
+        self.seti_snapshot([self.existing_vep(status="PAID", seti_state=2)], represented_cuit="20999999999")
+        self.assertEqual(self.store.reconcile_paid(1001), 0)
+        self.assertEqual(self.store.get(row["id"])["status"], "UNKNOWN")
 
     def test_each_network_has_specific_non_invented_next_steps(self):
         from contador_ai.iibb_payment import NETWORK_GUIDANCE, NETWORK_HELP_URLS

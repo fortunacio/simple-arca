@@ -331,10 +331,10 @@ class TelegramClient:
         if self.iibb_payment_bot is None:
             return 0
         sent = 0
-        for chat_id, row_id, reply in self.iibb_payment_bot.pending_replies():
+        for chat_id, row_id, reply, version in self.iibb_payment_bot.pending_replies():
             try:
                 self.deliver(chat_id, reply)
-                self.iibb_payment_bot.store.mark_notified(row_id)
+                self.iibb_payment_bot.store.mark_notified(row_id, version)
                 sent += 1
             except Exception:
                 LOGGER.exception("No pude entregar una novedad de pago de Ingresos Brutos")

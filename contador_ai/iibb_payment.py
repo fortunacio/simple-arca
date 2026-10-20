@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
+import time
 import uuid
-from datetime import date, datetime, timezone
-from decimal import Decimal
+from collections.abc import Callable
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 
 from .bot_reply import BotReply
 from .db import Database
@@ -67,6 +70,11 @@ ACTIVE_STATES = (
     "GENERATED",
     "UNKNOWN",
 )
+SETI_NETWORKS = {
+    "1001": {"LINK", "RED LINK"},
+    "1002": {"BANELCO"},
+    "1003": {"INTERBANKING"},
+}
 
 
 class IibbPaymentStore:
@@ -104,16 +112,17 @@ class IibbPaymentStore:
             return connection.execute(query, parameters).fetchone()
 
     def active_for_period(self, chat_id: int, account: str, period: str):
-        placeholders = ",".join("?" for _ in ACTIVE_STATES)
+        states = (*ACTIVE_STATES, "PAID")
+        placeholders = ",".join("?" for _ in states)
         with self.db.connect() as connection:
             return connection.execute(
                 f"""
                 SELECT * FROM iibb_payment_drafts
-                WHERE chat_id = ? AND account = ? AND period = ?
+                WHERE chat_id = ? AND REPLACE(account, '-', '') = ? AND period = ?
                   AND status IN ({placeholders})
                 ORDER BY created_at DESC LIMIT 1
                 """,
-                (chat_id, account, period, *ACTIVE_STATES),
+                (chat_id, account.replace("-", ""), period, *states),
             ).fetchone()
 
     def request_quote(
@@ -128,6 +137,7 @@ class IibbPaymentStore:
     ):
         if network_id not in NETWORKS:
             raise ValueError("La red de pago no es válida")
+        account = account.replace("-", "")
         existing = self.active_for_period(chat_id, account, period)
         if existing is not None:
             return existing
@@ -310,13 +320,13 @@ class IibbPaymentStore:
 
     def quote_succeeded(self, row_id: str, quote: dict[str, str], *, changed=False) -> None:
         with self.db.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE iibb_payment_drafts SET
                     status = 'QUOTED', obligation_due_date = ?, principal = ?,
                     interest = ?, total = ?, vep_expires_on = ?, last_error = NULL,
                     notification_pending = 1, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                WHERE id = ? AND status IN ('QUOTING', 'GENERATING')
                 """,
                 (
                     quote["due_date"],
@@ -327,6 +337,8 @@ class IibbPaymentStore:
                     row_id,
                 ),
             )
+            if not cursor.rowcount:
+                return
             row = connection.execute(
                 "SELECT chat_id FROM iibb_payment_drafts WHERE id = ?", (row_id,)
             ).fetchone()
@@ -341,50 +353,192 @@ class IibbPaymentStore:
     def failed(self, row_id: str, message: str, *, keep_quote: bool = False) -> None:
         status = "QUOTED" if keep_quote else "ERROR"
         with self.db.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE iibb_payment_drafts
                 SET status = ?, last_error = ?, notification_pending = 1,
-                    updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('QUOTING', 'GENERATING')
                 """,
                 (status, message[:500], row_id),
             )
+            if not cursor.rowcount:
+                return
             row = connection.execute(
                 "SELECT chat_id FROM iibb_payment_drafts WHERE id = ?", (row_id,)
             ).fetchone()
             self._event(connection, row_id, int(row["chat_id"]), "ERROR", {"message": message[:500]})
 
     def generation_unknown(self, row_id: str, message: str, *, pdf: bytes | None = None,
-                           vep_number: str | None = None) -> None:
+                           vep_number: str | None = None, diagnostic: dict | None = None) -> None:
         with self.db.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE iibb_payment_drafts
                 SET status = 'UNKNOWN', last_error = ?, notification_pending = 1,
                     official_pdf = COALESCE(?, official_pdf),
                     vep_number = COALESCE(?, vep_number),
-                    updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'GENERATING'
                 """,
                 (message[:500], pdf, vep_number, row_id),
             )
+            if not cursor.rowcount:
+                return
             row = connection.execute(
                 "SELECT chat_id FROM iibb_payment_drafts WHERE id = ?", (row_id,)
             ).fetchone()
-            self._event(connection, row_id, int(row["chat_id"]), "UNKNOWN", {"message": message[:500]})
+            self._event(connection, row_id, int(row["chat_id"]), "UNKNOWN",
+                        {"message": message[:500], "diagnostic": diagnostic or {}})
+
+    def emission_started(self, row_id: str) -> None:
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT chat_id FROM iibb_payment_drafts WHERE id = ? AND status = 'GENERATING'",
+                (row_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("La generación ya no está activa; no se enviará la solicitud")
+            connection.execute(
+                "UPDATE iibb_payment_drafts SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (row_id,),
+            )
+            self._event(connection, row_id, int(row["chat_id"]), "EMISSION_STARTED")
+
+    def verified_seti_snapshot(self, chat_id: int) -> dict | None:
+        """Only a recent, complete query for the current identity can resolve issuance."""
+        identity = self.db.get_tax_identity(chat_id)
+        snapshot = self.db.get_live_snapshot(chat_id, "ARCA_SETI", "payment_status")
+        if identity is None or identity["status"] != "VERIFIED" or snapshot is None:
+            return None
+        try:
+            payload = json.loads(snapshot["payload_json"])
+            started = datetime.fromisoformat(payload["query_started_at"])
+            fetched = datetime.fromisoformat(snapshot["fetched_at"])
+            expires = datetime.fromisoformat(snapshot["expires_at"])
+            now = datetime.now(timezone.utc)
+            if (payload.get("complete") is not True
+                    or payload.get("represented_cuit") != identity["represented_cuit"]
+                    or not isinstance(payload.get("veps"), list)
+                    or not all(isinstance(v, dict) for v in payload["veps"])
+                    or not now - timedelta(minutes=10) <= started <= fetched <= now
+                    or expires <= now):
+                return None
+        except (KeyError, TypeError, ValueError):
+            return None
+        return payload
+
+    @staticmethod
+    def period_veps(payload: dict, row) -> list[dict]:
+        return [v for v in payload["veps"]
+                if v.get("tax_type") == "SANTA_FE_IIBB" and v.get("tax_period") == row["period"]]
+
+    def _reconciliation_blocked(self, connection, row) -> None:
+        message = "Encontré VEP en ARCA para este período, pero no puedo asociarlos con seguridad. Revisalos desde ARCA antes de continuar."
+        if row["status"] != "UNKNOWN" or row["last_error"] == message:
+            return
+        connection.execute(
+            """UPDATE iibb_payment_drafts SET last_error = ?, notification_pending = 1,
+               updated_at = CURRENT_TIMESTAMP WHERE id = ?""", (message, row["id"]),
+        )
+        self._event(connection, row["id"], int(row["chat_id"]), "RECONCILIATION_BLOCKED",
+                    {"stage": "seti_match"})
+
+    def reconcile_generation(self, chat_id: int, *, generating_id: str | None = None) -> int:
+        payload = self.verified_seti_snapshot(chat_id)
+        if payload is None:
+            return 0
+        reconciled = 0
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """SELECT * FROM iibb_payment_drafts WHERE chat_id = ?
+                   AND ((status = 'UNKNOWN' AND ? IS NULL)
+                        OR (status = 'GENERATING' AND id = ?))""",
+                (chat_id, generating_id, generating_id),
+            ).fetchall()
+            for row in rows:
+                if row["represented_cuit"] != payload["represented_cuit"]:
+                    continue
+                if row["status"] == "UNKNOWN":
+                    attempt = connection.execute(
+                        """SELECT created_at FROM iibb_payment_events
+                           WHERE draft_id = ? AND event_type = 'GENERATING'
+                           ORDER BY id DESC LIMIT 1""", (row["id"],),
+                    ).fetchone()
+                    if (attempt is None or datetime.fromisoformat(payload["query_started_at"])
+                            < datetime.fromisoformat(attempt["created_at"]).replace(tzinfo=timezone.utc)):
+                        continue
+                candidates = self.period_veps(payload, row)
+                # Never choose between two VEPs for the same period, even if only
+                # one has the expected amount. A known validated number is stronger.
+                if row["vep_number"]:
+                    candidates = [v for v in candidates if v.get("number") == row["vep_number"]]
+                if len(candidates) != 1:
+                    if candidates:
+                        self._reconciliation_blocked(connection, row)
+                    continue
+                vep = candidates[0]
+                number = str(vep.get("number", ""))
+                try:
+                    matches = (Decimal(str(vep.get("amount"))) == Decimal(str(row["total"]))
+                               and Decimal(str(row["total"])).is_finite())
+                except (InvalidOperation, ValueError):
+                    matches = False
+                year, month = str(row["period"]).split("-")
+                if (not matches or not re.fullmatch(r"[0-9]{6,12}", number)
+                        or str(vep.get("description", "")).upper() != f"SF-RGS{month}/{year[-2:]}"
+                        or vep.get("seti_state") not in (1, 2)
+                        or (vep.get("seti_state") == 2) != (vep.get("status") == "PAID")
+                        or str(vep.get("payment_entity", "")).strip().upper()
+                        not in SETI_NETWORKS.get(str(row["network_id"]), set())
+                        or vep.get("is_consolidated") or vep.get("is_sub_vep")
+                        or connection.execute(
+                            "SELECT 1 FROM iibb_payment_drafts WHERE vep_number = ? AND id != ?",
+                            (number, row["id"]),
+                        ).fetchone()):
+                    self._reconciliation_blocked(connection, row)
+                    continue
+                # Preserve any received bytes as evidence, but only send a PDF
+                # whose fiscal fields and number have been independently validated.
+                pdf_valid = False
+                if row["official_pdf"]:
+                    from .siat import parse_vep_pdf
+                    try:
+                        receipt = parse_vep_pdf(bytes(row["official_pdf"]), row["represented_cuit"],
+                                                {"period": row["period"], "total": row["total"],
+                                                 "vep_expires_on": row["vep_expires_on"]})
+                        pdf_valid = receipt["vep_number"] == number
+                    except Exception:
+                        pass
+                status = "PAID" if vep["status"] == "PAID" else "GENERATED"
+                connection.execute(
+                    """UPDATE iibb_payment_drafts SET status = ?, vep_number = ?,
+                       vep_expires_on = ?, last_error = ?, notification_pending = 1,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                    (status, number, row["vep_expires_on"] if pdf_valid else None,
+                     None if pdf_valid else "Comprobante y vigencia pendientes de consultar en ARCA",
+                     row["id"]),
+                )
+                self._event(connection, row["id"], chat_id, "GENERATION_RECONCILED",
+                            {"source": "ARCA_SETI", "vep_number": number, "status": status,
+                             "pdf_validated": pdf_valid, "query_started_at": payload["query_started_at"]})
+                reconciled += 1
+        return reconciled
 
     def generation_succeeded(self, row_id: str, result: dict[str, object]) -> None:
         with self.db.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE iibb_payment_drafts
                 SET status = 'GENERATED', vep_number = ?, official_pdf = ?,
                     vep_expires_on = COALESCE(?, payment_date), last_error = NULL,
                     notification_pending = 1, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                WHERE id = ? AND status = 'GENERATING'
                 """,
                 (str(result["vep_number"]), bytes(result["pdf"]),
                  result.get("quote", {}).get("vep_expires_on"), row_id),
             )
+            if not cursor.rowcount:
+                raise RuntimeError("La generación ya cambió de estado; se conserva el resultado actual")
             row = connection.execute(
                 "SELECT chat_id FROM iibb_payment_drafts WHERE id = ?", (row_id,)
             ).fetchone()
@@ -403,24 +557,31 @@ class IibbPaymentStore:
         with self.db.connect() as connection:
             return connection.execute(
                 f"""
-                SELECT * FROM iibb_payment_drafts
+                SELECT iibb_payment_drafts.*, COALESCE((
+                    SELECT MAX(id) FROM iibb_payment_events
+                    WHERE draft_id = iibb_payment_drafts.id
+                ), 0) AS notification_version FROM iibb_payment_drafts
                 WHERE notification_pending = 1 AND chat_id IN ({placeholders})
                 ORDER BY updated_at, id
                 """,
                 tuple(sorted(chat_ids)),
             ).fetchall()
 
-    def mark_notified(self, row_id: str) -> None:
+    def mark_notified(self, row_id: str, notification_version: int) -> None:
         with self.db.connect() as connection:
             connection.execute(
                 """
                 UPDATE iibb_payment_drafts SET notification_pending = 0,
                     updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                    AND COALESCE((SELECT MAX(id) FROM iibb_payment_events WHERE draft_id = ?), 0) = ?
                 """,
-                (row_id,),
+                (row_id, row_id, notification_version),
             )
 
     def reconcile_paid(self, chat_id: int) -> int:
+        identity = self.db.get_tax_identity(chat_id)
+        if identity is None or identity["status"] != "VERIFIED":
+            return 0
         snapshot = self.db.get_live_snapshot(chat_id, "SANTA_FE_IIBB", "account_status")
         try:
             payload = json.loads(snapshot["payload_json"]) if snapshot is not None else {}
@@ -436,12 +597,15 @@ class IibbPaymentStore:
         with self.db.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, chat_id, period, vep_number FROM iibb_payment_drafts
+                SELECT id, chat_id, period, vep_number, represented_cuit FROM iibb_payment_drafts
                 WHERE chat_id = ? AND status IN ('GENERATED', 'UNKNOWN', 'EXPIRED')
                 """,
                 (chat_id,),
             ).fetchall()
+            reconciled = 0
             for row in rows:
+                if row["represented_cuit"] != identity["represented_cuit"]:
+                    continue
                 if (
                     str(row["period"]) not in paid_periods
                     and str(row["vep_number"] or "") not in paid_vep_numbers
@@ -456,7 +620,8 @@ class IibbPaymentStore:
                     (row["id"],),
                 )
                 self._event(connection, row["id"], row["chat_id"], "PAID")
-        return len(rows)
+                reconciled += 1
+        return reconciled
 
 
 class IibbPaymentProcessor:
@@ -465,18 +630,60 @@ class IibbPaymentProcessor:
         store: IibbPaymentStore,
         connector: SantaFeIibbConnector,
         allowed_chat_ids: frozenset[int] | None = None,
+        *,
+        seti_sync: Callable[[int], None] | None = None,
     ):
         self.store = store
         self.connector = connector
         self.allowed_chat_ids = allowed_chat_ids
+        self.seti_sync = seti_sync
+        self._recovery_due: dict[int, float] = {}
+        self._recovery_delay: dict[int, int] = {}
+        self._housekeeping_due = 0.0
+
+    def reconcile_pending(self) -> int:
+        if self.seti_sync is None:
+            return 0
+        now = time.monotonic()
+        if now >= self._housekeeping_due:
+            self.store.recover_stale_jobs()
+            self._housekeeping_due = now + 30
+        with self.store.db.connect() as connection:
+            chats = connection.execute(
+                "SELECT DISTINCT chat_id FROM iibb_payment_drafts WHERE status = 'UNKNOWN'"
+            ).fetchall()
+        for row in chats:
+            chat_id = int(row["chat_id"])
+            if ((self.allowed_chat_ids is not None and chat_id not in self.allowed_chat_ids)
+                    or now < self._recovery_due.get(chat_id, 0)):
+                continue
+            delay = self._recovery_delay.get(chat_id, 30)
+            try:
+                self.seti_sync(chat_id)
+                count = self.store.reconcile_generation(chat_id)
+                self.store.reconcile_paid(chat_id)
+            except Exception as exc:
+                # Keep UNKNOWN, including when the database cannot be updated.
+                LOGGER.warning("No pude verificar VEP inciertos en ARCA: %s", type(exc).__name__)
+                count = 0
+            self._recovery_due[chat_id] = time.monotonic() + delay
+            self._recovery_delay[chat_id] = min(delay * 2, 300)
+            return count
+        return 0
 
     def process_one(self) -> bool:
         row = self.store.claim_next()
         if row is None:
+            self.reconcile_pending()
             return False
         if self.allowed_chat_ids is not None and int(row["chat_id"]) not in self.allowed_chat_ids:
             self.store.failed(str(row["id"]), "Este chat no está autorizado para generar VEP")
             return True
+        emission_invoked = False
+        def before_emit():
+            nonlocal emission_invoked
+            self.store.emission_started(str(row["id"]))
+            emission_invoked = True
         try:
             payment_date = date.fromisoformat(str(row["payment_date"]))
             if row["status"] == "QUOTING":
@@ -488,6 +695,18 @@ class IibbPaymentProcessor:
                 )
                 self.store.quote_succeeded(str(row["id"]), quote)
             else:
+                if self.seti_sync is not None:
+                    self.seti_sync(int(row["chat_id"]))
+                payload = self.store.verified_seti_snapshot(int(row["chat_id"]))
+                if payload is None or payload["represented_cuit"] != row["represented_cuit"]:
+                    raise RuntimeError("Falta una consulta completa y reciente de ARCA para verificar duplicados")
+                if self.store.reconcile_generation(int(row["chat_id"]), generating_id=str(row["id"])):
+                    return True
+                if self.store.period_veps(payload, row):
+                    raise IibbGenerationUnknown(
+                        "ARCA informa VEP para este período que requieren revisión; no se emitió otro",
+                        diagnostic={"stage": "seti_ambiguous"},
+                    )
                 result = self.connector.generate_vep(
                     int(row["chat_id"]),
                     str(row["represented_cuit"]),
@@ -495,6 +714,7 @@ class IibbPaymentProcessor:
                     period=str(row["period"]),
                     payment_date=payment_date,
                     network_id=str(row["network_id"]),
+                    before_emit=before_emit,
                     expected_quote={
                         "due_date": str(row["obligation_due_date"]),
                         "principal": str(row["principal"]),
@@ -509,20 +729,32 @@ class IibbPaymentProcessor:
                     raise IibbGenerationUnknown(
                         "El VEP fue emitido, pero falló su registro; no se reintentará",
                         pdf=bytes(result["pdf"]), vep_number=str(result["vep_number"]),
+                        diagnostic={"stage": "generation_storage", "error": type(exc).__name__},
                     ) from exc
         except IibbQuoteChanged as exc:
             self.store.quote_succeeded(str(row["id"]), exc.quote, changed=True)
         except IibbGenerationUnknown as exc:
             self.store.generation_unknown(
                 str(row["id"]), str(exc), pdf=exc.pdf, vep_number=exc.vep_number,
+                diagnostic=exc.diagnostic,
             )
+            LOGGER.warning("VEP con resultado incierto: draft=%s diagnostic=%s", row["id"], exc.diagnostic)
+            self.reconcile_pending()
         except Exception as exc:
-            LOGGER.exception("Falló una operación de pago de Ingresos Brutos")
-            self.store.failed(
-                str(row["id"]),
-                str(exc) or exc.__class__.__name__,
-                keep_quote=row["status"] == "GENERATING",
-            )
+            if emission_invoked:
+                self.store.generation_unknown(
+                    str(row["id"]), "La generación se interrumpió; voy a verificar el resultado en ARCA",
+                    diagnostic={"stage": "generation_interrupted", "error": type(exc).__name__},
+                )
+                self.reconcile_pending()
+            else:
+                LOGGER.warning("No pude preparar o verificar el VEP: %s", type(exc).__name__)
+                self.store.failed(
+                    str(row["id"]),
+                    ("No pude preparar o verificar el VEP. No envié una generación; podés volver a confirmar cuando se restablezca la consulta."
+                     if row["status"] == "GENERATING" else str(exc) or type(exc).__name__),
+                    keep_quote=row["status"] == "GENERATING",
+                )
         return True
 
 
@@ -668,7 +900,7 @@ class IibbPaymentBotService:
             return BotReply("Estoy generando el VEP. Te lo envío apenas quede confirmado.", replace_message=replace)
         if status == "QUOTED":
             intro = (
-                f"Santa Fe no generó el VEP: {row['last_error']}\nPodés revisarlo y volver a confirmar."
+                f"No pude completar la generación: {row['last_error']}\nPodés revisarlo y volver a confirmar."
                 if row["last_error"]
                 else "Importe confirmado por Santa Fe"
             )
@@ -696,14 +928,16 @@ class IibbPaymentBotService:
             )
             return BotReply(text, keyboard, replace)
         if status == "GENERATED":
+            has_receipt = bool(row["official_pdf"]) and not row["last_error"]
             text = "\n".join(
                 [
-                    "VEP de Ingresos Brutos generado",
+                    "VEP de Ingresos Brutos generado" if has_receipt else "VEP de Ingresos Brutos confirmado en ARCA",
                     "",
                     f"VEP: {row['vep_number']}",
                     f"Período: {row['period']}",
                     f"Total: {format_money(row['total'])}",
-                    f"Pagar hasta: {format_date(row['vep_expires_on'])}",
+                    (f"Pagar hasta: {format_date(row['vep_expires_on'])}" if has_receipt
+                     else "Podés consultar el comprobante y su vigencia desde ARCA."),
                     "",
                     "Cómo pagarlo",
                     NETWORK_GUIDANCE[str(row["network_id"])],
@@ -719,7 +953,7 @@ class IibbPaymentBotService:
                     (("Volver a pagos", "tax:payments"),),
                 ),
                 replace,
-                document=bytes(row["official_pdf"]) if row["official_pdf"] else None,
+                document=bytes(row["official_pdf"]) if has_receipt else None,
                 filename=f"VEP-IIBB-{row['vep_number']}.pdf",
             )
         if status == "PAID":
@@ -729,8 +963,12 @@ class IibbPaymentBotService:
                 replace,
             )
         if status == "UNKNOWN":
+            if str(row["last_error"] or "").startswith(("Encontré VEP en ARCA", "ARCA informa VEP")):
+                text = str(row["last_error"]) + " No voy a emitir otro VEP para evitar duplicados."
+            else:
+                text = "Santa Fe no confirmó el resultado. Voy a verificar en ARCA si el VEP quedó generado y te aviso cuando pueda confirmarlo. No voy a repetir la generación para evitar duplicados. También podés revisarlo desde ARCA."
             return BotReply(
-                "No pude confirmar si Santa Fe generó el VEP. No voy a repetirlo automáticamente para evitar duplicados. Revisalo desde ARCA antes de volver a intentar.",
+                text,
                 ((('Abrir ARCA', PAYMENT_URL),), (('Volver a pagos', 'tax:payments'),)),
                 replace,
             )
@@ -750,6 +988,6 @@ class IibbPaymentBotService:
 
     def pending_replies(self):
         return [
-            (int(row["chat_id"]), str(row["id"]), self.render(row))
+            (int(row["chat_id"]), str(row["id"]), self.render(row), int(row["notification_version"]))
             for row in self.store.pending_notifications(self.allowed_chat_ids)
         ]

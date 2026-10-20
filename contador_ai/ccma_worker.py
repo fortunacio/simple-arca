@@ -553,6 +553,7 @@ def sync_portal_sources(
                 chat_id,
             )
 
+    iibb_payment_store.reconcile_generation(chat_id)
     iibb_payment_store.reconcile_paid(chat_id)
 
     return ccma_ready
@@ -661,14 +662,15 @@ def main() -> None:
                     or os.environ.get("INVOICE_EMISSION_CHAT_IDS", "")
                 )
             )
-            if payment_chat_ids:
+            if payment_chat_ids and seti_worker is not None:
                 iibb_payment_processor = IibbPaymentProcessor(
                     iibb_payment_store,
                     SiatIibbConnector(credentials),
                     payment_chat_ids,
+                    seti_sync=lambda chat_id: seti_worker.sync_chat(chat_id, require_ccma=False),
                 )
             else:
-                LOGGER.warning("No hay chats autorizados para generar VEP de Ingresos Brutos")
+                LOGGER.warning("La generación de VEP requiere chats autorizados y ARCA_SETI_ENABLED=true")
     configured = _chat_ids(
         os.environ.get("CCMA_CHAT_IDS", "")
         or os.environ.get("INVOICE_EMISSION_CHAT_IDS", "")

@@ -369,7 +369,7 @@ class SiatIibbConnector(SantaFeIibbConnector):
         return quote
 
     @staticmethod
-    def _emit_pdf(client, page, network_id):
+    def _emit_pdf(client, page, network_id, before_emit=None):
         if network_id not in {"1001", "1002", "1003"}:
             raise SantaFeIibbError("La red de pago no es válida")
         if len(page.form("f1").find("input", name="datos.destino", value=network_id)) != 1:
@@ -385,16 +385,19 @@ class SiatIibbConnector(SantaFeIibbConnector):
         target = official_url(page.url, action)
         fields = page.fields("f1")
         fields["datos.destino"] = network_id
+        if before_emit is not None:
+            before_emit()
         # No redirects: a 307/308 could repeat this non-idempotent POST.
         try:
             response = client.post(target, data=fields, headers={"Referer": page.url},
                                    follow_redirects=False)
         except httpx.HTTPError as exc:
             raise IibbGenerationUnknown(
-                "No se pudo confirmar si SIAT generó el VEP; no se reintentará"
+                "No se pudo confirmar si SIAT generó el VEP; no se reintentará",
+                diagnostic={"stage": "emission_transport", "error": type(exc).__name__},
             ) from exc
+        media_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
         if (response.status_code != 200
-                or response.headers.get("content-type", "").split(";")[0].strip().lower() != "application/pdf"
                 or not response.content.startswith(b"%PDF-")
                 or b"%%EOF" not in response.content[-1024:]
                 or len(response.content) > MAX_VEP_PDF_BYTES):
@@ -402,11 +405,22 @@ class SiatIibbConnector(SantaFeIibbConnector):
                 "SIAT no devolvió el PDF esperado después de emitir; no se reintentará",
                 pdf=(response.content if response.content.startswith(b"%PDF-")
                      and len(response.content) <= MAX_VEP_PDF_BYTES else None),
+                diagnostic={
+                    "stage": "emission_response", "http_status": response.status_code,
+                    # Never persist response bodies, URLs, cookies or arbitrary headers.
+                    "media_type": (media_type if media_type in {
+                        "application/pdf", "application/octet-stream", "application/json",
+                        "text/html", "text/plain",
+                    } else "other"),
+                    "response_bytes": len(response.content),
+                    "pdf_signature": response.content.startswith(b"%PDF-"),
+                    "pdf_eof": b"%%EOF" in response.content[-1024:],
+                },
             )
         return response.content
 
     def generate_vep(self, chat_id, represented_cuit, *, account, period,
-                     payment_date, network_id, expected_quote):
+                     payment_date, network_id, expected_quote, before_emit=None):
         if network_id not in {"1001", "1002", "1003"}:
             raise SantaFeIibbError("La red de pago no es válida")
         login = self._login(chat_id, represented_cuit, "santafe_pwlocal")
@@ -417,7 +431,7 @@ class SiatIibbConnector(SantaFeIibbConnector):
             comparable = ("due_date", "principal", "interest", "total", "vep_expires_on")
             if any(str(quote[k]) != str(expected_quote.get(k, "")) for k in comparable):
                 raise IibbQuoteChanged(quote)
-            document = self._emit_pdf(client, page, network_id)
+            document = self._emit_pdf(client, page, network_id, before_emit)
             try:
                 receipt = parse_vep_pdf(document, represented_cuit, quote)
             except Exception as exc:
@@ -426,5 +440,7 @@ class SiatIibbConnector(SantaFeIibbConnector):
                 raise IibbGenerationUnknown(
                     "SIAT devolvió un PDF pero no se pudo validar el VEP; no se reintentará",
                     pdf=document,
+                    diagnostic={"stage": (exc.stage if isinstance(exc, ExternalContractError)
+                                          else "pdf_validation"), "error": type(exc).__name__},
                 ) from exc
             return {"vep_number": receipt["vep_number"], "quote": quote, "pdf": document}

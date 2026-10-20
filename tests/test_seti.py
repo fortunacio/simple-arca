@@ -4,8 +4,12 @@ from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import Mock
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 from contador_ai.db import Database
+from contador_ai.external import ExternalContractError
 from contador_ai.seti import (
     BrowserSetiConnector,
     SetiAccessRequired,
@@ -108,6 +112,58 @@ class SetiReconciliationTest(TestCase):
         self.assertIn("contribuyente=20383717419", url)
         self.assertIn("ultimosMeses=12", url)
         self.assertIn("nroVep=0", url)
+
+    @staticmethod
+    def seti_page(start, count, *, cuit="20123456786"):
+        items = [{"nroVep": str(1000000000+i), "estado": 1, "importe": "42882.00",
+                  "cuit": cuit, "descripcion": "SF-RGS07/26", "entidadPago": "BANELCO"}
+                 for i in range(start, start+count)]
+        return SimpleNamespace(status=200, json=lambda: {"success": True, "data": {"vepsConsultados": items}})
+
+    def test_fetches_all_pages_before_claiming_the_seti_query_is_complete(self):
+        request = Mock()
+        request.get.side_effect = [self.seti_page(0, 20), self.seti_page(20, 1)]
+        result = BrowserSetiConnector(None)._fetch_payments(request, "20123456786")
+        self.assertEqual(len(result), 21)
+        self.assertEqual(result[-1]["number"], "1000000020")
+        pages = [parse_qs(urlsplit(call.args[0]).query)["pagina"] for call in request.get.call_args_list]
+        self.assertEqual(pages, [["1"], ["2"]])
+
+    def test_pagination_rejects_repeated_pages_and_identity_changes(self):
+        for second in [self.seti_page(0, 20), self.seti_page(20, 1, cuit="20999999999")]:
+            with self.subTest(second=second):
+                request = Mock()
+                request.get.side_effect = [self.seti_page(0, 20), second]
+                with self.assertRaises(ExternalContractError):
+                    BrowserSetiConnector(None)._fetch_payments(request, "20123456786")
+
+    def test_pagination_is_bounded_and_never_silently_truncates(self):
+        request = Mock()
+        request.get.side_effect = [self.seti_page(i*20, 20) for i in range(100)]
+        with self.assertRaises(ExternalContractError) as error:
+            BrowserSetiConnector(None)._fetch_payments(request, "20123456786")
+        self.assertEqual(error.exception.stage, "seti_pagination_limit")
+        self.assertEqual(request.get.call_count, 100)
+
+    def test_issuance_verification_does_not_depend_on_ccma_being_available(self):
+        with TemporaryDirectory() as directory:
+            db = self._verified_database(directory)
+            class Connector:
+                @staticmethod
+                def sync(chat_id, cuit):
+                    return {"complete": True, "veps": []}
+            SetiPaymentsWorker(db, Connector(), snapshot_ttl=timedelta(hours=1)).sync_chat(
+                1001, require_ccma=False,
+            )
+            payload = json.loads(db.get_live_snapshot(1001, "ARCA_SETI", "payment_status")["payload_json"])
+            self.assertEqual(payload["represented_cuit"], "20383717419")
+            self.assertTrue(payload["complete"])
+            self.assertIn("query_started_at", payload)
+            self.assertEqual(payload["ccma_reconciliation"]["status"], "UNAVAILABLE")
+            db.upsert_live_snapshot(1001, "ARCA_CCMA", "account_status", "", "", "not-json")
+            SetiPaymentsWorker(db, Connector(), snapshot_ttl=timedelta(hours=1)).sync_chat(
+                1001, require_ccma=False,
+            )
 
     def test_matches_duplicate_component_amounts_one_by_one(self):
         vep = {

@@ -132,8 +132,8 @@ class FakePaymentStore:
     def __init__(self):
         self.notified = []
 
-    def mark_notified(self, row_id):
-        self.notified.append(row_id)
+    def mark_notified(self, row_id, version):
+        self.notified.append((row_id, version))
 
 
 class FakePaymentBot:
@@ -146,7 +146,7 @@ class FakePaymentBot:
         return BotReply("preparando pago", replace_message=True)
 
     def pending_replies(self):
-        return [(123, "payment-1", BotReply("VEP listo"))]
+        return [(123, "payment-1", BotReply("VEP listo"), 7)]
 
 
 class TelegramAccessTest(TestCase):
@@ -438,5 +438,5 @@ class TelegramAccessTest(TestCase):
         client.iibb_payment_bot = payment_bot
 
         self.assertEqual(client.run_iibb_payment_notifications(), 1)
-        self.assertEqual(payment_bot.store.notified, ["payment-1"])
+        self.assertEqual(payment_bot.store.notified, [("payment-1", 7)])
         self.assertEqual(client.sent[0][1]["text"], "VEP listo")

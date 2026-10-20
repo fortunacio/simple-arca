@@ -89,7 +89,7 @@ class BrowserSetiConnector:
         }
 
     @staticmethod
-    def _query_url(cuit: str, *, number: str = "0") -> str:
+    def _query_url(cuit: str, *, number: str = "0", page: int = 1) -> str:
         params = {
             "usuario": "TODOS",
             "contribuyente": cuit,
@@ -101,11 +101,88 @@ class BrowserSetiConnector:
             "transaccion": "0",
             "ultimosMeses": "12",
             "orden": json.dumps({"valor": "vepId", "tipo": "desc"}, separators=(",", ":")),
-            "pagina": "1",
+            "pagina": str(page),
             "totalPagina": "20",
             "cantTotal": "0",
         }
         return f"{BrowserSetiConnector.PAYMENTS_API}?{urlencode(params)}"
+
+    def _fetch_payments(self, request, represented_cuit: str) -> list[dict]:
+        veps, seen = [], set()
+        # An incomplete first page cannot prove the absence or uniqueness of a VEP.
+        for page_number in range(1, 101):
+            response = request.get(self._query_url(represented_cuit, page=page_number))
+            if response.status == 401:
+                raise SetiAccessRequired("SETI no recibió una sesión autenticada")
+            if response.status in TRANSIENT_HTTP_STATUSES or response.status >= 500:
+                raise ExternalUnavailable(
+                    host="seti.afip.gob.ar",
+                    stage="seti_payments",
+                    status_code=response.status,
+                )
+            if response.status >= 400:
+                raise ExternalRejected(
+                    host="seti.afip.gob.ar",
+                    stage="seti_payments",
+                    status_code=response.status,
+                )
+            try:
+                envelope = response.json()
+            except (TypeError, ValueError) as exc:
+                raise ExternalContractError(
+                    host="seti.afip.gob.ar",
+                    stage="seti_payments_contract",
+                ) from exc
+            if not isinstance(envelope, dict):
+                raise ExternalContractError(
+                    host="seti.afip.gob.ar",
+                    stage="seti_payments_contract",
+                )
+            if envelope.get("success") is not True:
+                raise ExternalRejected(
+                    host="seti.afip.gob.ar",
+                    stage="seti_payments",
+                )
+            data = envelope.get("data")
+            if not isinstance(data, dict) or not isinstance(
+                data.get("vepsConsultados"), list
+            ):
+                raise ExternalContractError(
+                    host="seti.afip.gob.ar",
+                    stage="seti_payments_contract",
+                )
+            items = data["vepsConsultados"]
+            if any(not isinstance(item, dict) for item in items):
+                raise ExternalContractError(
+                    host="seti.afip.gob.ar",
+                    stage="seti_payments_contract",
+                )
+            observed_cuit = {
+                re.sub(r"\D", "", str(item.get("cuit", "")))
+                for item in items
+            }
+            if observed_cuit and observed_cuit != {represented_cuit}:
+                raise ExternalContractError(
+                    host="seti.afip.gob.ar",
+                    stage="seti_identity_contract",
+                )
+            try:
+                page_veps = [self._normalize_payment(item) for item in items]
+            except (SetiError, TypeError, ValueError) as exc:
+                raise ExternalContractError(
+                    host="seti.afip.gob.ar", stage="seti_payments_contract",
+                ) from exc
+            numbers = [vep["number"] for vep in page_veps]
+            if (any(not re.fullmatch(r"[0-9]{6,12}", number) for number in numbers)
+                    or len(set(numbers)) != len(numbers) or seen.intersection(numbers)):
+                raise ExternalContractError(
+                    host="seti.afip.gob.ar", stage="seti_pagination",
+                )
+            seen.update(numbers)
+            veps.extend(page_veps)
+            if len(items) < 20:
+                return veps
+        raise ExternalContractError(host="seti.afip.gob.ar", stage="seti_pagination_limit")
 
     def sync(self, chat_id: int, represented_cuit: str) -> dict[str, object]:
         from playwright.sync_api import Error as PlaywrightError
@@ -178,75 +255,12 @@ class BrowserSetiConnector:
                     ) from exc
 
                 try:
-                    response = seti.request.get(self._query_url(represented_cuit))
+                    veps = self._fetch_payments(seti.request, represented_cuit)
                 except PlaywrightError as exc:
-                    raise ExternalUnavailable(
-                        host="seti.afip.gob.ar",
-                        stage="seti_payments",
-                    ) from exc
-                if response.status == 401:
-                    raise SetiAccessRequired("SETI no recibió una sesión autenticada")
-                if response.status in TRANSIENT_HTTP_STATUSES or response.status >= 500:
-                    raise ExternalUnavailable(
-                        host="seti.afip.gob.ar",
-                        stage="seti_payments",
-                        status_code=response.status,
-                    )
-                if response.status >= 400:
-                    raise ExternalRejected(
-                        host="seti.afip.gob.ar",
-                        stage="seti_payments",
-                        status_code=response.status,
-                    )
-                try:
-                    envelope = response.json()
-                except (TypeError, ValueError) as exc:
-                    raise ExternalContractError(
-                        host="seti.afip.gob.ar",
-                        stage="seti_payments_contract",
-                    ) from exc
-                if not isinstance(envelope, dict):
-                    raise ExternalContractError(
-                        host="seti.afip.gob.ar",
-                        stage="seti_payments_contract",
-                    )
-                if envelope.get("success") is not True:
-                    raise ExternalRejected(
-                        host="seti.afip.gob.ar",
-                        stage="seti_payments",
-                    )
-                data = envelope.get("data")
-                if not isinstance(data, dict) or not isinstance(
-                    data.get("vepsConsultados"), list
-                ):
-                    raise ExternalContractError(
-                        host="seti.afip.gob.ar",
-                        stage="seti_payments_contract",
-                    )
-                items = data["vepsConsultados"]
-                if any(not isinstance(item, dict) for item in items):
-                    raise ExternalContractError(
-                        host="seti.afip.gob.ar",
-                        stage="seti_payments_contract",
-                    )
-                observed_cuit = {
-                    re.sub(r"\D", "", str(item.get("cuit", "")))
-                    for item in items
-                }
-                if observed_cuit and observed_cuit != {represented_cuit}:
-                    raise ExternalContractError(
-                        host="seti.afip.gob.ar",
-                        stage="seti_identity_contract",
-                    )
-                try:
-                    veps = [self._normalize_payment(item) for item in items]
-                except (SetiError, TypeError, ValueError) as exc:
-                    raise ExternalContractError(
-                        host="seti.afip.gob.ar",
-                        stage="seti_payments_contract",
-                    ) from exc
+                    raise ExternalUnavailable(host="seti.afip.gob.ar", stage="seti_payments") from exc
                 return {
                     "window_months": 12,
+                    "complete": True,
                     "veps": veps,
                 }
             finally:
@@ -375,12 +389,12 @@ class SetiPaymentsWorker:
         self.connector = connector
         self.snapshot_ttl = snapshot_ttl
 
-    def sync_chat(self, chat_id: int) -> None:
+    def sync_chat(self, chat_id: int, *, require_ccma: bool = True) -> None:
         identity = self.db.get_tax_identity(chat_id)
         if identity is None or identity["status"] != "VERIFIED":
             raise SetiError("El chat no tiene un CUIT verificado")
         ccma_row = self.db.get_live_snapshot(chat_id, "ARCA_CCMA", "account_status")
-        if ccma_row is None:
+        if ccma_row is None and require_ccma:
             self.db.record_connection_failure(
                 chat_id,
                 "ARCA_SETI",
@@ -388,13 +402,21 @@ class SetiPaymentsWorker:
                 FailureDetail("PENDING", stage="ccma_prerequisite").to_json(),
             )
             raise SetiError("Falta una consulta de CCMA para comparar los pagos")
+        ccma_available = ccma_row is not None
         try:
-            ccma = json.loads(ccma_row["payload_json"])
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise SetiError("La última consulta de CCMA no es válida") from exc
+            ccma = json.loads(ccma_row["payload_json"]) if ccma_row is not None else {}
+            if not isinstance(ccma, dict):
+                raise ValueError("CCMA inválido")
+        except (TypeError, ValueError) as exc:
+            if require_ccma:
+                raise SetiError("La última consulta de CCMA no es válida") from exc
+            ccma, ccma_available = {}, False
 
         try:
+            query_started_at = datetime.now(timezone.utc)
             payload = self.connector.sync(chat_id, identity["represented_cuit"])
+            payload["represented_cuit"] = identity["represented_cuit"]
+            payload["query_started_at"] = query_started_at.isoformat()
             veps = list(payload.get("veps", []))
             iibb_periods = self.db.get_iibb_vep_periods(chat_id)
             for vep in veps:
@@ -403,6 +425,8 @@ class SetiPaymentsWorker:
                     vep["tax_type"] = "SANTA_FE_IIBB"
                     vep["tax_period"] = period
             payload["ccma_reconciliation"] = reconcile_seti_payments(veps, ccma)
+            if not ccma_available:
+                payload["ccma_reconciliation"]["status"] = "UNAVAILABLE"
         except SetiAccessRequired:
             self.db.record_connection_failure(
                 chat_id,

@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+import json
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -146,6 +147,80 @@ class SiatTest(TestCase):
         with self.assertRaises(ExternalContractError):
             SiatIibbConnector._emit_pdf(None, Page(html), '1002')
 
+    def test_valid_receipt_with_incorrect_media_type_is_still_fiscally_validated(self):
+        document = receipt_pdf()
+        def handler(request):
+            return httpx.Response(200, content=document,
+                                  headers={'Content-Type': 'application/octet-stream'})
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            received = SiatIibbConnector._emit_pdf(client, Page(quote_html()), '1002')
+        self.assertEqual(parse_vep_pdf(received, CUIT, expected_quote())['vep_number'], '1234567890')
+        # The media-type fallback never bypasses identity or amount checks.
+        with self.assertRaises(ExternalContractError):
+            parse_vep_pdf(received, '20999999999', expected_quote())
+
+    def test_failed_response_keeps_safe_diagnostics_without_body_or_headers(self):
+        def handler(request):
+            return httpx.Response(500, text='private fiscal data secret-token',
+                                  headers={'Content-Type': 'text/html; charset=utf-8',
+                                           'Set-Cookie': 'session=secret-token'})
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaises(IibbGenerationUnknown) as error:
+                SiatIibbConnector._emit_pdf(client, Page(quote_html()), '1002')
+        diagnostic = error.exception.diagnostic
+        self.assertEqual(diagnostic['http_status'], 500)
+        self.assertEqual(diagnostic['media_type'], 'text/html')
+        self.assertGreater(diagnostic['response_bytes'], 0)
+        self.assertNotIn('secret-token', str(diagnostic))
+        self.assertNotIn('private fiscal data', str(error.exception))
+
+    def test_failure_to_record_submission_prevents_the_actual_post(self):
+        calls = []
+        def handler(request):
+            calls.append(request)
+            self.fail('No request may be sent without a durable submission record')
+        def unavailable_database():
+            raise RuntimeError('database unavailable')
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaises(RuntimeError):
+                SiatIibbConnector._emit_pdf(client, Page(quote_html()), '1002', unavailable_database)
+        self.assertEqual(calls, [])
+
+    def test_storage_recovery_preserves_a_valid_receipt_and_expiration(self):
+        with TemporaryDirectory() as directory:
+            db = Database(Path(directory) / 'test.sqlite3')
+            db.initialize()
+            db.ensure_user(1001)
+            db.set_pending_tax_identity(1001, CUIT, 'production')
+            db.mark_tax_identity_verified(1001)
+            store = IibbPaymentStore(db)
+            row = store.request_quote(chat_id=1001, represented_cuit=CUIT, account=ACCOUNT,
+                                      period=PERIOD, network_id='1002', payment_date=CURRENT)
+            store.claim_next()
+            store.quote_succeeded(row['id'], expected_quote())
+            store.request_generation(row['id'], 1001)
+            store.claim_next()
+            document = receipt_pdf()
+            store.generation_unknown(row['id'], 'storage failure', pdf=document,
+                                     vep_number='1234567890')
+            now = datetime.now().astimezone()
+            db.upsert_live_snapshot(
+                1001, 'ARCA_SETI', 'payment_status', now.isoformat(),
+                (now+timedelta(hours=1)).isoformat(),
+                json.dumps({'represented_cuit': CUIT, 'complete': True,
+                            'query_started_at': now.isoformat(), 'veps': [{
+                                'number': '1234567890', 'amount': '42882.00', 'seti_state': 1,
+                                'status': 'UNKNOWN', 'tax_type': 'SANTA_FE_IIBB', 'tax_period': PERIOD,
+                                'description': f'SF-RGS{PERIOD[5:]}/{PERIOD[2:4]}',
+                                'payment_entity': 'BANELCO'}]}),
+            )
+            self.assertEqual(store.reconcile_generation(1001), 1)
+            recovered = store.get(row['id'])
+            self.assertEqual(recovered['vep_expires_on'], DUE.isoformat())
+            self.assertIsNone(recovered['last_error'])
+            bot = IibbPaymentBotService(store, frozenset({1001}), enabled=True)
+            self.assertEqual(bot.render(recovered).document, document)
+
     def test_official_pdf_fields_are_verified_independently(self):
         text = (f'Nº de VEP: 1234567890 Tipo de Pago: Ingresos Brutos Formulario: 5439 '
                 f'CUIT: {CUIT} Concepto: 19 Subconcepto: 19 Período: {PERIOD} '
@@ -283,6 +358,15 @@ class SiatTest(TestCase):
             db = Database(Path(directory) / 'test.sqlite3')
             db.initialize()
             db.ensure_user(1001)
+            db.set_pending_tax_identity(1001, CUIT, "production")
+            db.mark_tax_identity_verified(1001)
+            now = datetime.now().astimezone()
+            db.upsert_live_snapshot(
+                1001, "ARCA_SETI", "payment_status", now.isoformat(),
+                (now + timedelta(hours=1)).isoformat(),
+                json.dumps({"complete": True, "represented_cuit": CUIT,
+                            "query_started_at": now.isoformat(), "veps": []}),
+            )
             store = IibbPaymentStore(db)
             document = receipt_pdf()
             connector, calls = self.connector(pdf=document)
